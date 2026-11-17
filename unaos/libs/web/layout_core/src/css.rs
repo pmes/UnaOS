@@ -448,7 +448,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         list.retain(|(p, _)| p != prop);
         list.push((prop.to_string(), value.to_string()));
     }
-    let value = noninherited_initial(prop, value); if css_wide(prop, value, &mut style.paint) { return; } match prop {
+    let value = noninherited_initial(prop, value); if css_wide(prop, value, &mut style.paint) { return; } match prop { "all" => apply_css_wide_all(value, style, cx),
         "display" => {
             // Outer display type (css-display-3 §2.1) for the inline
             // whitespace pass: 0 inline, 1 block-level, 2 inline-level box.
@@ -3683,10 +3683,75 @@ fn noninherited_initial<'a>(prop: &str, value: &'a str) -> &'a str {
         }
         "background" => "transparent",
         "display" => "inline",
+        "color" if value.eq_ignore_ascii_case("initial") => "black", // SR1021: css-color-4 CanvasText (light scheme); unset stays inherit (css_wide)
         "width" | "height" | "min-width" | "min-height" | "max-width" | "max-height" => "auto",
         "border" | "border-top" | "border-right" | "border-bottom" | "border-left" | "border-style"
         | "border-top-style" | "border-right-style" | "border-bottom-style" | "border-left-style" => "none",
         "border-width" => "3px",
         _ => value,
+    }
+}
+
+// ---- AETHERCSSWIDEALL (LEDGER SR1021): css-cascade-4 §3.1 the all shorthand over ONE longhand list (named tail block) ----
+
+/// AETHERCSSWIDEALL (SR1021): the longhands `all` resets (css-cascade-4 §3.1): every longhand arm of
+/// [`apply_declaration`] except `direction`. THE one list of the parsed longhand names; `css_wide_all_list_covers_arms`
+/// (tests/css_wide_initial.rs) pins that every arm name is here or in [`ALL_SKIPPED`], so a new arm reds the pin.
+pub const ALL_LONGHANDS: &[&str] = &[
+    "display", "list-style-type", "content", "counter-reset", "counter-set", "counter-increment", "quotes",
+    "flex-direction", "flex-wrap", "row-gap", "column-gap", "flex-grow", "flex-shrink", "flex-basis",
+    "width", "min-width", "max-width", "height", "min-height", "max-height",
+    "table-layout", "border-collapse", "caption-side", "border-spacing",
+    "overflow-x", "overflow-y", "scrollbar-gutter", "scroll-behavior", "scroll-snap-type", "scroll-snap-align", "scroll-snap-stop",
+    "scroll-padding-top", "scroll-padding-right", "scroll-padding-bottom", "scroll-padding-left",
+    "scroll-margin-top", "scroll-margin-right", "scroll-margin-bottom", "scroll-margin-left",
+    "padding-top", "padding-right", "padding-bottom", "padding-left",
+    "margin-top", "margin-right", "margin-bottom", "margin-left",
+    "position", "z-index", "top", "right", "bottom", "left",
+    "aspect-ratio", "transform", "translate", "rotate", "scale", "transform-origin", "transform-style", "backface-visibility", "perspective", "perspective-origin", "transform-box",
+    "clip-path", "will-change", "container-type", "container-name", "contain",
+    "writing-mode", "text-combine-upright", "text-orientation",
+    "column-count", "column-width", "column-fill", "column-rule-width", "column-rule-style", "column-rule-color", "column-span", "box-decoration-break",
+    "filter", "backdrop-filter", "break-before", "break-after", "break-inside",
+    "vertical-align", "clear", "float", "text-indent", "text-align", "justify-content", "align-items", "align-content",
+    "background-color", "background-image", "background-size", "background-position", "background-repeat", "box-shadow",
+    "color", "font-family", "font-stretch", "font-synthesis-weight", "font-synthesis-style", "font-synthesis-small-caps", "font-variant-caps", "font-size", "font-weight", "font-style", "line-height",
+    "word-spacing", "letter-spacing", "text-shadow", "visibility", "opacity",
+    "text-decoration-line", "white-space", "white-space-collapse", "word-break", "overflow-wrap", "box-sizing", "text-transform",
+    "object-fit", "object-position", "mask-image", "mask-size", "mask-position", "mask-repeat",
+    "border-top-width", "border-right-width", "border-bottom-width", "border-left-width",
+    "border-top-left-radius", "border-top-right-radius", "border-bottom-right-radius", "border-bottom-left-radius",
+    "border-top-style", "border-right-style", "border-bottom-style", "border-left-style",
+    "outline-style", "outline-width", "outline-color", "outline-offset",
+    "cursor",
+];
+
+/// AETHERCSSWIDEALL (SR1021): the arm names `all` does not iterate, by reason.
+pub const ALL_SKIPPED: &[&str] = &[
+    // css-cascade-4 §3.1: `all` leaves `direction` (and `unicode-bidi`, which has no arm); `all` is this arm.
+    "direction", "all",
+    // SHORTHANDS: reset through their longhands, which are listed (the `border-width` shorthand under initial / unset would write 3px into every side of `paint.border` and re-create the sides `border-*-style: none` cleared).
+    "list-style", "flex-flow", "gap", "flex", "overflow", "scroll-padding", "scroll-margin", "padding", "margin", "inset", "container", "columns", "column-rule", "background", "font-synthesis", "font-variant", "font", "border", "border-top", "border-right", "border-bottom", "border-left", "border-style", "border-color", "border-width", "border-radius", "text-decoration", "mask", "outline",
+    // LOGICAL names: `apply_logical` / the scroll-margin arms re-apply them as the physical longhands listed.
+    "overflow-inline", "overflow-block", "scroll-margin-block", "scroll-margin-inline", "scroll-margin-block-start", "scroll-margin-block-end", "scroll-margin-inline-start", "scroll-margin-inline-end",
+    // ALIAS spellings of a listed name (the same field, the same value grammar).
+    "grid-gap", "grid-row-gap", "grid-column-gap", "-webkit-text-combine", "-ms-text-combine-horizontal", "page-break-before", "page-break-after", "page-break-inside", "-webkit-column-break-before", "-webkit-column-break-after", "-webkit-column-break-inside", "-webkit-box-shadow", "word-wrap", "-webkit-mask", "-webkit-mask-image", "-webkit-mask-size", "-webkit-mask-position", "-webkit-mask-repeat",
+];
+
+/// AETHERCSSWIDEALL (SR1021): `all: inherit | initial | unset` applies the keyword to each of [`ALL_LONGHANDS`] through
+/// [`apply_declaration`] itself, so each rides its own road: the inherit bits (SR815 / SR823 / SR831) and SR832's
+/// [`noninherited_initial`] table; an arm with no keyword road drops it as when the keyword is written alone. The later
+/// declaration wins through the same field writes. `revert` / `revert-layer` are dropped as every arm drops them
+/// (AETHER-CSS-WIDE-REVERT owed); any other value is invalid: dropped and recorded.
+fn apply_css_wide_all<H: Host>(value: &str, style: &mut SpecifiedStyle<H>, cx: &ParseCx) {
+    let kw = value.trim().to_ascii_lowercase();
+    match kw.as_str() {
+        "inherit" | "initial" | "unset" => {
+            for &name in ALL_LONGHANDS {
+                apply_declaration(name, &kw, style, cx);
+            }
+        }
+        "revert" | "revert-layer" => {}
+        _ => H::record_css(&format!("all-value:{}", clip(value))),
     }
 }
