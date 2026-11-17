@@ -2735,3 +2735,19 @@ fn striaripplemore_the_editor_word_is_one_undo_step() {
     assert!(st.undo());
     assert_eq!(st.timeline, tl);
 }
+
+// ---- STRIALINKAUTOMORE (LEDGER SR968): the near pass also needs src_in within one tick (named tail block) ----
+
+#[test]
+fn strialinkautomore_near_needs_src_in() {
+    let (_, _, b) = base();
+    // A1's second clip one tick later and one tick longer than V1's B[20,30)@10, but from src_in 25: another piece of B.
+    let mut tl = striacliplink_base();
+    tl.tracks[1].clips[1] = Clip::new(b, 25, 34, 11);
+    tl.validate().unwrap();
+    assert_eq!(strialinkautofuzz_groups(&tl.link_av()), vec![vec![1, 0], vec![1, 0]], "src_in five ticks apart: not a twin");
+    // src_in one tick apart: a rounding twin, linked with its own id.
+    tl.tracks[1].clips[1] = Clip::new(b, 21, 30, 11);
+    tl.validate().unwrap();
+    assert_eq!(strialinkautofuzz_groups(&tl.link_av()), vec![vec![1, 2], vec![1, 2]], "src_in within one tick: linked");
+}

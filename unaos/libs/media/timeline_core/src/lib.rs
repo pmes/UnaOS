@@ -2851,7 +2851,7 @@ impl Timeline {
 impl Timeline {
     /// STRIALINKAUTOFUZZ: the near pass of [`Timeline::link_av`] on video track `v` and audio track `a`.
     fn link_av_near(mut self, v: usize, a: usize) -> Timeline {
-        let near = |c: &Clip, o: &Clip| c.group == 0 && o.group == 0 && c.src == o.src && (o.at - c.at).abs() <= 1 && (o.len() - c.len()).abs() <= 1;
+        let near = |c: &Clip, o: &Clip| c.group == 0 && o.group == 0 && c.src == o.src && (o.at - c.at).abs() <= 1 && (o.len() - c.len()).abs() <= 1 && (o.src_in - c.src_in).abs() <= 1; // STRIALINKAUTOMORE (SR968): src_in within one tick too
         let mut pairs: Vec<(usize, usize)> = Vec::new();
         for (i, c) in self.tracks[v].clips.iter().enumerate() {
             let mut cand = self.tracks[a].clips.iter().enumerate().filter(|(_, o)| near(c, *o)).map(|(j, _)| j);
