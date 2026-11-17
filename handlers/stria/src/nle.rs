@@ -322,6 +322,8 @@ struct Vid {
     done: bool,
     /// NLESIZESWITCH (SR384): the size of the last frame this run showed (`reel_rgba`'s one line per change).
     size: Option<(u32, u32)>,
+    /// STRIASPEEDREVERSE (SR9067): the frames a BACKWARD run decoded up to its target (the last [`BACK_CACHE`]), served in reverse.
+    back: VecDeque<Frame>,
 }
 
 impl Vid {
@@ -341,7 +343,7 @@ impl Vid {
         if let Some(hit) = swap.reseed(&mut dec, track, &cursor, origin + key_ns) { // SWAPBACKSEEK (SR353): the run's keyframe with every set in effect there
             log::info!("[STRIA] :: nle reseed reel={} cache={}", src.0, if hit { "hit" } else { "miss" });
         }
-        Ok(Vid { src, origin, track_id: track.id, cursor, track: track.clone(), swap, stood_in: !dec.is_real(), park: m.park.clone(), dec, pending: VecDeque::new(), peeked: None, last: None, done: false, size: None })
+        Ok(Vid { src, origin, track_id: track.id, cursor, track: track.clone(), swap, stood_in: !dec.is_real(), park: m.park.clone(), dec, pending: VecDeque::new(), peeked: None, last: None, done: false, size: None, back: VecDeque::new() })
     }
     fn pull(&mut self) -> Result<Option<Frame>, RenderError> {
         loop {
@@ -618,7 +620,7 @@ fn mix_run(
     }
     for (li, l) in run.layers.iter().enumerate() {
         let slot = &mut auds[if under(li) { tracks + l.track } else { l.track }];
-        if l.seek.is_some() || slot.as_ref().map(|a| a.src) != Some(l.src) {
+        if !reversed_layer(tl, run, li) && (l.seek.is_some() || slot.as_ref().map(|a| a.src) != Some(l.src)) { // STRIASPEEDREVERSE (SR9067): a reversed layer opens its own slot (file tail)
             let key = match l.seek {
                 Some(k) => k,
                 None => sources.keyframe_ns(l.src, Kind::Audio, tl.tb.to_ns(l.src_t)).ok_or(RenderError::NoStream(l.src, Kind::Audio))?,
@@ -627,7 +629,7 @@ fn mix_run(
             *seeks += 1;
         }
         let start = samples(tl.tb.to_ns(l.src_t), rate);
-        let pcm = take_rated(tl, run, li, slot.as_mut().expect("opened above"), start, n, rate)?; // STRIACLIPSPEED (SR829): a rated clip's layer through the same Sinc at the effective rate (file tail)
+        let pcm = match take_reversed(tl, run, li, sources, slot, rate, ch, n, seeks)? { Some(p) => p, None => take_rated(tl, run, li, slot.as_mut().expect("opened above"), start, n, rate)? }; // STRIASPEEDREVERSE (SR9067): a reversed layer read forward and reversed (file tail); STRIACLIPSPEED (SR829): a rated clip's layer through the same Sinc at the effective rate (file tail)
         mix_into(&mut acc, &pcm, l, n, ch.max(1) as usize);
         if let Some(t) = taps.as_mut() {
             mix_into(&mut t[l.track], &pcm, l, n, ch.max(1) as usize); // NLE4C: the same terms, the master acc untouched
@@ -687,7 +689,7 @@ fn vid_frame(
     proxy: bool, // STRIAPROXYMEDIA (SR882): open on the source's attached proxy when one is (the preview's render)
 ) -> Result<Frame, RenderError> {
     if let Some(f) = title_frame(tl, sources, run, src, src_t, r) { return Ok(f); } if let Some(f) = seq_frame(tl, sources, run, src, src_t)? { return Ok(f); } let target = tl.tb.to_ns(src_t); // STRIATITLECLIP (SR828): a title's frame is its cached still (file tail); STRIAIMPORTIMAGESEQUENCE (SR888): a sequence's frame is one file read and decoded (file tail)
-    if seek.is_some() || run.as_ref().map(|v| v.src) != Some(src) {
+    if let Some(f) = vid_back(tl, sources, run, src, src_t, seek, tol, r)? { return Ok(f); } if seek.is_some() || run.as_ref().map(|v| v.src) != Some(src) { // STRIASPEEDREVERSE (SR9067): a run stepping backwards is served from its back cache (file tail)
         let key = match seek {
             Some(k) => k,
             None => sources.keyframe_ns(src, Kind::Video, target).ok_or(RenderError::NoStream(src, Kind::Video))?,
@@ -2162,4 +2164,101 @@ fn stack_rgba(
     let (Some(mut o), Some(t)) = (out, under_t) else { return Ok(top) };
     timeline_core::vmix::mix_step(timeline_core::TransitionKind::Dissolve, t, &mut o, &top, w, h);
     Ok(o)
+}
+
+// ---- STRIASPEEDREVERSE (LEDGER SR9067): a reversed clip on the one render — the back cache and the reversed take (named tail block) ----
+// The schedule names a reversed clip's source ticks DESCENDING and seeks only at its first step (timeline_core's `src_at`
+// continuity). VIDEO: a continuing run (same source, no seek) whose target is behind the frame it last showed is served by
+// `vid_back` from `Vid.back`, the last `BACK_CACHE` frames the run decoded up to its target; a miss re-opens the run at the
+// keyframe at or before the target through THE `Vid::open` and decodes forward to it keeping the last `BACK_CACHE` (at worst
+// one GOP decode per `BACK_CACHE` steps; the decoded frames count as `runup_frames`, the open as `seeks`). A forward run never
+// fills the cache, so every forward render is unchanged; a forward step on a run with a cache drops the run and the normal
+// road re-opens it. AUDIO: a reversed layer's run hears source ticks `lo = src_at(end - 1) ..= src_at(out_t)`; `take_reversed`
+// re-opens the layer's slot at the keyframe at or before `lo`, reads the run's `n` samples FORWARD from `lo` through THE
+// `take_rated` (the 1x copy or the rated Sinc: a clone of the run whose layer starts at `lo`) and reverses the frames.
+
+/// STRIASPEEDREVERSE: how many decoded frames a backward run keeps.
+const BACK_CACHE: usize = 16;
+
+/// STRIASPEEDREVERSE: the frame at `src_t` when run `run` (same `src`, no `seek`) steps backwards; `None`: the normal road.
+#[allow(clippy::too_many_arguments)]
+fn vid_back(tl: &Timeline, sources: &Sources, run: &mut Option<Vid>, src: SourceId, src_t: i64, seek: Option<i64>, tol: i64, r: &mut RenderReport) -> Result<Option<Frame>, RenderError> {
+    let target = tl.tb.to_ns(src_t);
+    let Some(v) = run.as_mut().filter(|v| v.src == src && seek.is_none()) else { return Ok(None) };
+    let Some(shown) = v.last.as_ref().map(|f| f.pts_ns - v.origin) else { return Ok(None) };
+    if target >= shown - tol {
+        if v.back.is_empty() {
+            return Ok(None);
+        }
+        if target <= shown + tol {
+            return Ok(v.last.clone());
+        }
+        *run = None;
+        return Ok(None);
+    }
+    let origin = v.origin;
+    if v.back.front().is_some_and(|f| f.pts_ns - origin <= target + tol) {
+        let f = v.back.iter().rev().find(|f| f.pts_ns - origin <= target + tol).cloned().expect("the front qualifies");
+        v.last = Some(f.clone());
+        if v.stood_in {
+            sources.note_stand_in(src);
+        }
+        return Ok(Some(f));
+    }
+    let key = sources.keyframe_ns(src, Kind::Video, target).ok_or(RenderError::NoStream(src, Kind::Video))?;
+    *run = None;
+    *run = Some(Vid::open(sources.get(src)?, src, key)?);
+    r.seeks += 1;
+    let v = run.as_mut().expect("opened above");
+    loop {
+        if v.peeked.is_none() {
+            v.peeked = v.pull()?;
+        }
+        let rel = match v.peeked.as_ref() {
+            Some(f) => f.pts_ns - v.origin,
+            None => break,
+        };
+        if rel > target + tol {
+            break;
+        }
+        let f = v.peeked.take().expect("just seen");
+        v.back.push_back(f);
+        if v.back.len() > BACK_CACHE {
+            v.back.pop_front();
+        }
+        r.runup_frames += 1;
+    }
+    let f = match v.back.back() {
+        Some(f) => {
+            r.runup_frames = r.runup_frames.saturating_sub(1);
+            f.clone()
+        }
+        None => v.peeked.clone().ok_or(RenderError::Short(src))?,
+    };
+    v.last = Some(f.clone());
+    if v.stood_in {
+        sources.note_stand_in(src);
+    }
+    Ok(Some(f))
+}
+
+/// STRIASPEEDREVERSE: layer `li` of `run` plays a reversed clip (timeline_core's `AudioRun::layer_clip`).
+fn reversed_layer(tl: &Timeline, run: &AudioRun, li: usize) -> bool {
+    run.layer_clip(tl, li).is_some_and(|c| c.reverse)
+}
+
+/// STRIASPEEDREVERSE: a reversed layer's `n` output samples: its slot re-opened at the keyframe at or before the run's lowest
+/// source tick, read forward from there through THE `take_rated`, the frames reversed; `None`: not a reversed layer.
+#[allow(clippy::too_many_arguments)]
+fn take_reversed(tl: &Timeline, run: &AudioRun, li: usize, sources: &Sources, slot: &mut Option<Aud>, rate: u32, ch: u16, n: i64, seeks: &mut u64) -> Result<Option<Vec<f32>>, RenderError> {
+    let Some(c) = run.layer_clip(tl, li).filter(|c| c.reverse) else { return Ok(None) };
+    let l = run.layers[li];
+    let lo = c.src_at(run.out_t + run.len - 1);
+    let key = sources.keyframe_ns(l.src, Kind::Audio, tl.tb.to_ns(lo)).ok_or(RenderError::NoStream(l.src, Kind::Audio))?;
+    *slot = Some(Aud::open(sources.get(l.src)?, l.src, key, ch)?);
+    *seeks += 1;
+    let mut fwd = run.clone();
+    fwd.layers[li].src_t = lo;
+    let pcm = take_rated(tl, &fwd, li, slot.as_mut().expect("opened above"), samples(tl.tb.to_ns(lo), rate), n, rate)?;
+    Ok(Some(pcm.chunks(ch.max(1) as usize).rev().flatten().copied().collect()))
 }

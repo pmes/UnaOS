@@ -275,7 +275,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let sel = st.selection.map(|(t, i)| format!("\"{t}:{i}\"")).unwrap_or_else(|| "null".into());
     let clip = st.selected().map(|c| format!("\"{}:{}:{}{}\"", c.at, c.src_in, c.src_out, if c.rate_q16 == 0x1_0000 { String::new() } else { format!(":{}", c.rate_q16) })).unwrap_or_else(|| "null".into()); // STRIACLIPSPEED (SR829): `:<rate_q16>` only at a rate other than 1x
     let err = errors.join("; ").replace('"', "'");
-    let meters = meters_json(c, &face) + &help_json(&face) + &snap_json(&face) + &note_json(&face) + &tc_json(&face) + &help_search_json(&face) + &info_json(&face) + &clipped_json(&face) + &autosaved_json(&face) + &held_json(&face) + &slip_json(&face) + &note_json(&face); // STRIAAUTOSAVECAP (SR913): `"autosaved":true` while this session's autosave stands (file tail); STRIASLIPVIEWMORE (SR946): `"slip":"WxH"` while a slip / slide pair shows (file tail); STRIAPANNEXT (SR994): `"note":"<text>"` while a note stands (file tail); NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail); STRIASNAPMORE (SR952): `"snap":false` while the drag snap default is off (file tail)
+    let meters = meters_json(c, &face) + &help_json(&face) + &snap_json(&face) + &note_json(&face) + &tc_json(&face) + &help_search_json(&face) + &info_json(&face) + &clipped_json(&face) + &autosaved_json(&face) + &held_json(&face) + &slip_json(&face) + &note_json(&face) + &reverse_json(&face); // STRIAAUTOSAVECAP (SR913): `"autosaved":true` while this session's autosave stands (file tail); STRIASLIPVIEWMORE (SR946): `"slip":"WxH"` while a slip / slide pair shows (file tail); STRIAPANNEXT (SR994): `"note":"<text>"` while a note stands (file tail); STRIASPEEDREVERSE (SR9067): `"reverse":true` only for a reversed selected clip (file tail); NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail); STRIASNAPMORE (SR952): `"snap":false` while the drag snap default is off (file tail)
     let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face) + &note_json(&face) + &queued_json(&face) + &bin_json(c, &face) + &bin_top_json(c, &face) + &source_json(&face) + &recent_json(c) + &frame_json(&face) + &markers_json(&face) + &color_json(&face) + &paint + &proxy_json(&face); // STRIACOLORLIFT (SR869): the selected clip's grade (file tail); STRIAPROXYBUTTONS (SR930): the reels with an attached proxy (file tail); NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail); STRIAEXPORTFRAME (SR830): the saved frame (file tail); STRIAMARKERS (SR835): the markers (file tail); STRIAPROJECTBIN (SR885): the bin's rows with --bin (file tail); STRIAEXPORTQUEUEMORE (SR971): the waiting count (file tail); STRIASOURCEVIEWER (SR9045): the loaded source (file tail)
     println!(
         "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}{export}{}}}",
@@ -589,6 +589,7 @@ fn transport() -> TetraNode {
         button("env", "Env"), button("env-", "Env -"), button("env+", "Env +"), button("env-del", "Env Del"), // STRIAGAINENVELOPE (SR9047): a gain point at the playhead on the selected clip, one dB a press, removed
         button("title-size-", "Title -"), button("title-size+", "Title +"), button("title-align", "Align"), button("title-ink", "Ink"), // STRIATITLESTYLEFACE (SR9077): the selected title's size step, alignment and ink cycle (the title step words)
         button("goto", "Go To"), // STRIADROPFRAMEFACE (SR9078): the bare press names `goto <timecode|frames>` (the witness: `goto=<tc>`)
+        button("reverse", "Reverse"), // STRIASPEEDREVERSE (SR9067): the selected clip plays backwards / forwards (THE `reverse` verb)
         button("help", "?"), // STRIAUNDOHISTORY (SR876): the undo history on the message line; STRIATRACKSTHREE (SR9038): the track header column on / off; NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`); STRIAAUDIOCROSSFADE (SR860): Xfade puts / takes the selected audio clip's head crossfade; STRIAXFADECURVEBUTTON (SR925): Curve swaps its curve linear / equal; STRIAHELPMORE (SR977): the help query field before it
     ])
 }
@@ -3492,5 +3493,29 @@ mod striadropframeface_tests {
         assert_eq!(drive(&mut f, "goto"), vec![String::from(nle_face::GOTO_USAGE)]);
         assert_eq!((f.state.undo_depth(), f.dirty()), (0, false));
         println!("striadropframeface witness: goto=00:00:01;00 -> 30; ;00 at minute 1 refused; bare goto -> usage");
+    }
+}
+
+// ---- STRIASPEEDREVERSE (LEDGER SR9067): the witness reads a reversed selected clip (named tail block) ----
+/// STRIASPEEDREVERSE: `,"reverse":true` while the selected clip plays backwards; empty otherwise, so every forward line is
+/// unchanged.
+fn reverse_json(face: &Face) -> String {
+    if face.state.selected().is_some_and(|c| c.reverse) { ",\"reverse\":true".into() } else { String::new() }
+}
+
+#[cfg(test)]
+mod striaspeedreverse_tests {
+    use super::*;
+
+    #[test]
+    fn striaspeedreverse_witness_key_only_when_reversed() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(nle_face::EditorState::new(tl), src, (320, 160), nle_face::PixelOrder::Rgba, false);
+        assert_eq!(reverse_json(&face), "", "no selection");
+        face.state.select(0, 0).unwrap();
+        assert_eq!(reverse_json(&face), "", "a forward clip");
+        assert_eq!(face.state.verb("reverse"), Some(Ok(())));
+        assert_eq!(reverse_json(&face), ",\"reverse\":true");
+        println!("striaspeedreverse witness: {}", reverse_json(&face));
     }
 }
