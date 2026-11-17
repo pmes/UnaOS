@@ -2725,3 +2725,51 @@ fn currentcolor_alpha_background() {
     let s = styled(&[("background-color", "rgba(0, 0, 0, 0.25)")]);
     assert_eq!(bg_alpha_ink(&s.paint, 0.5), 0.25);
 }
+
+// ---- AETHERCSSTEXTDECORATIONCOLORALPHA (LEDGER SR1148): the decoration colour keeps its alpha (named tail block) ----
+
+/// AETHERCSSTEXTDECORATIONCOLORALPHA (SR1148): `text-decoration-color: rgba(255, 0, 0, 0.5)` keeps its RGB and its alpha,
+/// and the shorthand's colour word the same (before SR1148 the alpha was dropped: an opaque red line).
+#[test]
+fn text_decoration_color_alpha_rgba_half() {
+    let s = styled(&[("text-decoration-color", "rgba(255, 0, 0, 0.5)")]);
+    assert_eq!(s.paint.decoration_color, Some(Some((255, 0, 0))));
+    assert_eq!(s.paint.deco_alpha, Some(0.5), "armed: the longhand keeps the half alpha");
+    let s = styled(&[("text-decoration", "underline rgba(255, 0, 0, 0.5)")]);
+    assert_eq!((s.paint.underline, s.paint.decoration_color), (Some(true), Some(Some((255, 0, 0)))));
+    assert_eq!(s.paint.deco_alpha, Some(0.5), "armed: the shorthand's colour word keeps the half alpha");
+}
+
+/// AETHERCSSTEXTDECORATIONCOLORALPHA (SR1148): `transparent` and an alpha-0 function colour are colours at alpha 0 (before
+/// SR1148 both were dropped: the earlier colour stood).
+#[test]
+fn text_decoration_color_alpha_transparent() {
+    let s = styled(&[("text-decoration-color", "red"), ("text-decoration-color", "transparent")]);
+    assert_eq!((s.paint.decoration_color, s.paint.deco_alpha), (Some(Some((0, 0, 0))), Some(0.0)), "armed: transparent is black at alpha 0");
+    let z = styled(&[("text-decoration-color", "rgba(0, 0, 255, 0)")]);
+    assert_eq!((z.paint.decoration_color, z.paint.deco_alpha), (Some(Some((0, 0, 255))), Some(0.0)), "armed: an alpha-0 function colour");
+}
+
+/// AETHERCSSTEXTDECORATIONCOLORALPHA (SR1148): an opaque colour and currentcolor write no alpha (None = opaque / the
+/// decorating box's ink).
+#[test]
+fn text_decoration_color_alpha_opaque_none() {
+    let s = styled(&[("text-decoration-color", "red")]);
+    assert_eq!((s.paint.decoration_color, s.paint.deco_alpha), (Some(Some((255, 0, 0))), None));
+    let s = styled(&[("text-decoration-color", "rgba(255, 0, 0, 0.5)"), ("text-decoration-color", "currentcolor")]);
+    assert_eq!((s.paint.decoration_color, s.paint.deco_alpha), (Some(None), None), "currentcolor clears the alpha");
+}
+
+/// AETHERCSSTEXTDECORATIONCOLORALPHA (SR1148): the alpha moves with the colour across rules (`merge_paint`): a later
+/// `text-decoration-color: red` drops it, a rule with no decoration colour keeps it, a later `text-decoration: underline`
+/// (the shorthand resets the colour to currentcolor) clears it.
+#[test]
+fn text_decoration_color_alpha_cascade() {
+    let half: &[(&str, &str)] = &[("text-decoration-color", "rgba(255, 0, 0, 0.5)")];
+    let c = cascade(&[half, &[("text-decoration-color", "red")]]);
+    assert_eq!((c.paint.decoration_color, c.paint.deco_alpha), (Some(Some((255, 0, 0))), None), "armed: a later red is opaque");
+    let k = cascade(&[half, &[("color", "blue")]]);
+    assert_eq!(k.paint.deco_alpha, Some(0.5), "a rule without a decoration colour keeps the alpha");
+    let r = cascade(&[half, &[("text-decoration", "underline")]]);
+    assert_eq!((r.paint.decoration_color, r.paint.deco_alpha), (Some(None), None), "the shorthand's reset clears both");
+}

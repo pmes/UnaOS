@@ -21,7 +21,7 @@ struct Inherited {
     /// The box whose `text-shadow` is in effect (inherited; `PaintStyle::text_shadows` holds the layers).
     text_shadow: Option<NodeId>,
     line_height: f32, // multiplier of font size
-    underline: bool, deco_color: Option<(u8, u8, u8)>, deco_style: u8, deco_thick: Option<f32>, ul_offset: Option<f32>, ul_pos: u8,
+    underline: bool, deco_color: Option<(u8, u8, u8)>, deco_alpha: f32, deco_style: u8, deco_thick: Option<f32>, ul_offset: Option<f32>, ul_pos: u8,
     nowrap: bool,
     white_space: u8,
     word_break: u8,
@@ -486,7 +486,7 @@ fn root_inherited() -> Inherited {
         rtl: false, bidi_ovr: 0,
         text_shadow: None,
         line_height: 0.0, // natural
-        underline: false, deco_color: None, deco_style: 0, deco_thick: None, ul_offset: None, ul_pos: 0,
+        underline: false, deco_color: None, deco_alpha: 1.0, deco_style: 0, deco_thick: None, ul_offset: None, ul_pos: 0,
         nowrap: false,
         white_space: 0,
         word_break: 0,
@@ -713,7 +713,7 @@ fn draw_decorations(
     if !(deco.underline || deco.line_through) || x1 <= x0 {
         return;
     }
-    let m = crate::fonts::decoration_metrics(face, size); let color = deco.color.unwrap_or(color); let t = deco.thickness.unwrap_or(m.thickness);
+    let m = crate::fonts::decoration_metrics(face, size); let color = deco.color.unwrap_or(color); let t = deco.thickness.unwrap_or(m.thickness); let k = deco_line_alpha(&deco);
     let mut hline = |xa0: f32, xb0: f32, top: f32, thick: f32| {
         let yi = top.round() as i32;
         for dy in 0..thick.round().max(1.0) as i32 {
@@ -725,7 +725,7 @@ fn draw_decorations(
             let xb = (xb0.max(0.0).round() as u32).min(width);
             for x in xa..xb {
                 if in_damage(x, yy as u32, damage_rects) && in_clip(x, yy as u32, clip) {
-                    put_px(surface, width, x, yy as u32, color);
+                    deco_px(surface, width, x, yy as u32, color, k);
                 }
             }
         }
@@ -989,7 +989,7 @@ fn draw_text(
     damage_rects: &[(u32, u32, u32, u32)],
     clip: Clip,
 ) {
-    let deco = Deco { underline, line_through: false, color: None, style: 0, thickness: None, ul_offset: None, ul_pos: 0 };
+    let deco = Deco { underline, line_through: false, color: None, alpha: 1.0, style: 0, thickness: None, ul_offset: None, ul_pos: 0 };
     draw_lines(
         text, origin_x, origin_y, max_width, adv, line_height_mult, color,
         &crate::fonts::lines::TextMode::default(), deco, &[], surface, width, height, damage_rects, clip,
@@ -1174,7 +1174,7 @@ fn cell_valign_offset(layout: &LayoutTree, id: NodeId, content_h: f32) -> f32 {
 #[derive(Clone, Copy, Default)]
 struct Deco {
     underline: bool,
-    line_through: bool, color: Option<(u8, u8, u8)>, style: u8, thickness: Option<f32>, ul_offset: Option<f32>, ul_pos: u8,
+    line_through: bool, color: Option<(u8, u8, u8)>, alpha: f32, style: u8, thickness: Option<f32>, ul_offset: Option<f32>, ul_pos: u8,
 }
 
 /// Draws a run on the lines fonts::lines breaks it into — the same breaker
@@ -3465,7 +3465,7 @@ fn frame_walk(
                             inherited.line_height,
                             inherited.color,
                             &mode,
-                            Deco { underline: inherited.underline, line_through: inherited.line_through, color: inherited.deco_color, style: inherited.deco_style, thickness: inherited.deco_thick, ul_offset: inherited.ul_offset, ul_pos: inherited.ul_pos },
+                            Deco { underline: inherited.underline, line_through: inherited.line_through, color: inherited.deco_color, alpha: inherited.deco_alpha, style: inherited.deco_style, thickness: inherited.deco_thick, ul_offset: inherited.ul_offset, ul_pos: inherited.ul_pos },
                             inherited.shadows(layout),
                             surface,
                             width,
@@ -3833,7 +3833,7 @@ fn frame_walk(
                             }
                             continue;
                         }
-                        let deco = Deco { underline: i.underline, line_through: i.line_through, color: i.deco_color, style: i.deco_style, thickness: i.deco_thick, ul_offset: i.ul_offset, ul_pos: i.ul_pos };
+                        let deco = Deco { underline: i.underline, line_through: i.line_through, color: i.deco_color, alpha: i.deco_alpha, style: i.deco_style, thickness: i.deco_thick, ul_offset: i.ul_offset, ul_pos: i.ul_pos };
                         // AETHERRENDER3 (SR126): the caret of an editable vertical field — `layout_core::hit::caret_rect` maps the
                         // caret offset of this text box to the physical bar (a horizontal bar across the column), painted on the
                         // page once the staging buffer is composited.
@@ -4653,12 +4653,12 @@ pub(crate) fn control_tag(tag: &str) -> bool {
 /// the decorating box's ink; None now means only "no decorating ancestor" (draw_decorations' run-ink fallback).
 fn deco_ink(inherited: &mut Inherited, tag: &str, spec: &crate::layout::PaintStyle) {
     let own = tag == "a" || tag == "u" || spec.underline.is_some() || spec.line_through.is_some(); if own {
-        inherited.deco_color = None; inherited.deco_style = 0; inherited.deco_thick = None; inherited.ul_offset = None;
+        inherited.deco_color = None; inherited.deco_alpha = 1.0; inherited.deco_style = 0; inherited.deco_thick = None; inherited.ul_offset = None;
     }
     if let Some(s) = spec.decoration_style { inherited.deco_style = s; } if let Some(t) = spec.decoration_thickness { inherited.deco_thick = t; } if let Some(o) = spec.underline_offset { inherited.ul_offset = o; } if let Some(p) = spec.underline_position { inherited.ul_pos = p; } if let Some(c) = spec.decoration_color {
-        inherited.deco_color = c;
+        inherited.deco_color = c; inherited.deco_alpha = spec.deco_alpha.unwrap_or(1.0);
     }
-    if own && inherited.deco_color.is_none() { inherited.deco_color = Some(inherited.color); }
+    if own && inherited.deco_color.is_none() { inherited.deco_color = Some(inherited.color); inherited.deco_alpha = inherited.color_alpha; }
 }
 
 // ---- AETHERCSSOMUNICODEBIDI (LEDGER SR1008): the unicode-bidi tag road and the paint-time override (named tail block) ----
@@ -4899,4 +4899,26 @@ fn diagonal_ghost(bs: &mut [boxpaint::Side; 4], undropped: [Option<(f32, (u8, u8
         }
     }
     any.then_some(ghost)
+}
+
+// ---- AETHERCSSTEXTDECORATIONCOLORALPHA (LEDGER SR1148): the decoration line composites at its colour's alpha (named tail block) ----
+
+/// AETHERCSSTEXTDECORATIONCOLORALPHA (SR1148): the line's alpha (0..=255): a resolved decoration colour brings its own
+/// (`Deco::alpha`: a declared colour's, or the decorating box's ink alpha frozen by `deco_ink`; never multiplied by the run's
+/// ink, so a propagated line keeps the decorating box's alpha); the run-ink fallback (no colour) is the run's ink alpha.
+fn deco_line_alpha(deco: &Deco) -> u8 {
+    if deco.color.is_some() {
+        return (deco.alpha.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+    }
+    INK_ALPHA.with(|c| c.get())
+}
+
+/// AETHERCSSTEXTDECORATIONCOLORALPHA (SR1148): one decoration pixel at alpha `k`: opaque through [`put_px`] (byte-identical
+/// to before), nothing at 0, else [`blend_px`].
+fn deco_px(surface: &mut [u8], width: u32, x: u32, y: u32, color: (u8, u8, u8), k: u8) {
+    match k {
+        255 => put_px(surface, width, x, y, color),
+        0 => {}
+        _ => blend_px(surface, width, x, y, color, k),
+    }
 }

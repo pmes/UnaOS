@@ -10812,4 +10812,86 @@ b</div>
         assert!(css_wide_red(imgalt_px(&e, l + 3, t + 1)), "armed: #is corner's top half is red: {:?}", imgalt_px(&e, l + 3, t + 1));
         assert!(css_wide_blue(imgalt_px(&e, l + 1, t + 3)), "#is corner's left half is blue: {:?}", imgalt_px(&e, l + 1, t + 3));
     }
+
+    // ---- AETHERCSSTEXTDECORATIONCOLORALPHA (LEDGER SR1148): the decoration line composites at its colour's alpha (named tail block) ----
+
+    /// AETHERCSSTEXTDECORATIONCOLORALPHA (SR1148): one 20px sans-serif row per probe on white, MMMM (no descenders, so the
+    /// underline row holds only line pixels): `#ua` a `<u>` with `color: rgba(0, 0, 0, 0.5)`; `#ut` `color: transparent;
+    /// text-decoration: underline`; `#ur` black text with `text-decoration: underline rgba(255, 0, 0, 0.5)`; `#pc` an opaque
+    /// black span inside a half-alpha underlined div; `#un` a plain opaque `text-decoration: underline` (the control).
+    fn text_decoration_alpha_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            body { margin: 0; background: #fff }
+            div { margin: 0 0 12px; font: 20px sans-serif; color: #000 }
+            </style></head><body>
+            <div><u id="ua" style="color:rgba(0, 0, 0, 0.5)">MMMM</u></div>
+            <div><span id="ut" style="color:transparent;text-decoration:underline">MMMM</span></div>
+            <div><span id="ur" style="text-decoration:underline rgba(255, 0, 0, 0.5)">MMMM</span></div>
+            <div style="text-decoration:underline;color:rgba(0, 0, 0, 0.5)"><span id="pc" style="color:#000">MMMM</span></div>
+            <div><span id="un" style="text-decoration:underline">MMMM</span></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSTEXTDECORATIONCOLORALPHA (SR1148): the underline's pixel under element `id`: the row of its rect (extended
+    /// 4px down, as `text_decoration_ink`) with the most non-white pixels, read at the rect's mid x; and the rect's total
+    /// non-white count.
+    fn text_decoration_alpha_line(e: &mut crate::AetherEngine, id: &str) -> ((u8, u8, u8), usize) {
+        let (l, t, w, h) = imgalt_rect(e, id);
+        let (sw, sh) = (e.width as usize, e.height as usize);
+        let (x0, x1) = (l.floor().max(0.0) as usize, ((l + w).ceil() as usize).min(sw));
+        let (y0, y1) = (t.floor().max(0.0) as usize, ((t + h).ceil() as usize + 4).min(sh));
+        let (mut best, mut best_n, mut total) = (y0, 0usize, 0usize);
+        for y in y0..y1 {
+            let n = (x0..x1).filter(|&x| imgalt_px(e, x, y) != (255, 255, 255)).count();
+            total += n;
+            if n > best_n {
+                (best, best_n) = (y, n);
+            }
+        }
+        (imgalt_px(e, (l + w / 2.0) as usize, best), total)
+    }
+
+    /// AETHERCSSTEXTDECORATIONCOLORALPHA (SR1148): a `<u>` in half-alpha black paints its underline at half ink (~127; before
+    /// SR1148 the line was opaque black over half-alpha glyphs), and the plain opaque underline stays black (the pin).
+    #[test]
+    fn text_decoration_alpha_currentcolor_half() {
+        let mut e = text_decoration_alpha_engine();
+        let ((r, g, b), _) = text_decoration_alpha_line(&mut e, "ua");
+        assert!([r, g, b].iter().all(|c| (110..=150).contains(c)), "armed: the half-alpha text's underline is half ink: {:?}", (r, g, b));
+        let ((r, g, b), n) = text_decoration_alpha_line(&mut e, "un");
+        assert!(n > 20 && r < 30 && g < 30 && b < 30, "the opaque underline stays black: {:?}, {n} px", (r, g, b));
+    }
+
+    /// AETHERCSSTEXTDECORATIONCOLORALPHA (SR1148): `color: transparent; text-decoration: underline` paints nothing: no
+    /// glyphs and no line (before SR1148 a bare opaque underline was left).
+    #[test]
+    fn text_decoration_alpha_transparent_no_line() {
+        let mut e = text_decoration_alpha_engine();
+        assert_eq!(text_decoration_alpha_line(&mut e, "ut").1, 0, "armed: transparent text keeps no underline");
+    }
+
+    /// AETHERCSSTEXTDECORATIONCOLORALPHA (SR1148): `text-decoration: underline rgba(255, 0, 0, 0.5)` on black text paints a
+    /// half-red line (~(255, 127, 127) on white; before SR1148 opaque red) while the glyphs stay black.
+    #[test]
+    fn text_decoration_alpha_declared_half_red() {
+        let mut e = text_decoration_alpha_engine();
+        let ((r, g, b), _) = text_decoration_alpha_line(&mut e, "ur");
+        assert!(r >= 245 && (110..=150).contains(&g) && (110..=150).contains(&b), "armed: the line is half red: {:?}", (r, g, b));
+        assert!(color_alpha_ink(&mut e, "ur").0 < 30, "the glyphs stay black");
+    }
+
+    /// AETHERCSSTEXTDECORATIONCOLORALPHA (SR1148): an opaque black span inside a half-alpha underlined div paints its glyphs
+    /// opaque and the div's propagated line at the div's half alpha (the line is the decorating box's, not the run's ink).
+    #[test]
+    fn text_decoration_alpha_propagated_keeps_parent() {
+        let mut e = text_decoration_alpha_engine();
+        let ((r, g, b), _) = text_decoration_alpha_line(&mut e, "pc");
+        assert!([r, g, b].iter().all(|c| (110..=150).contains(c)), "armed: the parent's line under the child is half ink: {:?}", (r, g, b));
+        assert!(color_alpha_ink(&mut e, "pc").0 < 30, "the child's glyphs are opaque black");
+    }
 }

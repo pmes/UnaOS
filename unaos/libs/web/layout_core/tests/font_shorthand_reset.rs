@@ -609,9 +609,10 @@ fn text_decoration_color_longhand() {
     for v in ["currentcolor", "currentColor", "initial", "unset"] {
         assert_eq!(styled(&[("text-decoration-color", v)]).paint.decoration_color, Some(None), "{v}");
     }
-    for v in ["inherit", "transparent", "bogus"] {
+    for v in ["inherit", "bogus"] {
         assert_eq!(styled(&[("text-decoration-color", v)]).paint.decoration_color, None, "{v}");
     }
+    let t = styled(&[("text-decoration-color", "transparent")]).paint; assert_eq!((t.decoration_color, t.deco_alpha), (Some(Some((0, 0, 0))), Some(0.0)), "SR1148: transparent is a colour at alpha 0 (SR1112's border ruling)");
     let s = styled(&[("text-decoration-color", "red"), ("text-decoration-color", "bogus")]);
     assert_eq!(s.paint.decoration_color, red, "an invalid later value is dropped");
     assert_eq!(styled(&[("color", "red")]).paint.decoration_color, None, "armed: color alone writes none");
