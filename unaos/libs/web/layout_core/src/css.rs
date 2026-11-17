@@ -3173,7 +3173,7 @@ fn apply_display<H: Host>(value: &str, style: &mut SpecifiedStyle<H>) {
 
 /// border-style keyword -> paint code (0 solid, 1 dashed, 2 dotted,
 /// 3 double); the 3D styles paint solid in their colour.
-fn border_style_code(v: &str) -> Option<u8> {
+pub fn border_style_code(v: &str) -> Option<u8> {
     match v.trim() {
         "solid" | "groove" | "ridge" | "inset" | "outset" => Some(0),
         "dashed" => Some(1),
@@ -4749,6 +4749,19 @@ fn bg_shorthand_layer_props<H: Host>(paint: &mut PaintStyle<H>, value: &str) {
     }
 }
 
+// ---- AETHERCSSOMBORDERSIDESTYLECOLUMNS (LEDGER SR1103): the border-style paint code back to its keyword (named tail block) ----
+
+/// AETHERCSSOMBORDERSIDESTYLECOLUMNS (SR1103): the inverse of [`border_style_code`] — 1 dashed, 2 dotted, 3 double,
+/// every other code `solid` (the render's `style_on` default; groove / ridge / inset / outset collapse to 0 and read solid).
+pub fn border_style_word(code: u8) -> &'static str {
+    match code {
+        1 => "dashed",
+        2 => "dotted",
+        3 => "double",
+        _ => "solid",
+    }
+}
+
 // ---- AETHERTEXTALIGNLAST (LEDGER SR1062): css-text-3 §7.2 text-align-last parses to the text-align codes (named tail block) ----
 
 /// AETHERTEXTALIGNLAST (SR1062): css-text-3 §7.2 `text-align-last` to its code (the `text-align` table: 0 start,
@@ -4772,6 +4785,17 @@ fn text_align_last_code<H: Host>(value: &str) -> Option<u8> {
     }
 }
 
+// ---- AETHERCSSOMTEXTDECORATIONCOLUMNS (LEDGER SR1108): the text-decoration-style and text-underline-position codes back to their keywords (named tail block) ----
+
+/// AETHERCSSOMTEXTDECORATIONCOLUMNS (SR1108): the inverse of [`deco_style_code`] (0 solid 1 double 2 dotted 3 dashed 4 wavy).
+pub fn text_decoration_style_word(code: u8) -> &'static str {
+    ["solid", "double", "dotted", "dashed", "wavy"].get(code as usize).copied().unwrap_or("solid")
+}
+
+/// AETHERCSSOMTEXTDECORATIONCOLUMNS (SR1108): the inverse of [`underline_position_code`] (0 auto 1 from-font 2 under).
+pub fn underline_position_word(code: u8) -> &'static str {
+    ["auto", "from-font", "under"].get(code as usize).copied().unwrap_or("auto")
+}
 
 // ---- AETHERCSSBORDERCOLORSTORED (LEDGER SR1058): a pending per-side border colour; border-color alone builds no frame (named tail block) ----
 
