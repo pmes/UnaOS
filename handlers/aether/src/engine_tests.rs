@@ -9156,4 +9156,32 @@ b</div>
         assert_eq!(font_shorthand_cs(&mut e, "num", "lineHeight"), format!("{}px", crate::css::line_height_used_px(&used, 1.5, 16.0, sel)));
         assert_eq!(font_shorthand_cs(&mut e, "len", "lineHeight"), format!("{}px", crate::css::line_height_used_px(&plain, -24.0, 16.0, sel)));
     }
+
+    // ---- AETHERCSSALIGNCONTENTSAFE (LEDGER SR1064): safe / unsafe / first|last baseline on the alignment arms (named tail block) ----
+
+    /// AETHERCSSALIGNCONTENTSAFE (SR1064): two 200 x 20 flex rows, one 50 x 20 child each, the rules in a sheet:
+    /// `justify-content: safe center` centres its child like the plain `center` twin (x 75; before, the declaration was
+    /// dropped and the child sat at 0), and the `safe` it could not honour is on the CSS ledger (`align-overflow:safe`).
+    #[test]
+    fn align_safe_center_engine() {
+        crate::ledger::reset();
+        let html = r#"<!doctype html><html><head><style>
+            .f { display: flex; width: 200px; height: 20px }
+            .c { justify-content: center }
+            .s { justify-content: safe center }
+            </style></head><body style="margin:0">
+            <div id="c" class="f c"><div id="ck" style="width:50px;height:20px"></div></div>
+            <div id="s" class="f s"><div id="sk" style="width:50px;height:20px"></div></div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 400));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        let left = |e: &mut crate::AetherEngine, id: &str, c: &str| imgalt_rect(e, id).0 - imgalt_rect(e, c).0;
+        let (c, s) = (left(&mut e, "ck", "c"), left(&mut e, "sk", "s"));
+        assert!((c - 75.0).abs() <= 0.5, "armed: center puts the child at 75: {c}");
+        assert!((s - c).abs() <= 0.5, "safe center centres like center: {s} vs {c}");
+        let snap = crate::ledger::snapshot();
+        assert!(snap.contains(crate::ledger::ApiCategory::Css, "align-overflow:safe"), "the safe modifier is recorded");
+    }
 }
