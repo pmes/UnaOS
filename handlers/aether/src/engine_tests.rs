@@ -5550,7 +5550,7 @@ mod tests {
             <div style="font:italic 20px serif"><span id="uns" style="font-size:12px;font:unset">Hello</span></div>
             <div style="font:italic 20px serif"><span id="ini" style="font:initial">Hello</span></div>
             <div style="font:italic 20px serif"><button id="btn" style="font:inherit">Go</button></div>
-            <div style="font:italic 20px serif"><button id="pbtn" style="font-size:20px">Go</button></div>
+            <div style="font:italic 20px serif"><button id="pbtn" style="font:italic 20px serif">Go</button></div>
             <div style="font:italic 20px serif"><button id="ubtn">Go</button></div>
         </body></html>"#;
         let mut engine = crate::AetherEngine::new();
@@ -5587,9 +5587,8 @@ mod tests {
     }
 
     /// AETHERFONTSHORTHANDINHERIT (SR810): `button { font: inherit }` (every reset sheet's line) takes the parent's
-    /// 20px: its box is the `font-size: 20px` twin's, not the 13.333px control default's (armed by the plain button).
-    /// The family stays the control family and cssom reads the raw size (AETHER-CSS-WIDE-LONGHANDS,
-    /// AETHER-CSSOM-FONT-SIZE-REL owed), so the box is the pin.
+    /// 20px: its box is the `font: italic 20px serif` twin's, not the 13.333px control default's (armed by the plain
+    /// button). AETHERCSSWIDELONGHANDS (SR815) re-pinned the twin: the inherit button now takes the parent's family too.
     #[test]
     fn font_inherit_button_takes_parent_size() {
         let mut e = font_wide_engine();
@@ -5598,5 +5597,467 @@ mod tests {
         let (_, _, uw, uh) = imgalt_rect(&mut e, "ubtn");
         assert!((w - pw).abs() <= 0.5 && (h - ph).abs() <= 0.5, "btn {w}x{h} is the 20px twin's {pw}x{ph}");
         assert!((h - uh).abs() > 0.5 || (w - uw).abs() > 0.5, "the plain button {uw}x{uh} differs (armed)");
+    }
+
+    // ---- AETHERCSSWIDELONGHANDS (LEDGER SR815): an explicit inherit beats an earlier rule and the tag default (named tail block) ----
+
+    /// AETHERCSSWIDELONGHANDS (SR815): one line per probe under a 20px serif upright body, the rules in a sheet: an
+    /// upright reference, `p { font-style: italic }` and its `p.x { font-style: inherit }` twin, `em` with
+    /// `font-style: inherit` / `unset` beside a plain (tag-default italic) em, an italic parent's plain child and its
+    /// same-block `font-style: normal; font-style: inherit` twin, and three buttons under `button { font-size: 13px }`:
+    /// `button.i { font: inherit }`, `button.t { font: 20px serif }` and a plain one. Rows 12px apart, so one probe's
+    /// ink window (its rect +- 2px) does not take a neighbour's glyph edge.
+    fn css_wide_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><head><style>
+            div, p { margin: 0 0 12px }
+            p { font-style: italic }
+            p.x { font-style: inherit }
+            em.n { font-style: inherit }
+            em.u { font-style: unset }
+            button { font-size: 13px }
+            button.i { font: inherit }
+            button.t { font: 20px serif }
+            </style></head><body style="margin:0;font:20px serif">
+            <div><span id="plain">Hello</span></div>
+            <p id="itp">Hello</p>
+            <p id="px" class="x">Hello</p>
+            <div><em id="emref">Hello</em></div>
+            <div><em id="emn" class="n">Hello</em></div>
+            <div><em id="emu" class="u">Hello</em></div>
+            <div style="font-style:italic"><span id="itkid">Hello</span></div>
+            <div style="font-style:italic"><span id="inhkid" style="font-style:normal;font-style:inherit">Hello</span></div>
+            <div><button id="bi" class="i">Go</button></div>
+            <div><button id="bt" class="t">Go</button></div>
+            <div><button id="bp">Go</button></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSWIDELONGHANDS (SR815): `p.x { font-style: inherit }` after `p { font-style: italic }` under an upright
+    /// parent paints upright (the plain reference's ink; the italic p does not, armed) and cssom reads `normal`.
+    #[test]
+    fn css_wide_cross_rule_upright() {
+        let mut e = css_wide_engine();
+        let plain = small_caps_ink_columns(&mut e, "plain");
+        assert!(plain.iter().sum::<usize>() > 20, "the reference run paints");
+        assert_ne!(small_caps_ink_columns(&mut e, "itp"), plain, "the italic p is not the upright ink (armed)");
+        assert_eq!(small_caps_ink_columns(&mut e, "px"), plain, "p.x inherits the upright parent past the earlier rule");
+        assert_eq!(font_shorthand_cs(&mut e, "itp", "fontStyle"), "italic");
+        assert_eq!(font_shorthand_cs(&mut e, "px", "fontStyle"), "normal", "cssom reads the parent's style");
+    }
+
+    /// AETHERCSSWIDELONGHANDS (SR815): `em { font-style: inherit }` beats the tag's UA italic, and `unset` is inherit for
+    /// an inherited property (css-cascade-4 §7.3.3): both paint the upright reference's ink; the plain em does not.
+    #[test]
+    fn css_wide_tag_default_beaten() {
+        let mut e = css_wide_engine();
+        let plain = small_caps_ink_columns(&mut e, "plain");
+        assert_ne!(small_caps_ink_columns(&mut e, "emref"), plain, "a plain em is italic by the tag default (armed)");
+        for id in ["emn", "emu"] {
+            assert_eq!(small_caps_ink_columns(&mut e, id), plain, "#{id}: upright, the parent's style");
+            assert_eq!(font_shorthand_cs(&mut e, id, "fontStyle"), "normal", "#{id}: cssom");
+        }
+    }
+
+    /// AETHERCSSWIDELONGHANDS (SR815): `font-style: normal; font-style: inherit` on a child of an italic parent (the later
+    /// declaration wins) paints the parent's italic: the italic parent's plain child's ink, not the upright reference's.
+    #[test]
+    fn css_wide_child_takes_italic_parent() {
+        let mut e = css_wide_engine();
+        let italic_kid = small_caps_ink_columns(&mut e, "itkid");
+        assert_ne!(italic_kid, small_caps_ink_columns(&mut e, "plain"), "the italic parent's child is italic (armed)");
+        assert_eq!(small_caps_ink_columns(&mut e, "inhkid"), italic_kid, "the same-block inherit takes the parent's italic");
+        assert_eq!(font_shorthand_cs(&mut e, "inhkid", "fontStyle"), "italic");
+    }
+
+    /// AETHERCSSWIDELONGHANDS (SR815): `button.i { font: inherit }` after `button { font-size: 13px }` under a 20px serif
+    /// parent takes 20px serif: its box is the `font: 20px serif` button's, not the plain 13px button's (armed), and
+    /// cssom reads `20px`.
+    #[test]
+    fn css_wide_control_font_inherit() {
+        let mut e = css_wide_engine();
+        let (_, _, w, h) = imgalt_rect(&mut e, "bi");
+        let (_, _, tw, th) = imgalt_rect(&mut e, "bt");
+        let (_, _, pw, ph) = imgalt_rect(&mut e, "bp");
+        assert!((w - tw).abs() <= 0.5 && (h - th).abs() <= 0.5, "bi {w}x{h} is the 20px serif button's {tw}x{th}");
+        assert!((h - ph).abs() > 0.5 || (w - pw).abs() > 0.5, "the plain 13px button {pw}x{ph} differs (armed)");
+        assert_eq!(font_shorthand_cs(&mut e, "bi", "fontSize"), "20px", "cssom reads the parent's size");
+        assert_ne!(font_shorthand_cs(&mut e, "bp", "fontSize"), "20px", "the plain button keeps the earlier rule (armed)");
+    }
+
+    // ---- AETHERCSSOMFONTSIZEREL (LEDGER SR819): getComputedStyle's fontSize is the used size (named tail block) ----
+
+    /// AETHERCSSOMFONTSIZEREL (SR819): one probe per relative road: em and % of the parent's size, smaller / larger
+    /// (layout_core's /1.2 and x1.2), `font: inherit` and em on a control, a plain control, and nested em.
+    fn font_size_rel_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0;font:16px serif">
+            <div style="font-size:10px"><span id="em" style="font-size:2em">Hello</span></div>
+            <div style="font-size:16px"><span id="pct" style="font-size:150%">Hello</span></div>
+            <div style="font-size:10px"><span id="sm" style="font-size:smaller">Hello</span></div>
+            <div style="font-size:10px"><span id="lg" style="font-size:larger">Hello</span></div>
+            <div style="font-size:20px"><button id="fib" style="font:inherit">Go</button></div>
+            <div style="font-size:20px"><button id="plain">Go</button></div>
+            <div style="font-size:10px"><button id="emb" style="font-size:2em">Go</button></div>
+            <div style="font-size:10px"><div style="font-size:2em"><span id="nest" style="font-size:1.5em">Hello</span></div></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 400));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSOMFONTSIZEREL (SR819): `font-size: 2em` under 10px reads 20px and `150%` under 16px reads 24px (the
+    /// specified road read the parent's size: 10px / 16px).
+    #[test]
+    fn font_size_rel_cssom_em_percent() {
+        let mut e = font_size_rel_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "em", "fontSize"), "20px", "2em of 10px");
+        assert_eq!(font_shorthand_cs(&mut e, "pct", "fontSize"), "24px", "150% of 16px");
+    }
+
+    /// AETHERCSSOMFONTSIZEREL (SR819): `smaller` / `larger` under 10px read layout_core's /1.2 and x1.2, in the report's
+    /// 4-decimal grammar.
+    #[test]
+    fn font_size_rel_cssom_smaller_larger() {
+        let mut e = font_size_rel_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "sm", "fontSize"), "8.3333px", "smaller: 10 / 1.2");
+        assert_eq!(font_shorthand_cs(&mut e, "lg", "fontSize"), "12px", "larger: 10 x 1.2");
+    }
+
+    /// AETHERCSSOMFONTSIZEREL (SR819): a `font: inherit` button under 20px reads 20px (it painted 20px and read the
+    /// 13.333px control default before), a plain button reads 13.333px (CONTROL_FONT_PX: Chromium's 13.3333px is
+    /// AETHER-CONTROL-FONT-PX-THIRD owed), a `font-size: 2em` button under 10px reads 20px.
+    #[test]
+    fn font_size_rel_cssom_font_inherit_button() {
+        let mut e = font_size_rel_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "fib", "fontSize"), "20px", "font: inherit takes the parent's 20px");
+        assert_eq!(font_shorthand_cs(&mut e, "plain", "fontSize"), "13.333px", "the control default");
+        assert_eq!(font_shorthand_cs(&mut e, "emb", "fontSize"), "20px", "2em of 10px on a control");
+    }
+
+    /// AETHERCSSOMFONTSIZEREL (SR819): `1.5em` inside `2em` under 10px reads 30px: the em chain is the layout's.
+    #[test]
+    fn font_size_rel_cssom_nested_em() {
+        let mut e = font_size_rel_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "nest", "fontSize"), "30px", "1.5 x 2 x 10px");
+    }
+
+    // ---- AETHERRTLMARGINAUTO (LEDGER SR781): an rtl column's over-constrained margins bind margin-right (named tail block) ----
+
+    /// AETHERRTLMARGINAUTO (SR781, AETHER-RTL-MARGIN-AUTO): in a 300px `dir=rtl` column a 100px block with margin-left 10
+    /// and margin-right 20 sits 20 from the right edge (CSS 2.2 §10.3.3: margin-left is the over-constrained one; SR711's
+    /// END), `margin-left: auto` takes the slack to the same place, `margin: 0 auto` centres, an ltr column keeps
+    /// margin-left; `style.direction` flips re-derive it.
+    #[test]
+    fn rtl_margin_over_constrained_ends_at_margin_right() {
+        let html = r#"<html><head><style>
+            body { margin: 0; }
+            .col { width: 300px; }
+            .col div { width: 100px; height: 10px; }
+        </style></head><body>
+        <div class="col" id="rc" dir="rtl">
+            <div id="a" style="margin-left: 10px; margin-right: 20px"></div>
+            <div id="b" style="margin-left: auto; margin-right: 20px"></div>
+            <div id="c" style="margin: 0 auto"></div>
+        </div>
+        <div class="col" id="lc"><div id="d" style="margin-left: 10px; margin-right: 20px"></div></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(800, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        let off = |e: &mut crate::AetherEngine, col: &str, id: &str| {
+            js_num(e, &format!("document.getElementById('{id}').getBoundingClientRect().left - document.getElementById('{col}').getBoundingClientRect().left"))
+        };
+        assert_eq!(off(&mut engine, "rc", "a"), 180.0, "rtl 10 / 20: margin-right binds");
+        assert_eq!(off(&mut engine, "rc", "b"), 180.0, "rtl auto / 20: the auto margin takes the slack");
+        assert_eq!(off(&mut engine, "rc", "c"), 100.0, "rtl 0 auto: centred");
+        assert_eq!(off(&mut engine, "lc", "d"), 10.0, "ltr 10 / 20: margin-left binds");
+        for (dir, want) in [("ltr", 10.0), ("rtl", 180.0)] {
+            js_num(&mut engine, &format!("document.getElementById('rc').style.direction = '{dir}'; 0"));
+            engine.render_frame();
+            assert_eq!(off(&mut engine, "rc", "a"), want, "style.direction = {dir}: the 10 / 20 block's offset");
+        }
+    }
+
+
+    // ---- AETHERCENTERRESTYLEITEMS (LEDGER SR782): a removed align=center lets the cell's narrow block go back to the start (named tail block) ----
+
+    /// AETHERCENTERRESTYLEITEMS (SR782): a `td align=center` centres its 200px block (-webkit-center, SR436); a script
+    /// that removes the attribute leaves the block at the cell's content start, as Chromium re-derives the placement on
+    /// the style recalc: neither the rule's align-self (SR686) nor the cell's align-items the rule wrote is kept.
+    #[test]
+    fn center_restyle_items_follow_removed_align() {
+        let html = r#"<!doctype html><html><body style="margin: 0"><table style="width: 600px; border-spacing: 0"><tr><td id="cell" align="center"><div id="d" style="width: 200px">ab</div></td></tr></table></body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(800, 400));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        let r = |e: &mut crate::AetherEngine, id: &str, k: &str| js_num(e, &format!("document.getElementById('{id}').getBoundingClientRect().{k}"));
+        let (cl, cw, dl, dw) = (r(&mut engine, "cell", "left"), r(&mut engine, "cell", "width"), r(&mut engine, "d", "left"), r(&mut engine, "d", "width"));
+        assert!(dw > 0.0 && (dl + dw / 2.0 - (cl + cw / 2.0)).abs() <= 1.0, "td align=center centres #d (d {dl} + {dw}, cell {cl} + {cw})");
+        engine.js_engine.as_mut().unwrap().execute("document.getElementById('cell').removeAttribute('align');").expect("script must run clean");
+        engine.render_frame();
+        let (cl, dl) = (r(&mut engine, "cell", "left"), r(&mut engine, "d", "left"));
+        assert!((dl - (cl + 1.0)).abs() <= 1.0, "align removed: #d sits at the cell's content start (d {dl}, cell {cl})");
+        let ta = engine.js_engine.as_mut().unwrap().eval_string("getComputedStyle(document.getElementById('cell')).textAlign").unwrap();
+        assert_ne!(ta, "-webkit-center", "align removed: the cell's computed text-align is no longer the align= value");
+    }
+
+    // ---- AETHERFILETYPECHANGE (LEDGER SR783): leaving type=file drops the selection (named tail block) ----
+
+    /// AETHERFILETYPECHANGE (SR783): file input `f` (multiple, two Files through SR706's DataTransfer helper), `fv`
+    /// (value="kept.txt", one File), text input `t` and a fresh multiple file input `fresh`; `input` / `change` on f, fv
+    /// and t count into `window.ev`.
+    fn file_type_change_page() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body>
+            <div><input type="file" id="f" multiple></div>
+            <div><input type="file" id="fv" value="kept.txt"></div>
+            <div><input type="text" id="t"></div>
+            <div><input type="file" id="fresh" multiple></div>
+            <script>
+              function list(names) { var d = new DataTransfer(); names.forEach(function (n) { d.items.add(new File(["x"], n)); }); return d.files; }
+              document.getElementById("f").files = list(["a.txt", "b.txt"]);
+              document.getElementById("fv").files = list(["report.pdf"]);
+              window.ev = 0;
+              ["f", "fv", "t"].forEach(function (id) { ["input", "change"].forEach(function (k) { document.getElementById(id).addEventListener(k, function () { window.ev++; }); }); });
+            </script>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 400));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERFILETYPECHANGE (SR783): `type = 'text'` on a file input holding a FileList drops the selection (Chromium
+    /// destroys FileInputType and its FileList): `files` reads null, `value` reads the value content attribute (HTML
+    /// §4.10.5 type change: "" with none, `kept.txt` on fv, never the fakepath), the FileList held before reads length
+    /// 0 with no index, and no `input` / `change` event fires, then or after a tick.
+    #[test]
+    fn file_type_change_leaving_clears() {
+        let mut engine = file_type_change_page();
+        let js = engine.js_engine.as_mut().expect("page must have booted");
+        let got = js
+            .eval_string(r#"(function () { var f = document.getElementById("f"), fv = document.getElementById("fv"), k = f.files, n = k.length, fp = fv.value; f.type = "text"; fv.type = "text"; return [n, f.files === null, JSON.stringify(f.value), k.length, k[0] === undefined, fp, fv.value, fv.files === null, window.ev].join(","); })()"#)
+            .unwrap();
+        assert_eq!(got, "2,true,\"\",0,true,C:\\fakepath\\report.pdf,kept.txt,true,0");
+        engine.tick();
+        let js = engine.js_engine.as_mut().expect("page must have booted");
+        assert_eq!(js.eval_string("String(window.ev)").unwrap(), "0", "no event is queued by the type change");
+    }
+
+    /// AETHERFILETYPECHANGE (SR783): a file input taken to text and back to file holds an empty FileList, `value` "",
+    /// no event fired, and its painted status is a fresh input's (SR715's probe), where two Files painted `2 files`.
+    #[test]
+    fn file_type_change_return_empty() {
+        let mut engine = file_type_change_page();
+        let before = file_value_clear_extent(&mut engine, "f");
+        let js = engine.js_engine.as_mut().expect("page must have booted");
+        let got = js
+            .eval_string(r#"(function () { var f = document.getElementById("f"); f.type = "text"; f.type = "file"; return [f.files.length, JSON.stringify(f.value), window.ev].join(","); })()"#)
+            .unwrap();
+        assert_eq!(got, "0,\"\",0");
+        engine.tick(); engine.render_frame();
+        let (f, fresh) = (file_value_clear_extent(&mut engine, "f"), file_value_clear_extent(&mut engine, "fresh"));
+        assert_ne!(before, fresh, "two Files painted `2 files` before the type change");
+        assert_eq!(f, fresh, "the returned input paints a fresh input's status");
+    }
+
+    /// AETHERFILETYPECHANGE (SR783): a text input's `files` is null (HTML: null off the File Upload state); taken to
+    /// `file` it holds an empty FileList.
+    #[test]
+    fn file_type_change_text_to_file() {
+        let mut engine = file_type_change_page();
+        let js = engine.js_engine.as_mut().expect("page must have booted");
+        let got = js
+            .eval_string(r#"(function () { var t = document.getElementById("t"), was = t.files === null; t.type = "file"; return [was, t.files !== null, t.files.length].join(","); })()"#)
+            .unwrap();
+        assert_eq!(got, "true,true,0");
+    }
+
+    // ---- AETHERCSSOMLINEHEIGHTUSED (LEDGER SR824): getComputedStyle's lineHeight is the used px (named tail block) ----
+
+    /// AETHERCSSOMLINEHEIGHTUSED (SR824): one probe per line-height road: a number (under a px and an em font size), a
+    /// length, `normal`, a % and em (at 16px and 20px, the latter through `reresolve_font_relative`), and inheritance
+    /// (a number re-multiplies, a length is kept).
+    fn line_height_used_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0;font:16px serif">
+            <div style="font-size:20px"><span id="num" style="line-height:1.5">Hello</span></div>
+            <div style="font-size:10px"><span id="numem" style="font-size:2em;line-height:1.5">Hello</span></div>
+            <div><span id="len" style="line-height:24px">Hello</span></div>
+            <div><span id="nrm" style="line-height:normal">Hello</span></div>
+            <div style="font-size:16px"><span id="pct" style="line-height:150%">Hello</span></div>
+            <div style="font-size:16px"><span id="em16" style="line-height:1.5em">Hello</span></div>
+            <div><span id="em20" style="font-size:20px;line-height:1.5em">Hello</span></div>
+            <div style="font-size:10px;line-height:2"><span id="inum" style="font-size:20px">Hello</span></div>
+            <div style="font-size:10px;line-height:20px"><span id="ilen" style="font-size:30px">Hello</span></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 400));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSOMLINEHEIGHTUSED (SR824): a number reads number x the USED font size: `1.5` under 20px reads 30px
+    /// (Chromium), and `font-size: 2em; line-height: 1.5` under 10px reads 30px (1.5 x the used 20px).
+    #[test]
+    fn line_height_used_cssom_number() {
+        let mut e = line_height_used_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "num", "lineHeight"), "30px", "1.5 x 20px");
+        assert_eq!(font_shorthand_cs(&mut e, "numem", "lineHeight"), "30px", "1.5 x the used 2em of 10px");
+    }
+
+    /// AETHERCSSOMLINEHEIGHTUSED (SR824): a px line-height reads its px (it read `normal`: the stored length is negative).
+    #[test]
+    fn line_height_used_cssom_length() {
+        let mut e = line_height_used_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "len", "lineHeight"), "24px");
+    }
+
+    /// AETHERCSSOMLINEHEIGHTUSED (SR824): `normal` stays the keyword (Chromium).
+    #[test]
+    fn line_height_used_cssom_normal() {
+        let mut e = line_height_used_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "nrm", "lineHeight"), "normal");
+    }
+
+    /// AETHERCSSOMLINEHEIGHTUSED (SR824): a % and an em resolve against the element's own used font size: `150%` and
+    /// `1.5em` at 16px read 24px, `1.5em` with `font-size: 20px` reads 30px.
+    #[test]
+    fn line_height_used_cssom_percent_em() {
+        let mut e = line_height_used_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "pct", "lineHeight"), "24px", "150% of 16px");
+        assert_eq!(font_shorthand_cs(&mut e, "em16", "lineHeight"), "24px", "1.5em of 16px");
+        assert_eq!(font_shorthand_cs(&mut e, "em20", "lineHeight"), "30px", "1.5em of the element's own 20px");
+    }
+
+    /// AETHERCSSOMLINEHEIGHTUSED (SR824): CSS 2.2 §10.8.1 inheritance: a number inherits as the number (a 20px child of
+    /// `line-height: 2` reads 40px), a length as the length (a 30px child of `line-height: 20px` reads 20px).
+    #[test]
+    fn line_height_used_cssom_inherit() {
+        let mut e = line_height_used_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "inum", "lineHeight"), "40px", "2 x the child's 20px");
+        assert_eq!(font_shorthand_cs(&mut e, "ilen", "lineHeight"), "20px", "the parent's 20px kept");
+    }
+
+    // ---- AETHERCSSWIDECOLOR (LEDGER SR823): an explicit color: inherit beats an earlier rule and the a tag's link blue (named tail block) ----
+
+    /// AETHERCSSWIDECOLOR (SR823): one row per probe at 20px serif, the rules in a sheet. Under a red parent: a plain
+    /// link (the UA link blue), `a.c { color: blue }` and its `a.c.x { color: inherit }` twin, `a.u { color: unset }`,
+    /// `a.l { color: inherit } a.l.k { color: rgb(0, 160, 0) }` and a same-block `color: inherit; color: rgb(0, 160, 0)`
+    /// link. Under a black-background yellow-text row (the dark theme): the reset sheet's `a.r { color: inherit }` and a
+    /// plain link. Rows 12px apart, so one probe's rect does not take a neighbour's ink.
+    fn css_wide_color_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 12px }
+            a.c { color: blue }
+            a.c.x { color: inherit }
+            a.r { color: inherit }
+            a.u { color: unset }
+            a.l { color: inherit }
+            a.l.k { color: rgb(0, 160, 0) }
+            </style></head><body style="margin:0;font:20px serif">
+            <div style="color:rgb(255, 0, 0)"><a id="aref" href="#">Hello</a></div>
+            <div style="color:rgb(255, 0, 0)"><a id="ac" class="c" href="#">Hello</a></div>
+            <div style="color:rgb(255, 0, 0)"><a id="ax" class="c x" href="#">Hello</a></div>
+            <div style="color:rgb(255, 0, 0)"><a id="au" class="u" href="#">Hello</a></div>
+            <div style="color:rgb(255, 0, 0)"><a id="ak" class="l k" href="#">Hello</a></div>
+            <div style="color:rgb(255, 0, 0)"><a id="ai" href="#" style="color:inherit;color:rgb(0, 160, 0)">Hello</a></div>
+            <div style="background:#000;color:rgb(255, 255, 0)"><a id="ar" class="r" href="#">Hello</a></div>
+            <div style="background:#000;color:rgb(255, 255, 0)"><a id="aref2" href="#">Hello</a></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSWIDECOLOR (SR823): the count of pixels in element `id`'s rect whose (r, g, b) passes `hue`.
+    fn css_wide_color_ink(e: &mut crate::AetherEngine, id: &str, hue: fn((u8, u8, u8)) -> bool) -> usize {
+        let (l, t, w, h) = imgalt_rect(e, id);
+        let (sw, sh) = (e.width as usize, e.height as usize);
+        let (x0, x1) = (l.floor().max(0.0) as usize, ((l + w).ceil() as usize).min(sw));
+        let (y0, y1) = (t.floor().max(0.0) as usize, ((t + h).ceil() as usize + 1).min(sh));
+        let mut n = 0;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                if hue(imgalt_px(e, x, y)) {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    fn css_wide_red(c: (u8, u8, u8)) -> bool {
+        c.0 > 150 && c.1 < 90 && c.2 < 90
+    }
+
+    fn css_wide_blue(c: (u8, u8, u8)) -> bool {
+        c.2 > 150 && c.0 < 90 && c.1 < 90
+    }
+
+    fn css_wide_green(c: (u8, u8, u8)) -> bool {
+        c.1 > 110 && c.0 < 90 && c.2 < 90
+    }
+
+    fn css_wide_yellow(c: (u8, u8, u8)) -> bool {
+        c.0 > 150 && c.1 > 150 && c.2 < 90
+    }
+
+    /// AETHERCSSWIDECOLOR (SR823): `a.c.x { color: inherit }` after `a.c { color: blue }` under a red parent paints red
+    /// (no blue ink); the `a.c` twin and the plain link paint blue (armed); cssom reads the parent's rgb(255, 0, 0).
+    #[test]
+    fn css_wide_color_cross_rule_red() {
+        let mut e = css_wide_color_engine();
+        for id in ["aref", "ac"] {
+            assert!(css_wide_color_ink(&mut e, id, css_wide_blue) > 3, "#{id} paints blue (armed)");
+            assert_eq!(css_wide_color_ink(&mut e, id, css_wide_red), 0, "#{id} paints no red (armed)");
+        }
+        assert!(css_wide_color_ink(&mut e, "ax", css_wide_red) > 3, "a.c.x takes the red parent past the earlier rule");
+        assert_eq!(css_wide_color_ink(&mut e, "ax", css_wide_blue), 0, "a.c.x paints no blue");
+        assert_eq!(font_shorthand_cs(&mut e, "aref", "color"), "rgb(0, 0, 238)", "the plain link reads the UA link blue");
+        assert_eq!(font_shorthand_cs(&mut e, "ax", "color"), "rgb(255, 0, 0)", "cssom reads the parent's colour");
+    }
+
+    /// AETHERCSSWIDECOLOR (SR823): the reset sheet's `a { color: inherit }` under a dark (black, yellow-text) row paints
+    /// the row's yellow, not the UA link blue; the plain link beside it stays blue (armed).
+    #[test]
+    fn css_wide_color_reset_link_dark() {
+        let mut e = css_wide_color_engine();
+        assert!(css_wide_color_ink(&mut e, "aref2", css_wide_blue) > 3, "the plain link on the dark row is blue (armed)");
+        assert!(css_wide_color_ink(&mut e, "ar", css_wide_yellow) > 3, "the reset link paints the row's yellow");
+        assert_eq!(css_wide_color_ink(&mut e, "ar", css_wide_blue), 0, "the reset link paints no blue");
+        assert_eq!(font_shorthand_cs(&mut e, "ar", "color"), "rgb(255, 255, 0)");
+    }
+
+    /// AETHERCSSWIDECOLOR (SR823): `color: unset` is inherit for an inherited property (css-cascade-4 §7.3.3): red.
+    #[test]
+    fn css_wide_color_unset_is_inherit() {
+        let mut e = css_wide_color_engine();
+        assert!(css_wide_color_ink(&mut e, "au", css_wide_red) > 3, "a.u takes the red parent");
+        assert_eq!(css_wide_color_ink(&mut e, "au", css_wide_blue), 0, "a.u paints no blue");
+        assert_eq!(font_shorthand_cs(&mut e, "au", "color"), "rgb(255, 0, 0)");
+    }
+
+    /// AETHERCSSWIDECOLOR (SR823): a later `color: rgb(0, 160, 0)` beats an earlier inherit, across rules (`a.l.k`) and
+    /// in one block (the inline style): green, neither red nor blue.
+    #[test]
+    fn css_wide_color_later_value_wins() {
+        let mut e = css_wide_color_engine();
+        for id in ["ak", "ai"] {
+            assert!(css_wide_color_ink(&mut e, id, css_wide_green) > 3, "#{id} paints the later green");
+            assert_eq!(css_wide_color_ink(&mut e, id, css_wide_red), 0, "#{id} paints no red");
+            assert_eq!(css_wide_color_ink(&mut e, id, css_wide_blue), 0, "#{id} paints no blue");
+            assert_eq!(font_shorthand_cs(&mut e, id, "color"), "rgb(0, 160, 0)", "#{id}: cssom");
+        }
     }
 }
