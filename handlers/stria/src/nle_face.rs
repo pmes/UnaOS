@@ -32,6 +32,7 @@
 //! * NLEPLAYAUDIO (LEDGER SR676): a forward played tick is ONE `render` through `PlaySink` (the still, the meters, the mix to a `media::AudioOut` installed by [`Face::with_audio`]).
 //! * STRIAAUDIOSCRUB (LEDGER SR865): a ruler scrub step (with a device, not playing) is ONE `play_tick` of that tick: its still, the meters, one frame of sound.
 //! * STRIAAUDIOSCRUBMORE (LEDGER SR947): a clip / track click sounds its frame too; a scrub burst waits until the last snippet is mostly played; the meter strip shows the last sounded scrub step.
+//! * STRIAAUDIOSCRUBNEXT (LEDGER SR988): a scrub step the gate refused sounds on a later face clock tick.
 
 use std::time::Duration;
 
@@ -278,7 +279,7 @@ impl Face {
     /// One playback tick: the playhead steps `rate` frames (back when negative); playback stops at the end going
     /// forward and at 0 going back. True when it moved or stopped.
     pub fn tick(&mut self) -> bool {
-        if self.hover_dwell_tick() && !self.playing { return true; } // STRIAINFOREELHOVERDELAY (SR789): the hover dwell counts on THE face clock; the crossing tick repaints (file tail)
+        if (self.hover_dwell_tick() | self.scrub_retry_tick()) && !self.playing { return true; } // STRIAAUDIOSCRUBNEXT (SR988): a refused scrub step retried on the same clock (file tail); STRIAINFOREELHOVERDELAY (SR789): the hover dwell counts on THE face clock; the crossing tick repaints (file tail)
         if !self.playing {
             return false;
         }
@@ -324,7 +325,7 @@ pub async fn serve(bus: Synapse, mut rx: tokio::sync::broadcast::Receiver<SMessa
                 Err(RecvError::Lagged(_)) => continue,
                 Err(RecvError::Closed) => break,
             },
-            _ = clock.tick(), if face.playing || face.exporting() || face.hover_pending() => { // STRIAINFOREELHOVERDELAY (SR789): and a counting hover dwell; NLEFACEEXPORT (SR694): the clock also paints a running export's band
+            _ = clock.tick(), if face.playing || face.exporting() || face.hover_pending() || face.scrub_pending() => { // STRIAAUDIOSCRUBNEXT (SR988): and a refused scrub step owed its sound; STRIAINFOREELHOVERDELAY (SR789): and a counting hover dwell; NLEFACEEXPORT (SR694): the clock also paints a running export's band
                 if face.tick() | face.export_tick() {
                     for m in face.frames() { bus.fire(m); }
                 }
@@ -1769,6 +1770,7 @@ struct PlayAudio {
     run_pushed: u64,
     rate: u32,
     scrub: Option<(u64, u64)>, // STRIAAUDIOSCRUBMORE (SR947): the last scrub burst (device consumed before it, frames it pushed)
+    scrub_retry: Option<i64>, // STRIAAUDIOSCRUBNEXT (SR988): the tick a refused scrub step owes
 }
 
 impl PlayAudio {
@@ -1845,7 +1847,7 @@ impl Face {
         if want == self.play.live {
             return;
         }
-        self.play.live = want; self.play.scrub = None; // STRIAAUDIOSCRUBMORE (SR947): a transport change ends the scrub gate (file tail)
+        self.play.live = want; self.play.scrub = None; self.play.scrub_retry = None; // STRIAAUDIOSCRUBNEXT (SR988): and the owed retry; STRIAAUDIOSCRUBMORE (SR947): a transport change ends the scrub gate (file tail)
         let rate = self.play.rate;
         let Some(o) = self.play.out.as_mut() else { return };
         if want {
@@ -3118,7 +3120,7 @@ impl Face {
     /// released afterwards (an empty ring idles silent) until the next transport change's `sync_audio`.
     fn scrub_burst(&mut self, prev: i64) {
         let ph = self.state.playhead;
-        if self.playing || ph == prev || self.play.out.is_none() || self.play.shown == Some(ph) || ph >= self.state.timeline.end() || !self.scrub_due() { // STRIAAUDIOSCRUBMORE (SR947): and the last snippet mostly played (file tail)
+        if self.playing || ph == prev || self.play.out.is_none() || self.play.shown == Some(ph) || ph >= self.state.timeline.end() || !self.scrub_gate(ph) { // STRIAAUDIOSCRUBNEXT (SR988): the gate records a refused tick; STRIAAUDIOSCRUBMORE (SR947): and the last snippet mostly played (file tail)
             return;
         }
         if let Some(o) = self.play.out.as_mut() {
@@ -3351,5 +3353,110 @@ mod audioscrubmore_tests {
         let mut mute = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
         mute.on(&btn(true, 44.0, 70.0));
         assert!(mute.meter_levels().is_empty());
+    }
+}
+
+// ---- STRIAAUDIOSCRUBNEXT (LEDGER SR988): a refused scrub step is retried on the face clock (named tail block) ----
+
+impl Face {
+    /// STRIAAUDIOSCRUBNEXT (SR988): SR947's gate with the refusal recorded: not due records `ph` as the tick a later face
+    /// clock tick owes its sound; due drops the record. Reached only when every other clause of `scrub_burst`'s guard passed.
+    fn scrub_gate(&mut self, ph: i64) -> bool {
+        let due = self.scrub_due();
+        self.play.scrub_retry = if due { None } else { Some(ph) };
+        due
+    }
+    /// STRIAAUDIOSCRUBNEXT (SR988): a refused scrub step is owed its sound: `serve` runs its clock.
+    pub fn scrub_pending(&self) -> bool {
+        self.play.scrub_retry.is_some()
+    }
+    /// STRIAAUDIOSCRUBNEXT (SR988): one face clock tick of the retry: playing or a playhead moved off the recorded tick
+    /// drops it; not yet due keeps it; due runs SR865's `scrub_burst` itself (the whole guard re-checked) and drops it.
+    /// True only when a render happened (the repaint takes its still).
+    fn scrub_retry_tick(&mut self) -> bool {
+        let Some(t) = self.play.scrub_retry else { return false };
+        if self.playing || t != self.state.playhead {
+            self.play.scrub_retry = None;
+            return false;
+        }
+        if !self.scrub_due() {
+            return false;
+        }
+        let n = self.play.renders;
+        self.scrub_burst(i64::MIN);
+        self.play.scrub_retry = None;
+        self.play.renders != n
+    }
+}
+
+#[cfg(test)]
+mod audioscrubnext_tests {
+    use super::playaudio_tests::{Ev, face, still_at};
+    use super::*;
+
+    fn btn(down: bool, x: f64, y: f64) -> SMessage {
+        SMessage::BrowserButton { down, x, y, mods: 0, surface: 0 }
+    }
+
+    /// STRIAAUDIOSCRUBNEXT M3: a step the gate refused is owed; a clock tick before the device drained keeps it; the tick
+    /// after sounds it (one render) and the paint takes its still.
+    #[test]
+    fn striaaudioscrubnext_retry_sounds() {
+        let (mut f, log) = face();
+        log.lock().unwrap().clear();
+        f.on(&btn(true, 44.0, 70.0));
+        assert_eq!((f.state.playhead, f.played().renders), (5, 1));
+        log.lock().unwrap().clear();
+        f.on(&SMessage::BrowserMouseMove(124.0, 70.0, 0));
+        assert_eq!((f.state.playhead, f.played().renders), (15, 1));
+        assert!(f.scrub_pending());
+        assert!(!f.tick(), "not drained yet");
+        assert_eq!(f.played().renders, 1);
+        assert!(f.scrub_pending());
+        log.lock().unwrap().push(Ev::Push(vec![0.0; 2 * 1440]));
+        assert!(f.tick());
+        assert_eq!((f.state.playhead, f.played().renders), (15, 2));
+        assert!(!f.scrub_pending());
+        let _ = f.frames();
+        assert!(f.play.pending.is_none(), "the paint took the retried still");
+        assert_eq!(f.still().cloned(), still_at(15));
+        assert!(!f.playing);
+    }
+
+    /// STRIAAUDIOSCRUBNEXT M3: a playhead moved off the refused tick drops the retry; play drops it too.
+    #[test]
+    fn striaaudioscrubnext_retry_dropped() {
+        let (mut f, log) = face();
+        log.lock().unwrap().clear();
+        f.on(&btn(true, 44.0, 70.0));
+        log.lock().unwrap().clear();
+        f.on(&SMessage::BrowserMouseMove(124.0, 70.0, 0));
+        assert!(f.scrub_pending());
+        f.state.seek(3);
+        log.lock().unwrap().push(Ev::Push(vec![0.0; 2 * 1440]));
+        assert!(!f.tick());
+        assert!(!f.scrub_pending());
+        assert_eq!(f.played().renders, 1);
+
+        let (mut f, log) = face();
+        log.lock().unwrap().clear();
+        f.on(&btn(true, 44.0, 70.0));
+        log.lock().unwrap().clear();
+        f.on(&SMessage::BrowserMouseMove(124.0, 70.0, 0));
+        assert!(f.scrub_pending());
+        f.on(&btn(false, 124.0, 70.0));
+        f.verb("play");
+        assert!(!f.scrub_pending(), "a transport change drops the retry");
+    }
+
+    /// STRIAAUDIOSCRUBNEXT M3: a face without a device never owes a retry.
+    #[test]
+    fn striaaudioscrubnext_no_device() {
+        let (tl, src) = synth_fixture();
+        let mut mute = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        mute.on(&btn(true, 44.0, 70.0));
+        mute.on(&SMessage::BrowserMouseMove(124.0, 70.0, 0));
+        assert!(!mute.scrub_pending());
+        assert!(!mute.tick());
     }
 }
