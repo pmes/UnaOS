@@ -305,7 +305,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail)
+        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -828,5 +828,36 @@ mod striaclipgainface_tests {
         assert_eq!(st.verb("fade-in soon"), Some(Err(EditError::Fade)));
         assert_eq!(st.verb("fade-in 1 2"), Some(Err(EditError::Fade)));
         assert_eq!((st.selected().unwrap().fade_in, st.selected().unwrap().fade_out), (4, 8));
+    }
+}
+
+// ---- STRIATRACKMUTESOLO (LEDGER SR837): `mute` / `solo` on the selected clip's track through the one commit (named tail block) ----
+// The words ride THE verb dispatch both faces call. RULE: the word toggles the flag of the SELECTED clip's track (the
+// primary of the set); with nothing selected it is refused `EditError::NoTrack`. Each toggle is ONE `commit` (undo-able; it
+// dirties the document, and `edl::write` saves it as `* UNA MUTE` / `* UNA SOLO`); the selection stays.
+impl EditorState {
+    /// Toggle the selected clip's track's mute flag (one commit).
+    pub fn toggle_mute(&mut self) -> Result<(), EditError> {
+        let (track, _) = self.selection.ok_or(EditError::NoTrack)?;
+        let t = self.timeline.tracks.get(track).ok_or(EditError::NoTrack)?;
+        let tl = self.timeline.set_track_flags(track, !t.muted, t.solo)?;
+        self.commit(tl);
+        Ok(())
+    }
+    /// Toggle the selected clip's track's solo flag (one commit).
+    pub fn toggle_solo(&mut self) -> Result<(), EditError> {
+        let (track, _) = self.selection.ok_or(EditError::NoTrack)?;
+        let t = self.timeline.tracks.get(track).ok_or(EditError::NoTrack)?;
+        let tl = self.timeline.set_track_flags(track, t.muted, !t.solo)?;
+        self.commit(tl);
+        Ok(())
+    }
+    /// The `mute` / `solo` words of [`EditorState::verb`]; `None` for any other word.
+    fn track_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        match v {
+            "mute" => Some(self.toggle_mute()),
+            "solo" => Some(self.toggle_solo()),
+            _ => None,
+        }
     }
 }
