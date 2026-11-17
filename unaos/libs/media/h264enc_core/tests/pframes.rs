@@ -269,3 +269,71 @@ fn t8x8_every_p_scene_decodes_to_the_reconstruction() {
         }
     }
 }
+
+// ---- H264ENCPINTRA (LEDGER SR759): a P macroblock the reference cannot predict codes intra (named tail block) ----
+
+/// Frame 0 black (Y 16, Cb / Cr 128); every later frame black on the left half and [`pan`]'s texture on the right
+/// half: the right-half macroblocks of the first P have nothing in the reference to predict them from.
+fn right_half_new(t: usize) -> [Vec<u8>; 3] {
+    let mut p = [vec![16u8; W * H], vec![128u8; W * H / 4], vec![128u8; W * H / 4]];
+    if t == 0 {
+        return p;
+    }
+    let tex = pan(t);
+    for y in 0..H {
+        p[0][y * W + W / 2..(y + 1) * W].copy_from_slice(&tex[0][y * W + W / 2..(y + 1) * W]);
+    }
+    for c in 1..3 {
+        for y in 0..H / 2 {
+            p[c][y * (W / 2) + W / 4..(y + 1) * (W / 2)].copy_from_slice(&tex[c][y * (W / 2) + W / 4..(y + 1) * (W / 2)]);
+        }
+    }
+    p
+}
+
+/// The per-picture intra macroblock counts of `n` frames of `src(t)` under `cfg` (`Encoder::stats`, SR751's count).
+fn intra_counts(cfg: Config, n: usize, src: impl Fn(usize) -> [Vec<u8>; 3]) -> Vec<u32> {
+    let mut enc = Encoder::new(cfg).unwrap();
+    for t in 0..n {
+        enc.encode(&yuv(&src(t))).unwrap();
+    }
+    enc.stats().iter().map(|p| p.intra_mbs).collect()
+}
+
+/// The P bytes of [`right_half_new`] (3 frames, QP 26, GOP 10) with every P macroblock coded inter, measured at the
+/// pre-decision tree (b6fa8e9a7 + SR751): (entropy, transform8x8) -> bytes.
+const PINTRA_ALL_INTER: [(h264enc_core::Entropy, bool, usize); 4] = [
+    (h264enc_core::Entropy::Cavlc, false, 1003),
+    (h264enc_core::Entropy::Cabac, false, 824),
+    (h264enc_core::Entropy::Cavlc, true, 1005),
+    (h264enc_core::Entropy::Cabac, true, 825),
+];
+
+/// H264ENCPINTRA (SR759): the right half new in the first P codes intra (x264 `x264_macroblock_analyse`: intra replaces
+/// the best inter when cheaper); the stream decodes frame by frame to the encoder's reconstruction under CAVLC and CABAC,
+/// the 8x8 transform off and on; its P bytes are fewer than the all-inter coding's.
+#[test]
+fn pintra_new_right_half_codes_intra_and_decodes() {
+    for (entropy, t8x8, all_inter) in PINTRA_ALL_INTER {
+        let c = Config { entropy, transform8x8: t8x8, ..cfg(26, 10, false, 2) };
+        let (aus, _) = round_trip_cfg(c, 3, right_half_new, 30.0);
+        let intra = intra_counts(c, 3, right_half_new);
+        let n = p_bytes(&aus);
+        println!("pintra {entropy:?} t8x8 {t8x8} P intra_mbs={intra:?} p_bytes={n} all_inter={all_inter}");
+        assert!(intra[1] > 0, "{entropy:?} t8x8 {t8x8}: the new right half coded no intra macroblock ({intra:?})");
+        assert!(n < all_inter, "{entropy:?} t8x8 {t8x8}: P bytes {n} not below the all-inter coding's {all_inter}");
+    }
+}
+
+/// H264ENCPINTRA (SR759): a static and a flat scene keep every P macroblock P_Skip — no intra macroblock in a P.
+#[test]
+fn pintra_static_and_flat_p_code_no_intra() {
+    let flat = |_: usize| [vec![100u8; W * H], vec![128u8; W * H / 4], vec![128u8; W * H / 4]];
+    for entropy in [h264enc_core::Entropy::Cavlc, h264enc_core::Entropy::Cabac] {
+        let c = Config { entropy, ..cfg(26, 10, false, 2) };
+        for (name, intra) in [("static", intra_counts(c, 5, |_| frame(0))), ("flat", intra_counts(c, 5, flat))] {
+            println!("pintra {name} {entropy:?} intra_mbs={intra:?}");
+            assert!(intra[1..].iter().all(|&i| i == 0), "{name} {entropy:?}: a P coded intra ({intra:?})");
+        }
+    }
+}

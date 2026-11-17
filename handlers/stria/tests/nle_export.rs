@@ -732,14 +732,14 @@ fn nle5dclitable_h264_table_is_the_cli_chain() {
 
 /// The fnvs of [`nle5dclitable_chain`] over [`NLE5DCLITABLE_SETS`], measured on the tree before SR718 (the old match in place).
 const NLE5DCLITABLE_BEFORE: [u64; 8] = [
-    0xb3c1_26d2_643f_7976,
-    0xd4a7_27d4_5b5d_78c5,
-    0x050f_27c6_7cc3_2beb,
-    0x7265_0fd7_6ad4_126c,
-    0x3657_59b8_8c60_a4d0,
-    0x3657_59b8_8c60_a4d0,
-    0x050f_27c6_7cc3_2beb,
-    0xaae5_c049_c971_23c3, // H264ENCTWOPASSBLUR (SR736): the Default Pass2Opts plan (RAW keeps 0x7aca_82b3_ce88_470a)
+    0x3a30_55bf_79db_7d59, // H264ENCPINTRA (SR759): was 0xb3c1_26d2_643f_7976
+    0xd4a7_27d4_5b5d_78c5, // H264ENCPINTRA (SR759): was 0xd4a7_27d4_5b5d_78c5
+    0x90a9_4459_73cd_a5a0, // H264ENCPINTRA (SR759): was 0x050f_27c6_7cc3_2beb
+    0xa8c4_5a90_2fdd_d16e, // H264ENCPINTRA (SR759): was 0x7265_0fd7_6ad4_126c
+    0x711d_bf3f_792b_8b5d, // H264ENCPINTRA (SR759): was 0x3657_59b8_8c60_a4d0
+    0x711d_bf3f_792b_8b5d, // H264ENCPINTRA (SR759): was 0x3657_59b8_8c60_a4d0
+    0x90a9_4459_73cd_a5a0, // H264ENCPINTRA (SR759): was 0x050f_27c6_7cc3_2beb
+    0xd4ff_03e4_a085_e72a, // H264ENCPINTRA (SR759): was 0xaae5_c049_c971_23c3; H264ENCTWOPASSBLUR (SR736): the Default Pass2Opts plan (RAW keeps 0x4f03_dbed_36e4_72d6)
 ];
 
 #[test]
@@ -753,7 +753,7 @@ fn nle5dclitable_video_named_is_the_default_options() {
         assert_eq!(a, b, "{name}");
     }
     let face = nle5dclitable_fnv(video_named("h264", tl.tb).unwrap(), &refr.frames);
-    assert_eq!(face, 0x8318_f822_3505_f96b, "the face's h264 (SR694), pinned before SR718");
+    assert_eq!(face, 0xb3b7_1570_5572_2a7b, "the face's h264 (SR694), pinned before SR718");
     assert_eq!(face, nle5dclitable_fnv(Box::new(H264Encoder::new(26, 25)), &refr.frames), "QP 26, a one-second GOP");
     assert!(video_named_with("vp9", tl.tb, H264Opts::default()).is_none());
 }
@@ -776,7 +776,7 @@ fn h264enctwopassqcompcli_table_plans_with_the_cli_options() {
     assert_eq!(ninth, NLE5DCLITABLE_BEFORE[7], "set 9: qcomp 0.6 + cplxblur 20 are x264's defaults, set 8's bytes");
     assert_eq!(ninth, nle5dclitable_fnv(Box::new(chain(Pass2Opts::default())), &refr.frames), "set 9: the knob's chain");
     let raw = Pass2Opts { cplxblur: 0, qblur_q8: 0, i_from_gop: false, ..Pass2Opts::default() };
-    assert_eq!(nle5dclitable_fnv(Box::new(chain(raw)), &refr.frames), 0x7aca_82b3_ce88_470a, "RAW plans SR698's QPs: SR718's pin before SR736");
+    assert_eq!(nle5dclitable_fnv(Box::new(chain(raw)), &refr.frames), 0x4f03_dbed_36e4_72d6, "RAW plans SR698's QPs: SR718's pin before SR736");
     let tenth = nle5dclitable_fnv(video_named_with("h264", tl.tb, opts(Some((1, 1)), None)).unwrap(), &refr.frames);
     let knob = nle5dclitable_fnv(Box::new(chain(Pass2Opts { qcomp: (1, 1), ..Pass2Opts::default() })), &refr.frames);
     assert_eq!(tenth, knob, "set 10: the table is the knob's chain");
@@ -785,7 +785,7 @@ fn h264enctwopassqcompcli_table_plans_with_the_cli_options() {
 }
 
 /// The 10th set's fnv, measured on this tree by the arc's EXCEPTION run.
-const H264ENCTWOPASSQCOMPCLI_TENTH: u64 = 0x9b86_a3a8_5d39_7252;
+const H264ENCTWOPASSQCOMPCLI_TENTH: u64 = 0xee63_6af6_08fc_d437;
 
 #[test]
 fn h264enctwopassqcompcli_qcomp_of() {

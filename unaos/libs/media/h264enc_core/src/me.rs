@@ -282,7 +282,7 @@ impl Encoder {
             (luma, chroma) = self.inter_pred(&self.refp, mbx, mby, mv);
             code = self.inter_luma(mbx, mby, &luma, Kind::P16);
         }
-        code.mvd = [mv.x as i32 - pred_mv.x as i32, mv.y as i32 - pred_mv.y as i32];
+        code.mvd = [mv.x as i32 - pred_mv.x as i32, mv.y as i32 - pred_mv.y as i32]; if let Some(intra) = self.intra_over(mbx, mby, self.p16_cost(mbx, mby, &luma, code.mvd), 5) { return intra; }
         self.inter_recon(mbx, mby, &luma, &chroma, &mut code);
         self.motion[i] = MbMotion { r: 0, mv };
         code
@@ -376,7 +376,7 @@ impl Encoder {
                 best = Some((cost, kind, m, l, c));
             }
         }
-        let (_, kind, m, l, c) = best.expect("four candidates");
+        let (cost, kind, m, l, c) = best.expect("four candidates"); if let Some(intra) = self.intra_over(mbx, mby, cost, 23) { return intra; }
         let mut code = self.inter_luma(mbx, mby, &l, kind);
         if kind.l0() {
             code.mvd = mvd0;
@@ -421,5 +421,14 @@ impl Encoder {
             1 => Some(BWeights { explicit: true, log_wd: [lw; 3], w: [[1 << lw; 2]; 3], o: [offsets.unwrap_or([0; 2]), [0; 2], [0; 2]] }),
             _ => None,
         }
+    }
+}
+
+// ---- H264ENCPINTRA (LEDGER SR759): the P_L0_16x16 candidate's cost on b_mb's scale (named tail block) ----
+impl Encoder {
+    /// The cost of macroblock (mbx, mby) as P_L0_16x16 with luma prediction `luma` and motion vector difference `mvd`:
+    /// luma SAD + lambda x (mb_type ue(0) + the mvd's se(v) bits), the unit `b_mb` scores its candidates in.
+    fn p16_cost(&self, mbx: usize, mby: usize, luma: &[i32; 256], mvd: [i32; 2]) -> u32 {
+        self.sad(0, mbx * 16, mby * 16, 16, luma) + lambda(self.qp) * (ue_bits(0) + se_bits(mvd[0]) + se_bits(mvd[1]))
     }
 }

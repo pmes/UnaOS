@@ -260,7 +260,7 @@ fn d_no_bucket_no_bytes_moved() {
     // tests/rc.rs `d_rate_none_keeps_the_constant_qp_bytes`' first pin (60 frames, qp 26, gop 30), with hrd asked for.
     let cfg = Config { width: W as u32, height: H as u32, qp: 26, gop: 30, hrd: true, ..Default::default() };
     let samples: Vec<Vec<u8>> = run(cfg, 60, false).iter().map(Access::avcc_sample).collect();
-    assert_eq!(fnv(&samples), 0x1290_fbb5_41d1_0774, "hrd without a bucket moved the constant-QP bytes");
+    assert_eq!(fnv(&samples), 0x1fbc_56dc_6807_f2a8, "hrd without a bucket moved the constant-QP bytes");
     let crf = |hrd| Config { rate: Some(RateControl::crf(26, (FPS, 1))), hrd, ..cbr400(30) };
     let a: Vec<Vec<u8>> = run(crf(true), N, false).iter().map(Access::annexb).collect();
     let b: Vec<Vec<u8>> = run(crf(false), N, false).iter().map(Access::annexb).collect();

@@ -1663,3 +1663,7 @@ hevcconcealforwardbiinverse|exec-rmbp-hevcconcealforwardbiinverse|/home/user/exe
 nle5dexportmessagerate|exec-rmbp-nle5dexportmessagerate|/home/user/exec/nle5dexportmessagerate|cut 981c1d4dc|wave36 cut92h
 aethercssomshorthandtable|exec-rmbp-aethercssomshorthandtable|/home/user/exec/aethercssomshorthandtable|cut 981c1d4dc|wave36 cut92h
 aetherfallbackfcpatternorder|exec-rmbp-aetherfallbackfcpatternorder|/home/user/exec/aetherfallbackfcpatternorder|cut 981c1d4dc|wave36 cut92h
+h264encpintrasatdbias|exec-rmbp-h264encpintrasatdbias|/home/user/exec/h264encpintrasatdbias|cut 6d52a922c (PARKED SR777)|wave36 cut93h
+striainforeelhoverdelay|exec-rmbp-striainforeelhoverdelay|/home/user/exec/striainforeelhoverdelay|cut 7817adc47|wave36 cut93h
+h264enctwopassclitable|exec-rmbp-h264enctwopassclitable|/home/user/exec/h264enctwopassclitable|cut 7817adc47|wave36 cut93h
+aetherfontdbcachecompact|exec-rmbp-aetherfontdbcachecompact|/home/user/exec/aetherfontdbcachecompact|cut 7817adc47|wave36 cut93h
