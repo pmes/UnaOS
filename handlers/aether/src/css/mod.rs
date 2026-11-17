@@ -1410,7 +1410,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
             };
             let side = |i: usize| paint.border.and_then(|b| b[i]);
             let bw_top = paint.border_width.and_then(|w| w[0]).or(side(0).map(|s| s.0)).unwrap_or(0.0);
-            let lh = if me.line_height <= 0.0 { "normal".to_string() } else { px(me.line_height * me.font_size) };
+            let lh = line_height_used(&paint, me.line_height, me.font_size, layout_core::FontSel { family: me.family, weight: me.weight, italic: me.italic, ..Default::default() }).map(px).unwrap_or_else(|| "normal".to_string());
             let values = [
                 display.to_string(),
                 position.to_string(),
@@ -1728,4 +1728,18 @@ mod tests {
 /// element without a laid-out record (no box) keeps the report's specified / tag-default chain.
 fn font_size_used(paint: &crate::layout::PaintStyle, specified: f32) -> f32 {
     paint.used_font_size.unwrap_or(specified)
+}
+
+// ---- AETHERCSSOMLINEHEIGHTUSED (LEDGER SR824): getComputedStyle's lineHeight is the used px (named tail block) ----
+
+/// AETHERCSSOMLINEHEIGHTUSED (SR824): the resolved `line-height` (CSSOM: `normal` if the computed value is `normal`,
+/// else the used value). `mult` is the inherited `PaintStyle::line_height` in layout_core's sign encoding (css.rs
+/// `line-height` arm: > 0 a <number>, < 0 -(px) for a length / %, 0 `normal`); em and % were already replayed against
+/// the element's own used font by `reresolve_font_relative`. `None` is the keyword `normal`; otherwise the px the line
+/// box takes: the layout's own resolver `Fonts::line_height` over SR819's used font size.
+fn line_height_used(paint: &crate::layout::PaintStyle, mult: f32, specified: f32, sel: layout_core::FontSel) -> Option<f32> {
+    if mult == 0.0 {
+        return None;
+    }
+    Some(layout_core::Fonts::line_height(&crate::layout::HostFonts, sel, font_size_used(paint, specified), mult))
 }
