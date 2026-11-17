@@ -616,7 +616,7 @@ fn play_audio(c: &Cli, engine: &mut Option<Box<dyn std::any::Any>>, face: Face) 
 // ---- NLEFACEEXPORT (LEDGER SR694): the witness's export reading (named tail block) ----
 /// The witness's `"export"` field, only while an export runs (`Face::export_progress`); the default line is unchanged.
 fn export_json(face: &Face) -> String {
-    face.export_progress().map(|(d, t)| format!(",\"export\":{{\"done\":{d},\"total\":{t},\"audio\":\"{}\"{}}}", face.export_audio().unwrap_or_default(), face.export_eta().map(|e| format!(",\"eta_secs\":{}", nle_face::eta_secs(e))).unwrap_or_default() + &face.export_stall().map(|s| format!(",\"stalled_secs\":{}", nle_face::eta_secs(s))).unwrap_or_default())).unwrap_or_default() // NLE5DEXPORTMESSAGEAUDIO (SR756): the running job's audio word; NLE5DEXPORTMESSAGEETA (SR796): eta_secs while known; NLE5DEXPORTMESSAGEETASTALLWITNESS (SR825): stalled_secs while stalled
+    face.export_progress().map(|(d, t)| format!(",\"export\":{{\"done\":{d},\"total\":{t},\"audio\":\"{}\"{}{}}}", face.export_audio().unwrap_or_default(), face.export_pass().map(|(k, n)| format!(",\"pass\":{k},\"passes\":{n}")).unwrap_or_default(), face.export_eta().map(|e| format!(",\"eta_secs\":{}", nle_face::eta_secs(e))).unwrap_or_default() + &face.export_stall().map(|s| format!(",\"stalled_secs\":{}", nle_face::eta_secs(s))).unwrap_or_default())).unwrap_or_default() // NLE5DEXPORTMESSAGEAUDIO (SR756): the running job's audio word; NLE5DEXPORTMESSAGEETA (SR796): eta_secs while known; NLE5DEXPORTMESSAGEETASTALLWITNESS (SR825): stalled_secs while stalled; NLEFACEEXPORTPASSJSON (SR1097): pass / passes after audio under two-pass
 }
 
 // ---- NLE5DEXPORTRANGE (LEDGER SR717): the witness's marked range (named tail block) ----
@@ -901,6 +901,38 @@ mod exportstall_tests {
         assert!(face.wait_export());
         assert_eq!(export_json(&face), "");
         println!("nle5dexportmessageetastallwitness witness: {j}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- NLEFACEEXPORTPASSJSON (LEDGER SR1097): the witness's export object names the pass (named tail block) ----
+#[cfg(test)]
+mod exportpassjson_tests {
+    use super::*;
+
+    /// NLEFACEEXPORTPASSJSON (SR1097): a two-pass export held at 50 of 70 (pass 2 of 2) carries `"pass":2,"passes":2` right
+    /// after `"audio"`; once it is cancelled and joined the object is gone. Single-pass heads are pinned byte-exact above.
+    #[test]
+    fn nlefaceexportpassjson_witness_two_pass_fields() {
+        let exe = std::env::current_exe().expect("the test binary");
+        let dir = exe.parent().expect("its directory").join("nlefaceexportpassjson-witness");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        face.export_paused_plan(&dir, "h264", 50, nle_face::export_plan_of("bitrate 400 two-pass").unwrap()).unwrap();
+        let t0 = std::time::Instant::now();
+        while face.export_progress() != Some((50, 70)) {
+            assert!(t0.elapsed() < std::time::Duration::from_secs(120), "reading {:?}", face.export_progress());
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(face.export_pass(), Some((2, 2)));
+        let j = export_json(&face);
+        let head = j.split_once(",\"eta_secs\":").map_or(j.as_str(), |(h, _)| h);
+        assert_eq!(head.trim_end_matches('}'), r#","export":{"done":50,"total":70,"audio":"wav","pass":2,"passes":2"#, "{j}");
+        assert!(face.cancel_export());
+        assert!(face.wait_export());
+        assert_eq!(export_json(&face), "");
+        println!("nlefaceexportpassjson witness: {j}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
