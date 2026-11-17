@@ -1765,7 +1765,7 @@ struct PlayAudio {
     pushed: u64,
     run_base: u64,
     run_pushed: u64,
-    rate: u32, stretch: Option<gneiss_pal::dsp::audio::stretch::Wsola>, // STRIAJKLTRANSPORT (SR873): the forward 2x / 4x shuttle's ONE stretch (file tail)
+    rate: u32, stretch: Option<ShuttleStretch>, rev_next: Option<i64>, // STRIAJKLTRANSPORT (SR873): the shuttle's ONE stretch (file tail); STRIAJKLMORE (SR945): two stages past 4x, and where the last reverse render began (file tail)
 }
 
 impl PlayAudio {
@@ -1797,15 +1797,15 @@ struct PlaySink<'a> {
     meters: &'a mut MixMeters,
     out: Option<&'a mut Box<dyn crate::media::AudioOut>>,
     still: Option<Still>,
-    pushed: u64, stretch: Option<&'a mut gneiss_pal::dsp::audio::stretch::Wsola>, // STRIAJKLTRANSPORT (SR873): the shuttle's stretch, None at 1x (file tail)
+    pushed: u64, stretch: Option<&'a mut ShuttleStretch>, rev: Option<Vec<f32>>, // STRIAJKLTRANSPORT (SR873): the shuttle's stretch, None at 1x (file tail); STRIAJKLMORE (SR945): a reverse render's stereo, collected (file tail)
 }
 
 impl RenderSink for PlaySink<'_> {
     fn frame(&mut self, _out_t: i64, width: u32, height: u32, rgba: &[u8]) {
-        self.still = Some(Still { width, height, rgba: rgba.to_vec() });
+        if self.rev.is_none() || self.still.is_none() { self.still = Some(Still { width, height, rgba: rgba.to_vec() }); } // STRIAJKLMORE (SR945): a reverse render keeps its FIRST frame, the new playhead (file tail)
     }
     fn pcm(&mut self, out_t: i64, rate: u32, channels: u16, interleaved: &[f32]) {
-        RenderSink::pcm(&mut *self.meters, out_t, rate, channels, interleaved);
+        RenderSink::pcm(&mut *self.meters, out_t, rate, channels, interleaved); if let Some(r) = self.rev.as_mut() { r.extend(crate::media::to_stereo(interleaved, channels as usize)); return; } // STRIAJKLMORE (SR945): a reverse render's audio is pushed by `reverse_tick`, frames reversed (file tail)
         if let Some(o) = self.out.as_mut() {
             let took = o.push(&shuttle_pcm(self.stretch.as_deref_mut(), crate::media::to_stereo(interleaved, channels as usize))); // STRIAJKLTRANSPORT (SR873): stretched at 2x / 4x (file tail)
             self.pushed += (took / 2) as u64;
@@ -1836,9 +1836,9 @@ impl Face {
         PlayStats { renders: self.play.renders, pushed: self.play.pushed, live: self.play.live }
     }
     /// The device follows the transport: released while playing at rate 1; otherwise paused and its ring flushed (a
-    /// forward 2x / 4x shuttle is heard through ONE WSOLA stretch, STRIAJKLTRANSPORT SR873; 8x and reverse are silent: NLE-SHUTTLE-8X-AUDIO / NLE-SHUTTLE-REVERSE owed). A run's end logs what the device consumed, once.
+    /// forward 2x / 4x shuttle is heard through ONE WSOLA stretch, STRIAJKLTRANSPORT SR873; 8x through its two stages and reverse at every rate, STRIAJKLMORE SR945). A run's end logs what the device consumed, once.
     fn sync_audio(&mut self) {
-        let want = self.playing && (1..=SHUTTLE_HEARD).contains(&self.rate); self.shuttle_stretch(); // STRIAJKLTRANSPORT (SR873): 1x, 2x and 4x are heard (file tail)
+        let want = self.playing && (1..=SHUTTLE_MAX).contains(&self.rate.abs()); self.shuttle_stretch(); // STRIAJKLTRANSPORT (SR873): the forward shuttle is heard (file tail); STRIAJKLMORE (SR945): every rate, either direction (file tail)
         if want == self.play.live {
             return;
         }
@@ -1864,7 +1864,7 @@ impl Face {
     /// rate (the old path: `feed_meters` resets, the nudge, the paint renders `preview`). An error is `last_error` and resets
     /// the meters; the paint then renders `preview`, as before, and the next tick still steps on.
     fn play_tick(&mut self, ph: i64) -> bool {
-        if self.rate <= 0 {
+        if self.rate <= 0 { if self.reverse_tick(ph) { return true; } // STRIAJKLMORE (SR945): with a released device a reverse tick is ONE render, heard backward (file tail)
             return false;
         }
         self.play.pending = None;
@@ -1888,7 +1888,7 @@ impl Face {
             }
         }
         let out = if self.play.live { self.play.out.as_mut() } else { None }; // STRIAJKLTRANSPORT (SR873): live is 1x / 2x / 4x forward
-        let mut sink = PlaySink { meters: &mut self.meters, out, still: None, pushed: 0, stretch: self.play.stretch.as_mut() }; // STRIAJKLTRANSPORT (SR873)
+        let mut sink = PlaySink { meters: &mut self.meters, out, still: None, pushed: 0, stretch: self.play.stretch.as_mut(), rev: None }; // STRIAJKLTRANSPORT (SR873); STRIAJKLMORE (SR945): forward pushes as it renders
         let r = render(&self.state.timeline, ph..end, &self.sources, &mut sink);
         let (still, pushed) = (sink.still, sink.pushed);
         self.play.renders += 1;
@@ -1900,7 +1900,7 @@ impl Face {
                 self.meters.reset();
             }
         }
-        (self.play.shown, self.play.next) = (Some(ph), Some(end));
+        (self.play.shown, self.play.next) = (Some(ph), Some(end)); self.play.rev_next = None; // STRIAJKLMORE (SR945): a forward tick ends a reverse run (the next reverse tick flushes)
         true
     }
 }
@@ -2360,7 +2360,7 @@ impl Face {
     }
     /// The face's message line: the last error while one stands, else [`Face::reel_line`].
     pub fn message_text(&self) -> Option<String> {
-        self.last_error.clone().or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.reel_line())
+        self.last_error.clone().or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.shuttle_line()).or_else(|| self.reel_line()) // STRIAJKLMORE (SR945): the shuttle rate after the export line (file tail)
     }
     /// The message over a painted canvas: one line at x 4, baseline the message row's foot - 4, clipped to the canvas width, through
     /// [`Labels`]; unchanged with labels off, on the tracks Surface, or a band under [`MESSAGE_H`].
@@ -3100,17 +3100,18 @@ impl Face {
 
 // ---- STRIAJKLTRANSPORT (LEDGER SR873): the forward shuttle heard at 2x / 4x through audio_core's WSOLA (named tail block) ----
 
-/// STRIAJKLTRANSPORT (SR873): the fastest forward shuttle the device hears: audio_core's `stretch::MAX_RATE` (4.0), the
-/// ceiling of the WSOLA stretch the media Player's `set_rate` uses. 8x plays silent, as before (NLE-SHUTTLE-8X-AUDIO owed).
+/// STRIAJKLTRANSPORT (SR873): one stretch stage's ceiling: audio_core's `stretch::MAX_RATE` (4.0), the ceiling of the WSOLA
+/// stretch the media Player's `set_rate` uses. A faster shuttle (8x) runs two stages ([`ShuttleStretch`], STRIAJKLMORE SR945).
 const SHUTTLE_HEARD: i64 = gneiss_pal::dsp::audio::stretch::MAX_RATE as i64;
 
 impl Face {
-    /// STRIAJKLTRANSPORT (SR873): a forward shuttle at 2x / 4x with a device keeps ONE `Wsola` at the shuttle rate (pitch
-    /// kept; a rate change takes effect at its next hop); 1x, 8x, reverse and stop drop it, so the 1x path is unchanged.
+    /// STRIAJKLTRANSPORT (SR873): a shuttle at 2x..=8x either way (STRIAJKLMORE SR945) with a device keeps ONE
+    /// [`ShuttleStretch`] at |rate| (pitch kept; a rate change takes effect at its next hop); 1x, -1x and stop drop it, so the
+    /// 1x path is unchanged.
     fn shuttle_stretch(&mut self) {
-        if self.playing && self.play.out.is_some() && (2..=SHUTTLE_HEARD).contains(&self.rate) {
-            let (hz, r) = (self.play.rate, self.rate as f64);
-            self.play.stretch.get_or_insert_with(|| gneiss_pal::dsp::audio::stretch::Wsola::new(hz, 2)).set_rate(r);
+        if self.playing && self.play.out.is_some() && (2..=SHUTTLE_MAX).contains(&self.rate.abs()) {
+            let (hz, r) = (self.play.rate, self.rate.abs() as f64);
+            self.play.stretch.get_or_insert_with(|| ShuttleStretch::new(hz)).set_rate(r);
         } else {
             self.play.stretch = None;
         }
@@ -3118,13 +3119,10 @@ impl Face {
 }
 
 /// STRIAJKLTRANSPORT (SR873): a played tick's stereo on its way to the device: unchanged with no stretch (1x), else pushed
-/// through the shuttle's `Wsola` and what it yields so far (a 2x tick's two frames of audio come out as about one).
-fn shuttle_pcm(w: Option<&mut gneiss_pal::dsp::audio::stretch::Wsola>, stereo: Vec<f32>) -> Vec<f32> {
+/// through the shuttle's [`ShuttleStretch`] and what it yields so far (a 2x tick's two frames of audio come out as about one).
+fn shuttle_pcm(w: Option<&mut ShuttleStretch>, stereo: Vec<f32>) -> Vec<f32> {
     let Some(w) = w else { return stereo };
-    w.push(&stereo);
-    let mut out = Vec::new();
-    w.pull(&mut out);
-    out
+    w.run(&stereo)
 }
 
 #[cfg(test)]
@@ -3206,8 +3204,8 @@ mod striajkltransport_tests {
     }
 
     /// STRIAJKLTRANSPORT M3: 2x and 4x stay released (no pause, no flush on the step up) and keep the device in real time
-    /// (N ticks push N x 1920 frames within one WSOLA frame); 8x pauses and flushes and pushes nothing; back at 1x every
-    /// tick pushes exactly 1920 again (the stretch dropped).
+    /// (N ticks push N x 1920 frames within one WSOLA frame); 8x is released too and pushes (STRIAJKLMORE SR945, seat-granted:
+    /// it pinned the owed silence); back at 1x every tick pushes exactly 1920 again (the stretch dropped).
     #[test]
     fn striajkltransport_audio_follows() {
         let per = (SYNTH_RATE / 25) as usize;
@@ -3238,12 +3236,12 @@ mod striajkltransport_tests {
             key(&mut f, "l");
         }
         assert_eq!(f.rate, 8);
-        assert!(!f.played().live, "8x is silent, as before");
-        assert_eq!(dev.lock().unwrap().paused.last(), Some(&true));
+        assert!(f.played().live, "STRIAJKLMORE (SR945): 8x is released (two stretch stages)");
+        assert_eq!(dev.lock().unwrap().paused.last(), Some(&false));
         let before = dev.lock().unwrap().pushed.iter().sum::<usize>();
-        assert!(f.tick() && f.tick());
-        assert_eq!(dev.lock().unwrap().pushed.iter().sum::<usize>(), before, "8x pushes nothing");
-        assert!(f.play.stretch.is_none());
+        assert!(f.tick() && f.tick() && f.tick());
+        assert!(dev.lock().unwrap().pushed.iter().sum::<usize>() > before, "STRIAJKLMORE (SR945): 8x pushes");
+        assert!(f.play.stretch.is_some());
 
         let (mut f, dev) = face();
         key(&mut f, "l");
@@ -3258,7 +3256,8 @@ mod striajkltransport_tests {
         assert_eq!(dev.lock().unwrap().pushed, vec![per; 3], "1x after a shuttle is today's path");
     }
 
-    /// STRIAJKLTRANSPORT M3: reverse is silent: J pauses and flushes the device and its ticks push nothing; a face with no
+    /// STRIAJKLTRANSPORT M3, rewritten by STRIAJKLMORE (SR945, seat-granted: it pinned the owed silence): J keeps the device
+    /// released (no pause), its first tick flushes the ring once (the direction change) and its ticks push; a face with no
     /// device never builds a stretch.
     #[test]
     fn striajkltransport_reverse_silent() {
@@ -3268,13 +3267,14 @@ mod striajkltransport_tests {
         assert!(f.tick());
         let flushes = dev.lock().unwrap().flushes;
         key(&mut f, "j");
-        assert_eq!((f.playing, f.rate, f.played().live), (true, -1, false));
+        assert_eq!((f.playing, f.rate, f.played().live), (true, -1, true));
         let (pushed, last, fl) = { let d = dev.lock().unwrap(); (d.pushed.iter().sum::<usize>(), d.paused.last().copied(), d.flushes) };
-        assert_eq!((last, fl), (Some(true), flushes + 1));
+        assert_eq!((last, fl), (Some(false), flushes), "STRIAJKLMORE (SR945): J stays released");
         key(&mut f, "j");
         assert!(f.tick() && f.tick());
-        assert_eq!(dev.lock().unwrap().pushed.iter().sum::<usize>(), pushed, "reverse pushes nothing");
-        assert!(f.play.stretch.is_none());
+        assert_eq!(dev.lock().unwrap().flushes, flushes + 1, "STRIAJKLMORE (SR945): the direction change flushes once");
+        assert!(dev.lock().unwrap().pushed.iter().sum::<usize>() > pushed, "STRIAJKLMORE (SR945): reverse pushes");
+        assert!(f.play.stretch.is_some(), "-2x stretches");
 
         let (tl, src) = synth_fixture();
         let mut mute = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
@@ -3282,5 +3282,302 @@ mod striajkltransport_tests {
         key(&mut mute, "l");
         assert!(mute.tick());
         assert!(mute.play.stretch.is_none());
+    }
+}
+
+// ---- STRIAJKLMORE (LEDGER SR945): the 8x and reverse shuttle heard, the rate on the message line (named tail block) ----
+// SR873's ONE shuttle stretch becomes two audio_core `Wsola` stages: stage a at |rate| up to `MAX_RATE` (4), stage b at 4
+// only past it (8x = 2 x 4, pitch kept). A reverse tick with a released device is ONE `nle::render` of `ph + rate..ph`
+// through the same `PlaySink` (its `rev` collects the stereo, its `frame` keeps the first frame = the new playhead), heard
+// with its frames reversed through the same stretch; without a device the old silent nudge path stands. The message line
+// reads `shuttle <rate>x` while playing at any rate but 1 (after an error and the export line, before the reel line).
+// Owed: NLE-SHUTTLE-KERNEL (the kernel Player's EDIT_KEYS: kernel file), NLE-SHUTTLE-KHOLD (needs a key-release SMessage).
+
+/// STRIAJKLMORE (SR945): the shuttle's stretch: stage `a` at |rate| (<= [`SHUTTLE_HEARD`]), stage `b` at `SHUTTLE_HEARD` only
+/// when |rate| is past it, so 8x is 2x then 4x, the pitch kept by both.
+struct ShuttleStretch {
+    a: gneiss_pal::dsp::audio::stretch::Wsola,
+    b: Option<gneiss_pal::dsp::audio::stretch::Wsola>,
+    hz: u32,
+}
+
+impl ShuttleStretch {
+    fn new(hz: u32) -> ShuttleStretch {
+        ShuttleStretch { a: gneiss_pal::dsp::audio::stretch::Wsola::new(hz, 2), b: None, hz }
+    }
+    /// The shuttle's |rate|: one stage up to [`SHUTTLE_HEARD`], two past it (each change takes effect at its next hop).
+    fn set_rate(&mut self, r: f64) {
+        let top = SHUTTLE_HEARD as f64;
+        if r > top {
+            self.a.set_rate(r / top);
+            let hz = self.hz;
+            self.b.get_or_insert_with(|| gneiss_pal::dsp::audio::stretch::Wsola::new(hz, 2)).set_rate(top);
+        } else {
+            self.a.set_rate(r);
+            self.b = None;
+        }
+    }
+    /// Both stages from silence (the ring was flushed).
+    fn reset(&mut self) {
+        self.a.reset();
+        if let Some(b) = self.b.as_mut() {
+            b.reset();
+        }
+    }
+    /// Stereo through the stages: what they yield so far.
+    fn run(&mut self, stereo: &[f32]) -> Vec<f32> {
+        self.a.push(stereo);
+        let mut mid = Vec::new();
+        self.a.pull(&mut mid);
+        let Some(b) = self.b.as_mut() else { return mid };
+        b.push(&mid);
+        let mut out = Vec::new();
+        b.pull(&mut out);
+        out
+    }
+}
+
+/// STRIAJKLMORE (SR945): interleaved stereo with its frames in reverse order (the last frame first; each frame's L / R kept).
+fn reversed_frames(stereo: &[f32]) -> Vec<f32> {
+    stereo.chunks_exact(2).rev().flatten().copied().collect()
+}
+
+impl Face {
+    /// STRIAJKLMORE (SR945): one reverse tick at playhead `ph` with a released device: ONE render of `max(ph + rate, 0)..ph`
+    /// through [`PlaySink`] (the meters fed, the first frame kept, the stereo collected), its frames reversed and pushed
+    /// through the shuttle's stretch, the playhead at the range's start with that frame shown. A jump (the last reverse render
+    /// did not begin at `ph`) flushes the ring and resets the stretch and the meters, as `play_tick` does. False with no
+    /// device or a paused one (the silent nudge path). An error is `last_error` and resets the meters.
+    fn reverse_tick(&mut self, ph: i64) -> bool {
+        if self.rate >= 0 || !self.play.live || self.play.out.is_none() {
+            return false;
+        }
+        self.play.pending = None;
+        let lo = (ph + self.rate).max(0);
+        if lo >= ph {
+            self.playing = false;
+            self.sync_audio();
+            return true;
+        }
+        if self.play.rev_next != Some(ph) {
+            self.meters.reset();
+            if let Some(w) = self.play.stretch.as_mut() {
+                w.reset();
+            }
+            if let Some(o) = self.play.out.as_mut() {
+                o.flush();
+            }
+        }
+        let mut sink = PlaySink { meters: &mut self.meters, out: None, still: None, pushed: 0, stretch: None, rev: Some(Vec::new()) };
+        let r = render(&self.state.timeline, lo..ph, &self.sources, &mut sink);
+        let (still, back) = (sink.still, sink.rev.unwrap_or_default());
+        self.play.renders += 1;
+        if let Some(o) = self.play.out.as_mut() {
+            let took = o.push(&shuttle_pcm(self.play.stretch.as_mut(), reversed_frames(&back)));
+            self.play.pushed += (took / 2) as u64;
+        }
+        match r {
+            Ok(_) => self.play.pending = Some((lo, still)),
+            Err(e) => {
+                self.last_error = Some(format!("meters: {e}"));
+                self.meters.reset();
+            }
+        }
+        self.state.seek(lo);
+        (self.play.shown, self.play.next, self.play.rev_next) = (None, None, Some(lo));
+        true
+    }
+    /// STRIAJKLMORE (SR945): the shuttle rate as the message line reads it, `shuttle <rate>x` (`shuttle 8x`, `shuttle -2x`),
+    /// while playing at any rate but 1; `None` at play speed or stopped.
+    pub fn shuttle_line(&self) -> Option<String> {
+        (self.playing && self.rate != 1).then(|| format!("shuttle {}x", self.rate))
+    }
+}
+
+#[cfg(test)]
+mod striajklmore_tests {
+    use super::*;
+    use crate::media::AudioOut;
+    use crate::nle::SYNTH_RATE;
+    use std::sync::{Arc, Mutex};
+
+    /// The device's calls: every push's frames and samples, the pause states, the flushes.
+    #[derive(Default)]
+    struct Dev {
+        pushes: Vec<usize>,
+        samples: Vec<f32>,
+        paused: Vec<bool>,
+        flushes: usize,
+    }
+    struct Out(Arc<Mutex<Dev>>);
+    impl AudioOut for Out {
+        fn push(&mut self, stereo: &[f32]) -> usize {
+            let mut d = self.0.lock().unwrap();
+            d.pushes.push(stereo.len() / 2);
+            d.samples.extend_from_slice(stereo);
+            stereo.len()
+        }
+        fn consumed(&self) -> u64 {
+            self.0.lock().unwrap().pushes.iter().sum::<usize>() as u64
+        }
+        fn flush(&mut self) {
+            self.0.lock().unwrap().flushes += 1;
+        }
+        fn set_paused(&mut self, p: bool) {
+            self.0.lock().unwrap().paused.push(p);
+        }
+    }
+
+    fn face() -> (Face, Arc<Mutex<Dev>>) {
+        let (tl, src) = synth_fixture();
+        let dev = Arc::new(Mutex::new(Dev::default()));
+        (Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false).with_audio(Box::new(Out(dev.clone())), SYNTH_RATE), dev)
+    }
+
+    fn mute() -> Face {
+        let (tl, src) = synth_fixture();
+        Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false)
+    }
+
+    fn key(f: &mut Face, k: &str) {
+        assert!(f.on(&SMessage::BrowserText(k.into())));
+    }
+
+    fn pushed(dev: &Arc<Mutex<Dev>>) -> usize {
+        dev.lock().unwrap().pushes.iter().sum()
+    }
+
+    const PER: usize = (SYNTH_RATE / 25) as usize;
+    const WSOLA_N: usize = (SYNTH_RATE as usize / 50) & !1;
+
+    /// STRIAJKLMORE M3: L x4 is 8x and released, the 4x -> 8x step neither pauses nor flushes, two stages run; four 8x ticks
+    /// (1..33 of the 35-tick fixture) keep the device in real time (4 x 1920 frames, within four WSOLA frames under and two
+    /// over); K drops the stretch.
+    #[test]
+    fn striajklmore_eight_heard() {
+        let (mut f, dev) = face();
+        key(&mut f, "l");
+        assert!(f.tick(), "a 1x tick first: the run is under way");
+        key(&mut f, "l");
+        key(&mut f, "l");
+        assert_eq!(f.rate, 4);
+        let (paused, flushes) = { let d = dev.lock().unwrap(); (d.paused.clone(), d.flushes) };
+        key(&mut f, "l");
+        assert_eq!((f.rate, f.played().live), (8, true));
+        assert!(f.play.stretch.as_ref().is_some_and(|s| s.b.is_some()), "8x runs two stages");
+        let base = pushed(&dev);
+        let n = 4;
+        for _ in 0..n {
+            assert!(f.tick());
+        }
+        let d = dev.lock().unwrap();
+        assert_eq!((d.paused.clone(), d.flushes), (paused, flushes), "8x: no pause, no flush");
+        let got = d.pushes.iter().sum::<usize>() - base;
+        assert!(got + 4 * WSOLA_N >= n * PER && got <= n * PER + 2 * WSOLA_N, "8x: {got} frames for {n} ticks");
+        drop(d);
+        key(&mut f, "k");
+        assert!(f.play.stretch.is_none());
+        assert_eq!(f.shuttle_line(), None);
+    }
+
+    /// STRIAJKLMORE M3: J at 20 stays released; one -1x tick is ONE push of 1920 frames, exactly a forward face's push for
+    /// 19..20 with its frames reversed, and shows tick 19's frame at playhead 19; -4x keeps the device in real time; the run
+    /// to 0 stops, pauses and flushes; L after J flushes once (the direction change).
+    #[test]
+    fn striajklmore_reverse_heard() {
+        let (mut fwd, fdev) = face();
+        fwd.state.seek(19);
+        key(&mut fwd, "l");
+        assert!(fwd.tick());
+        let ahead = fdev.lock().unwrap().samples.clone();
+        assert_eq!(ahead.len(), 2 * PER);
+        let ahead_still = fwd.play.pending.clone().expect("the forward still");
+
+        let (mut f, dev) = face();
+        f.state.seek(20);
+        key(&mut f, "j");
+        assert_eq!((f.playing, f.rate, f.played().live), (true, -1, true));
+        assert_eq!(dev.lock().unwrap().paused.last(), Some(&false), "J releases the device");
+        assert!(f.tick());
+        assert!(f.last_error.is_none(), "{:?}", f.last_error);
+        assert_eq!(f.state.playhead, 19);
+        {
+            let d = dev.lock().unwrap();
+            assert_eq!(d.pushes, vec![PER], "one push of one tick");
+            assert_eq!(d.samples, reversed_frames(&ahead), "the forward audio, frames reversed");
+        }
+        let still = f.play.pending.clone().expect("the reverse still");
+        assert_eq!(still.0, 19);
+        assert_eq!(still.1.map(|s| s.rgba), ahead_still.1.map(|s| s.rgba), "tick 19's frame");
+
+        let (mut f, dev) = face();
+        let end = f.state.timeline.end();
+        f.state.seek(end);
+        for _ in 0..3 {
+            key(&mut f, "j");
+        }
+        assert_eq!(f.rate, -4);
+        let n = 4;
+        for _ in 0..n {
+            assert!(f.tick());
+        }
+        assert_eq!(f.state.playhead, end - 4 * n as i64);
+        let got = pushed(&dev);
+        assert!(got + 2 * WSOLA_N >= n * PER && got <= n * PER + WSOLA_N, "-4x: {got} frames for {n} ticks");
+        let flushes = dev.lock().unwrap().flushes;
+        while f.tick() {}
+        assert_eq!((f.playing, f.state.playhead), (false, 0), "the run to 0 stops");
+        let d = dev.lock().unwrap();
+        assert_eq!((d.paused.last().copied(), d.flushes), (Some(true), flushes + 1), "stopped: paused and flushed");
+        drop(d);
+
+        let (mut f, dev) = face();
+        f.state.seek(20);
+        key(&mut f, "j");
+        assert!(f.tick() && f.tick());
+        let flushes = dev.lock().unwrap().flushes;
+        key(&mut f, "l");
+        assert!(f.tick());
+        assert_eq!(dev.lock().unwrap().flushes, flushes + 1, "the direction change flushes once");
+        assert!(f.tick());
+        assert_eq!(dev.lock().unwrap().flushes, flushes + 1, "then the forward run is continuous");
+    }
+
+    /// STRIAJKLMORE M3: with no device a reverse tick is the old path: the playhead nudges back, the meters stay empty, no
+    /// render, no stretch.
+    #[test]
+    fn striajklmore_reverse_without_device() {
+        let mut f = mute();
+        f.state.seek(5);
+        key(&mut f, "j");
+        key(&mut f, "j");
+        assert_eq!(f.rate, -2);
+        assert!(f.tick());
+        assert_eq!(f.state.playhead, 3);
+        assert!(f.meters().levels().is_empty());
+        assert_eq!(f.played().renders, 0);
+        assert!(f.play.stretch.is_none());
+    }
+
+    /// STRIAJKLMORE M3: the message line: nothing stopped or at 1x; `shuttle 2x`, `shuttle 8x`, `shuttle -1x` while
+    /// shuttling; an error wins; K clears it.
+    #[test]
+    fn striajklmore_readout() {
+        let mut f = mute();
+        assert_eq!(f.message_text(), None);
+        key(&mut f, "l");
+        assert_eq!(f.message_text(), None, "1x: no readout");
+        key(&mut f, "l");
+        assert_eq!(f.message_text().as_deref(), Some("shuttle 2x"));
+        key(&mut f, "l");
+        key(&mut f, "l");
+        assert_eq!(f.message_text().as_deref(), Some("shuttle 8x"));
+        key(&mut f, "j");
+        assert_eq!(f.message_text().as_deref(), Some("shuttle -1x"));
+        f.last_error = Some("split: no such clip".into());
+        assert_eq!(f.message_text().as_deref(), Some("split: no such clip"), "an error wins");
+        f.last_error = None;
+        key(&mut f, "k");
+        assert_eq!(f.message_text(), None);
     }
 }
