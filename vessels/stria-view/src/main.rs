@@ -185,7 +185,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         }
         ["wheel", n] => SMessage::BrowserScroll(0.0, -nle_face::WHEEL_STEP * px(n)?, 0),
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
-        [w @ ("kind" | "ease"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
+        [w @ ("kind" | "ease" | "tc"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`; STRIATCSET (SR908): `tc:frames` sets the readout
         ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button
         _ => return None,
     };
@@ -937,5 +937,31 @@ mod striatimecodedisplay_tests {
         assert_eq!(seen, [",\"tc\":\"timecode\"", ",\"tc\":\"frames\"", ",\"tc\":\"seconds\"", ""]);
         assert_eq!((f.state.undo_depth(), f.dirty()), (0, false));
         println!("striatimecodedisplay witness: tc x4 -> {seen:?}");
+    }
+}
+
+// ---- STRIATCSET (LEDGER SR908): the witness's `tc:<unit>` token and the `t` key (named tail block) ----
+#[cfg(test)]
+mod striatcset_tests {
+    use super::*;
+
+    /// `tc:frames` / `tc:off` set the readout (no error; `"tc"` reads frames, then absent); `tc:bogus` is the face's one
+    /// error naming `tc`; `key:t` cycles from off to timecode. No undo step, not dirty.
+    #[test]
+    fn striatcset_do_tc_unit_token() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(drive(&mut f, "tc:frames").is_empty());
+        assert_eq!(tc_json(&f), ",\"tc\":\"frames\"");
+        assert!(drive(&mut f, "tc:off").is_empty());
+        assert_eq!(tc_json(&f), "");
+        let errors = drive(&mut f, "tc:bogus");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].starts_with("tc:"), "{errors:?}");
+        assert_eq!(tc_json(&f), "");
+        assert!(drive(&mut f, "key:t").is_empty());
+        assert_eq!(tc_json(&f), ",\"tc\":\"timecode\"");
+        assert_eq!((f.state.undo_depth(), f.dirty()), (0, false));
+        println!("striatcset witness: tc:frames, tc:off, tc:bogus refused, key:t -> timecode");
     }
 }

@@ -387,6 +387,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Meta+Shift+less", "slide-10"),
     ("Ctrl+Shift+greater", "slide+10"),
     ("Meta+Shift+greater", "slide+10"),
+    ("t", "tc"), // STRIATCSET (SR908): `t` (text) cycles the playhead readout through the `tc` word (file tail)
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
@@ -2603,6 +2604,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("slip+10", "slip the clip 10 frames on"),
     ("slide-10", "slide the clip 10 frames earlier"),
     ("slide+10", "slide the clip 10 frames later"),
+    ("tc", "playhead readout: off / timecode / frames / seconds"), // STRIATCSET (SR908)
     ("help", "show / hide this help"),
 ];
 /// NLE5DKEYSHELP (SR744): the help's inset from the band's top and left (px).
@@ -3142,7 +3144,7 @@ pub fn tc_text(t: i64, fps: u32, unit: TcUnit) -> String {
 impl Face {
     /// The `tc` word: the next unit in the cycle (off first); `None` for any other word.
     fn tc_verb(&mut self, v: &str) -> Option<bool> {
-        if v != "tc" {
+        if let Some(r) = self.tc_set(v) { return Some(r); } if v != "tc" { // STRIATCSET (SR908): `tc <unit>` sets the unit directly (file tail)
             return None;
         }
         self.tc = match self.tc {
@@ -3192,5 +3194,55 @@ mod striatimecodedisplay_tests {
         assert_eq!(tc_text(-3, 25, TcUnit::Frames), "0");
         assert_eq!(tc_text(-3, 25, TcUnit::Seconds), "0.00 s");
         assert_eq!([TcUnit::Timecode, TcUnit::Frames, TcUnit::Seconds].map(TcUnit::word), ["timecode", "frames", "seconds"]);
+    }
+}
+
+// ---- STRIATCSET (LEDGER SR908): `tc <unit>` sets the readout directly; `t` keys `tc` (named tail block) ----
+// `tc timecode|frames|seconds|off` sets SR872's readout unit (`off`: none) through `Face::tc_verb`'s first line; bare `tc`
+// still cycles. A view word: no undo step, no dirty. An unknown or extra argument keeps the unit and names itself in
+// `last_error`. The key `t` (a KEYS row, its HELP phrase) fires bare `tc` through `Face::verb`. Stria-view: `tc:<unit>`.
+// Owed: NLE-TC-KERNEL, NLE-TC-DROPFRAME (SR872's), NLE-TC-SET-BUTTON (the one TC button cycles).
+
+/// STRIATCSET (SR908): a `tc` argument as a unit: `off` -> `Some(None)`, a [`TcUnit::word`] -> `Some(Some(unit))`, else `None`.
+pub fn tc_unit_of(w: &str) -> Option<Option<TcUnit>> {
+    if w == "off" {
+        return Some(None);
+    }
+    [TcUnit::Timecode, TcUnit::Frames, TcUnit::Seconds].into_iter().find(|u| u.word() == w).map(Some)
+}
+
+impl Face {
+    /// `tc <unit>`: sets the readout's unit (`None` unless the first word is `tc` and an argument follows).
+    fn tc_set(&mut self, v: &str) -> Option<bool> {
+        let mut words = v.split_whitespace();
+        if words.next() != Some("tc") {
+            return None;
+        }
+        let args: Vec<&str> = words.collect();
+        if args.is_empty() {
+            return None;
+        }
+        match (args.len(), tc_unit_of(args[0])) {
+            (1, Some(u)) => self.tc = u,
+            _ => self.last_error = Some(format!("tc: unknown unit {} (timecode / frames / seconds / off)", args.join(" "))),
+        }
+        Some(true)
+    }
+}
+
+#[cfg(test)]
+mod striatcset_tests {
+    use super::*;
+
+    /// Every unit's word parses back to it; `off` is none; anything else is not a unit.
+    #[test]
+    fn striatcset_unit_words_round_trip() {
+        for u in [TcUnit::Timecode, TcUnit::Frames, TcUnit::Seconds] {
+            assert_eq!(tc_unit_of(u.word()), Some(Some(u)));
+        }
+        assert_eq!(tc_unit_of("off"), Some(None));
+        for w in ["Frames", "", "fps", "tc"] {
+            assert_eq!(tc_unit_of(w), None, "{w:?}");
+        }
     }
 }
