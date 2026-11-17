@@ -14581,3 +14581,25 @@ fn striakinsertall_face_laid_line_is_the_editors() {
     }
     println!("striakinsertall: insert / overwrite -> message row == EditorState::laid_line");
 }
+
+// ---- STRIAPANAUTOWRITE (LEDGER SR9084): the face's pan words and reading on a keyed clip (named tail block) ----
+
+/// On a keyed audio clip `pan-` steps from the pan shown at the playhead and writes the point there (one undo step, the
+/// static pan untouched); the note reads that pan and the clip's point count.
+#[test]
+fn striapanautowrite_face_pan_word_writes_the_point_and_reads_it() {
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+    let input = |f: &mut Face, v: &str| f.on(&bandy::SMessage::Input { target: stria::nle_face::SURFACE.into(), text: v.into() });
+    face.state.select(1, 1).unwrap();
+    let c = face.state.selected().unwrap();
+    face.state.seek(c.at);
+    assert!(input(&mut face, "pan-key 1"));
+    assert_eq!(face.last_error.take(), None);
+    let d0 = face.state.undo_depth();
+    assert!(input(&mut face, "pan-"));
+    let k = face.state.selected().unwrap();
+    assert_eq!((k.pan_keys.points().to_vec(), k.pan_cq8, face.state.undo_depth()), (vec![(c.src_in, 111i8)], 0, d0 + 1));
+    assert_eq!((face.note.as_deref(), face.last_error.as_deref()), (Some("pan: R 87 keys 1"), None));
+    println!("striapanautowrite face: pan- on a keyed clip -> {:?}", face.note);
+}

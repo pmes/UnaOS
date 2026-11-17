@@ -251,9 +251,9 @@ pub fn audio_runs(tl: &Timeline, range: Range<i64>, idx: &dyn SourceIndex) -> Re
     let mut out = Vec::new();
     let mut t = range.start;
     while t < range.end {
-        let here = key(t); let phere = pan_piece(tl, &tracks, t); // STRIAPANAUTOMATION (SR9050): an automated clip's pan splits runs too (file tail)
+        let here = key(t); let phere = pan_piece(tl, &tracks, t); let uhere = under_pan_piece(tl, &tracks, t); // STRIAPANAUTOWRITE (SR9084): a keyed outgoing clip's pan splits the under layer's runs (file tail); STRIAPANAUTOMATION (SR9050): an automated clip's pan splits runs too (file tail)
         let mut end = t + 1;
-        while end < range.end && key(end) == here && pan_piece(tl, &tracks, end) == phere {
+        while end < range.end && key(end) == here && pan_piece(tl, &tracks, end) == phere && under_pan_piece(tl, &tracks, end) == uhere {
             end += 1;
         }
         let mut layers = Vec::new();
@@ -921,4 +921,22 @@ mod striagainenvcurve_tests {
         let inc = h[2].layers[1];
         assert_eq!((inc.gain_cdb, inc.env), (0, [ENV_ONE / 4, ENV_ONE / 2]), "the incoming: its linear rise, untouched");
     }
+}
+
+// ---- STRIAPANAUTOWRITE (LEDGER SR9084): the under layer's run split at a keyed outgoing clip's pan (named tail block) ----
+
+/// STRIAPANAUTOWRITE: per audio track (`tracks`), the pan at tick `t` of the OUTGOING clip under a clip-to-clip crossfade
+/// there when that outgoing clip carries pan points, else `None`. `audio_runs` breaks a run where this changes (beside
+/// SR9050's [`pan_piece`] for the winner), so the under layer's pan is linear between its two edges; with no keyed outgoing
+/// clip every entry is `None` and the runs are exactly as before.
+fn under_pan_piece(tl: &Timeline, tracks: &[usize], t: i64) -> Vec<Option<i8>> {
+    tracks
+        .iter()
+        .map(|&ti| {
+            let ci = tl.clip_at(ti, t)?;
+            tl.crossfade_at(ti, ci).filter(|x| t < x.at + x.dur && x.partner == crate::Partner::Clip)?;
+            let o = tl.tracks[ti].clips.get(ci.checked_sub(1)?)?;
+            (o.pan_keys.n > 0).then(|| o.pan_at(t))
+        })
+        .collect()
 }

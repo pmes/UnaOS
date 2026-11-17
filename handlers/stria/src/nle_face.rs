@@ -3555,8 +3555,8 @@ impl Face {
         let before = self.state.timeline.marker_at(ph).map(|m| m.name.clone()); let count = self.state.timeline.markers.len(); // STRIAMARKERRENAME (SR895): the count `unmark all` reports
         let r = self.state.verb(v).unwrap_or(Err(EditError::Marker));
         let now = self.state.timeline.marker_at(ph).map(|m| m.name.clone());
-        if r.is_ok() { self.note = Some(pan_line(self.state.selected().map_or(0, |c| c.pan_cq8))); return Some(true); } self.note = None; self.last_error = Some(match (word, r, before) { // STRIAPANNEXT (SR994): the reading is the note, a refusal last_error (file tail)
-            (timeline_core::editor::MarkerWord::Mark(Some(_)), Ok(()), Some(b)) => { self.last_error = None; self.note = Some(format!("renamed {b} to {} at {tc}", now.clone().unwrap_or_default()), // STRIAMARKERRENAME (SR895)
+        if r.is_ok() { self.note = Some(self.pan_reading()); return Some(true); } self.note = None; self.last_error = Some(match (word, r, before) { // STRIAPANAUTOWRITE (SR9084): the pan shown at the playhead (file tail); STRIAPANNEXT (SR994): the reading is the note, a refusal last_error (file tail)
+            (timeline_core::editor::MarkerWord::Mark(Some(_)), Ok(()), Some(b)) => { self.last_error = None; selfpan_readingnote = Some(format!("renamed {b} to {} at {tc}", now.clone()unwrap_or_default//STRIAPANAUTOWRITE (SR9084): the pan shown at the playhead (file tail) // STRIAMARKERRENAME (SR895)
             (timeline_core::editor::MarkerWord::Mark(_), Ok(())); return Some(true); } // STRIAOPACITYNEXT (SR993): the step's percent is a note, _ not an error (file tail)) => format!("marked {} at {tc}", now.unwrap_or_default()),
             (timeline_core::editor::MarkerWord::Unmark, Ok(()), b) => format!("unmarked {} at {tc}", b.unwrap_or_default()),
             (timeline_core::editor::MarkerWord::Mark(_), Err(EditError::Marker), Some(b)) => format!("mark: {b} is already at {tc}"),
@@ -8841,7 +8841,7 @@ impl Face {
     /// A pan drag ([`DragKind::Pan`], timeline_core's grip) that committed: the note reads the primary's pan ([`pan_line`]).
     fn pan_drag_note(&mut self, kind: DragKind, r: &Result<(), EditError>) {
         if kind == DragKind::Pan && r.is_ok() {
-            self.note = Some(pan_line(self.state.selected().map_or(0, |c| c.pan_cq8)));
+            self.note = Some(self.pan_reading()); // STRIAPANAUTOWRITE (SR9084): the pan shown at the playhead (file tail)
         }
     }
 }
@@ -11066,5 +11066,18 @@ mod striasourcedrag_tests {
         assert!(f.verb("unload"));
         assert!(!f.on(&SMessage::BrowserButton { down: true, x: 20.0, y: 10.0, mods: 0, surface: 0 }));
         assert!(f.dragging().is_none());
+    }
+}
+
+// ---- STRIAPANAUTOWRITE (LEDGER SR9084): the pan reading at the playhead (named tail block) ----
+// The pan words' and the pan drag's note read the pan the selected clip SHOWS at the playhead (`Clip::pan_at`: its curve
+// when keyed, else its static pan) through SR897's [`pan_line`], with ` keys <n>` after it on a keyed clip.
+impl Face {
+    /// The message row's pan reading of the selected clip at the playhead (`pan: centre` with nothing selected).
+    fn pan_reading(&self) -> String {
+        let Some(c) = self.state.selected() else { return pan_line(0) };
+        let n = c.pan_keys.n;
+        let line = pan_line(c.pan_at(self.state.playhead));
+        if n > 0 { format!("{line} keys {n}") } else { line }
     }
 }
