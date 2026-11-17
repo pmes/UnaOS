@@ -2752,7 +2752,7 @@ fn frame_walk(
                         effects::paint_shadows(sh, box_sx, box_sy, bw, bh, radii, width, height, &boxpaint::sdf, &mut blend_at);
                     }
                     // css-color-4: a translucent background composites source-over.
-                    let bga = spec.bg_alpha.unwrap_or(1.0).clamp(0.0, 1.0);
+                    let bga = layout_core::css::bg_alpha_ink(&spec, inherited.color_alpha).clamp(0.0, 1.0);
                     let background = spec.background.map(|c| layout_core::paint::bg_ink(c, spec.currentcolor, inherited.color)).filter(|_| bga > 0.0);
                     if fancy && mask.is_none() && background.is_some() {
                         let mut blend_a = |x: u32, y: u32, c: (u8, u8, u8), a: f32| blend_at(x, y, c, a * bga);
@@ -3231,7 +3231,7 @@ fn frame_walk(
 
                 // A focused text field shows Chromium's focus ring (`:focus-visible` always matches a
                 // text field): 2px #101010 over the border box's outer edge.
-                let focused_field = is_control && focus_of(dom_node).is_some(); let mut border_a = border.as_mut().map_or(1.0, |b| layout_core::css::border_visible(&spec, b)); // SR1112: alpha-0 sides dropped, the stroke alpha of the rest
+                let focused_field = is_control && focus_of(dom_node).is_some(); let mut border_a = border.as_mut().map_or(1.0, |b| layout_core::css::border_visible(&spec, b, inherited.color_alpha)); // SR1112: alpha-0 sides dropped, the stroke alpha of the rest
                 if focused_field {
                     border = Some([Some((2.0, (16, 16, 16))); 4]); border_a = 1.0;
                 }
@@ -3745,8 +3745,8 @@ fn frame_walk(
                         }
                         let rounded = radius.iter().any(|&r| r != 0.0)
                             || sides.iter().any(|s| s.is_some_and(|s| s.2 != 0));
-                        let bga = spec.bg_alpha.unwrap_or(1.0);
-                        let bda = layout_core::css::border_visible(spec, &mut sides);
+                        let bga = layout_core::css::bg_alpha_ink(spec, inh.get(node).map_or(1.0, |i| i.color_alpha));
+                        let bda = layout_core::css::border_visible(spec, &mut sides, inh.get(node).map_or(1.0, |i| i.color_alpha));
                         let bg_rgb = spec.background.map(|c| layout_core::paint::bg_ink(c, spec.currentcolor, inh.get(node).map_or((0, 0, 0), |i| i.color)));
                         let mut blend_at = |x: u32, y: u32, c: (u8, u8, u8), a: f32| {
                             // Background and border colours composite at their alpha.

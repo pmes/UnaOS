@@ -2676,3 +2676,52 @@ fn apply_declaration_no_duplicate_arm() {
     assert_eq!(styled(&[("border-style", "dashed")]).paint.border_style, Some([1; 4]), "the live arm records the style");
     assert_eq!(styled(&[("border-style", "dotted solid")]).paint.border_style, Some([2, 0, 2, 0]), "per side");
 }
+
+// ---- AETHERCSSCURRENTCOLORALPHA (LEDGER SR1134): currentcolor carries the text colour's alpha to the border and background (named tail block) ----
+
+/// AETHERCSSCURRENTCOLORALPHA (SR1134): a currentcolor side (`border: 2px solid`, colour omitted) reads the ink alpha;
+/// a declared `red` side stays opaque and a declared `rgba(.., 0.25)` side keeps 0.25 whatever the ink; a later
+/// `border-top-color: currentcolor` over red sets only the top's bit.
+#[test]
+fn currentcolor_alpha_border_side() {
+    use layout_core::css::border_side_alpha_ink;
+    let s = styled(&[("border", "2px solid")]);
+    assert_eq!(s.paint.border_alpha, Some([Some(1.0); 4]), "the currentcolor writer stores the 1.0 carrier");
+    for i in 0..4 {
+        assert_eq!(border_side_alpha_ink(&s.paint, i, 0.5), 0.5, "side {i} takes the ink alpha");
+    }
+    let s = styled(&[("border", "2px solid red")]);
+    assert_eq!(border_side_alpha_ink(&s.paint, 0, 0.5), 1.0, "a declared colour keeps its own alpha");
+    let s = styled(&[("border", "2px solid rgba(0, 0, 0, 0.25)")]);
+    assert_eq!((border_side_alpha_ink(&s.paint, 0, 0.5), border_side_alpha_ink(&s.paint, 0, 1.0)), (0.25, 0.25), "regardless of the ink");
+    let s = styled(&[("border", "2px solid red"), ("border-top-color", "currentcolor")]);
+    assert_eq!((border_side_alpha_ink(&s.paint, 0, 0.5), border_side_alpha_ink(&s.paint, 1, 0.5)), (0.5, 1.0), "top currentcolor, right red");
+}
+
+/// AETHERCSSCURRENTCOLORALPHA (SR1134): `border_visible` at ink alpha 0 drops every currentcolor side (Chromium:
+/// `color: transparent; border: 1px solid` paints no border) and keeps a declared red side opaque.
+#[test]
+fn currentcolor_alpha_border_visible_drops() {
+    use layout_core::css::border_visible;
+    let s = styled(&[("border", "2px solid")]);
+    let mut sides = s.paint.border.expect("border");
+    assert_eq!(border_visible(&s.paint, &mut sides, 0.0), 0.0);
+    assert_eq!(sides, [None; 4], "every currentcolor side dropped at ink alpha 0");
+    let mut sides = s.paint.border.expect("border");
+    assert_eq!(border_visible(&s.paint, &mut sides, 0.5), 0.5, "half ink strokes at 0.5");
+    let s = styled(&[("border", "2px solid red")]);
+    let mut sides = s.paint.border.expect("border");
+    assert_eq!(border_visible(&s.paint, &mut sides, 0.0), 1.0);
+    assert!(sides.iter().all(|x| x.is_some()), "a declared red side is kept");
+}
+
+/// AETHERCSSCURRENTCOLORALPHA (SR1134): `background-color: currentcolor` reads the ink alpha; a declared
+/// `rgba(0, 0, 0, 0.25)` keeps 0.25.
+#[test]
+fn currentcolor_alpha_background() {
+    use layout_core::css::bg_alpha_ink;
+    let s = styled(&[("background-color", "currentcolor")]);
+    assert_eq!(bg_alpha_ink(&s.paint, 0.5), 0.5);
+    let s = styled(&[("background-color", "rgba(0, 0, 0, 0.25)")]);
+    assert_eq!(bg_alpha_ink(&s.paint, 0.5), 0.25);
+}
