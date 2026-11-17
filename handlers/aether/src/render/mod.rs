@@ -14,7 +14,7 @@ struct Inherited {
     /// font-stretch, percent.
     stretch: u16,
     /// AETHERFONTSYNTHESISPROPERTY (SR750): the inherited font-synthesis mask (`PaintStyle::no_synth`).
-    no_synth: u8,
+    no_synth: u8, caps: u8,
     word_spacing: f32,
     /// direction: rtl
     rtl: bool,
@@ -51,7 +51,7 @@ impl Inherited {
     }
     /// The measurer/shaper of this text: face stack, size, spacing, direction.
     fn advancer(&self) -> Advancer {
-        Advancer::new(self.sel(), self.font_size, self.letter_spacing).with_word_spacing(self.word_spacing).with_dir(self.rtl)
+        Advancer::new(self.sel(), self.font_size, self.letter_spacing).with_word_spacing(self.word_spacing).with_dir(self.rtl).with_small_caps(layout_core::paint::small_caps_synth(self.caps))
     }
     fn shadows<'a>(&self, layout: &'a LayoutTree) -> &'a [effects::Shadow] {
         self.text_shadow
@@ -479,7 +479,7 @@ fn root_inherited() -> Inherited {
         weight: 400,
         italic: false,
         stretch: 100,
-        no_synth: 0,
+        no_synth: 0, caps: 0,
         word_spacing: 0.0,
         rtl: false,
         text_shadow: None,
@@ -596,7 +596,7 @@ fn draw_shaped(
 ) -> f32 {
     // AETHERPAINTPERF (SR130): the same run at the same pen (exact bits), size, spacing, direction, colour and font
     // set draws the same coverage: replay the pixels the rasterizer emitted, through the same clip, in order.
-    let key = crate::perf::scoped().then(|| glyphcache::key(text, adv, origin_x, baseline_y, color));
+    if adv.small_caps { return small_caps_shaped(text, adv, origin_x, baseline_y, color, surface, width, height, damage_rects, clip); } let key = crate::perf::scoped().then(|| glyphcache::key(text, adv, origin_x, baseline_y, color));
     if let Some(run) = key.as_ref().and_then(glyphcache::get) {
         crate::perf::add_glyph(true);
         for &(px, py, a) in &run.px {
@@ -650,7 +650,7 @@ fn draw_text_shadows(
     text: &str, adv: &Advancer, origin_x: f32, baseline_y: f32, shadows: &[effects::Shadow],
     surface: &mut [u8], width: u32, height: u32, damage_rects: &[(u32, u32, u32, u32)], clip: Clip,
 ) {
-    if shadows.is_empty() {
+    if adv.small_caps { return small_caps_shadows(text, adv, origin_x, baseline_y, shadows, surface, width, height, damage_rects, clip); } if shadows.is_empty() {
         return;
     }
     let placed = adv.place(text);
@@ -1016,7 +1016,7 @@ fn inherit_element(inherited: &mut Inherited, tag: &str, spec: &crate::layout::P
     if let Some(st) = spec.stretch {
         inherited.stretch = st;
     }
-    inherited.no_synth = spec.no_synth(inherited.no_synth);
+    inherited.no_synth = spec.no_synth(inherited.no_synth); inherited.caps = spec.caps(inherited.caps);
     if let Some(ws) = spec.word_spacing {
         inherited.word_spacing = ws;
     }
@@ -4581,5 +4581,36 @@ fn draw_text_from(
     for (i, line) in lines.iter().enumerate() {
         let lx = if i < n && !rtl { x + start_x } else { x };
         draw_text(&line.text, lx, y + i as f32 * line_height, f32::MAX, adv, line_height_mult, color, false, surface, width, height, damage_rects, clip);
+    }
+}
+
+// ---- AETHERFONTVARIANTSMALLCAPS (LEDGER SR800): the painters draw a small-caps run as the pieces it is measured in (named tail block) ----
+
+/// AETHERFONTVARIANTSMALLCAPS (SR800): `draw_shaped` of a small-caps run: each of `Advancer::small_caps_pieces` (a
+/// lowercase segment uppercased at `SMALL_CAPS_SCALE` of the size, the rest at full size) drawn left to right, the pen
+/// advanced by the piece's own `str` — the widths `Advancer::str` gave layout. Returns the advance drawn.
+#[allow(clippy::too_many_arguments)]
+fn small_caps_shaped(
+    text: &str, adv: &Advancer, origin_x: f32, baseline_y: f32, color: (u8, u8, u8),
+    surface: &mut [u8], width: u32, height: u32, damage_rects: &[(u32, u32, u32, u32)], clip: Clip,
+) -> f32 {
+    let mut pen = 0.0f32;
+    for (t, a) in adv.small_caps_pieces(text) {
+        pen += draw_shaped(&t, &a, origin_x + pen, baseline_y, color, surface, width, height, damage_rects, clip);
+    }
+    pen
+}
+
+/// AETHERFONTVARIANTSMALLCAPS (SR800): `draw_text_shadows` of a small-caps run, piece by piece at the pens
+/// [`small_caps_shaped`] draws them at.
+#[allow(clippy::too_many_arguments)]
+fn small_caps_shadows(
+    text: &str, adv: &Advancer, origin_x: f32, baseline_y: f32, shadows: &[effects::Shadow],
+    surface: &mut [u8], width: u32, height: u32, damage_rects: &[(u32, u32, u32, u32)], clip: Clip,
+) {
+    let mut pen = 0.0f32;
+    for (t, a) in adv.small_caps_pieces(text) {
+        draw_text_shadows(&t, &a, origin_x + pen, baseline_y, shadows, surface, width, height, damage_rects, clip);
+        pen += a.str(&t);
     }
 }

@@ -5272,4 +5272,102 @@ mod tests {
         let shift = with_img as i64 - with_span as i64;
         assert!((shift - 4).abs() <= 1, "the line below starts 16 px down, 4 below a 12 px line (line 2 first ink row {with_img} vs {with_span})");
     }
+
+    // ---- AETHERFONTVARIANTSMALLCAPS (LEDGER SR800): font-variant: small-caps synthesizes small capitals (named tail block) ----
+
+    /// AETHERFONTVARIANTSMALLCAPS (SR800): one line per probe at 16px serif: the small-caps "Hello" and its references
+    /// ("H", "ELLO", a plain "Hello"), the two synthesis-none spellings, two block paragraphs for the line box, and the
+    /// `font` shorthand's `small-caps` prefix with an inheriting and a resetting child.
+    fn font_variant_small_caps_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0;font:16px serif">
+            <div><span id="sc" style="font-variant:small-caps">Hello</span></div>
+            <div><span id="h">H</span></div>
+            <div><span id="ello">ELLO</span></div>
+            <div><span id="plain">Hello</span></div>
+            <div><span id="none" style="font-variant:small-caps;font-synthesis-small-caps:none">Hello</span></div>
+            <div><span id="none2" style="font-variant:small-caps;font-synthesis:none">Hello</span></div>
+            <div id="dsc" style="font-variant:small-caps">Hello</div>
+            <div id="dplain">Hello</div>
+            <div id="f" style="font: small-caps 16px serif">x<span id="fk">y</span><span id="fn" style="font-variant-caps:normal">z</span></div>
+            <div id="dflt">q</div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 400));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERFONTVARIANTSMALLCAPS (SR800): the dark-pixel count of each column across element `id`'s line (its rect,
+    /// 2 px of margin above and below), from x 0: two runs painted with the same glyphs at the same pen agree exactly.
+    fn small_caps_ink_columns(e: &mut crate::AetherEngine, id: &str) -> Vec<usize> {
+        let (_, t, _, h) = imgalt_rect(e, id);
+        let (y0, y1) = ((t - 2.0).max(0.0) as usize, (t + h + 2.0).ceil() as usize);
+        (0..200).map(|x| imgalt_ink(e, x, x + 1, y0, y1)).collect()
+    }
+
+    /// AETHERFONTVARIANTSMALLCAPS (SR800): Chromium shapes the lowercase "ello" of a small-caps "Hello" as "ELLO" at
+    /// 0.7 x the font size (kSmallCapsFontSizeMultiplier, recalled), the "H" at full size: the run's advance less the
+    /// "H"'s is 0.7 x a full-size "ELLO"'s, within 1 px.
+    #[test]
+    fn font_variant_small_caps_advance() {
+        let mut e = font_variant_small_caps_engine();
+        let w = |e: &mut crate::AetherEngine, id: &str| imgalt_rect(e, id).2;
+        let (sc, h, ello, plain) = (w(&mut e, "sc"), w(&mut e, "h"), w(&mut e, "ello"), w(&mut e, "plain"));
+        assert!(h > 5.0 && ello > 20.0, "the references lay out ({h} / {ello})");
+        assert!((sc - h - 0.7 * ello).abs() <= 1.0, "small-caps Hello {sc} = H {h} + 0.7 x ELLO {ello}");
+        assert!((sc - plain).abs() > 0.5, "the small-caps run is not the plain run ({sc} vs {plain})");
+    }
+
+    /// AETHERFONTVARIANTSMALLCAPS (SR800): the small segments are shaped smaller but the line box reads the full-size
+    /// face: a small-caps paragraph is exactly as tall as a plain one.
+    #[test]
+    fn font_variant_small_caps_linebox() {
+        let mut e = font_variant_small_caps_engine();
+        let (dsc, dplain) = (imgalt_rect(&mut e, "dsc").3, imgalt_rect(&mut e, "dplain").3);
+        assert!(dplain > 10.0, "the plain paragraph has a line ({dplain})");
+        assert!((dsc - dplain).abs() < 0.01, "the line box does not shrink ({dsc} vs {dplain})");
+    }
+
+    /// AETHERFONTVARIANTSMALLCAPS (SR800): `font-synthesis-small-caps: none` (and the `font-synthesis: none` shorthand,
+    /// SR772) turns the synthesis off: the lowercase renders as is — the advance and the painted ink are the plain run's.
+    #[test]
+    fn font_variant_small_caps_synthesis_none() {
+        let mut e = font_variant_small_caps_engine();
+        let plain_w = imgalt_rect(&mut e, "plain").2;
+        let plain = small_caps_ink_columns(&mut e, "plain");
+        assert!(plain.iter().sum::<usize>() > 20, "the plain run paints");
+        for id in ["none", "none2"] {
+            let w = imgalt_rect(&mut e, id).2;
+            assert!((w - plain_w).abs() < 0.01, "#{id}: the plain advance ({w} vs {plain_w})");
+            assert_eq!(small_caps_ink_columns(&mut e, id), plain, "#{id}: the plain run's ink");
+        }
+    }
+
+    /// AETHERFONTVARIANTSMALLCAPS (SR800): the split reaches the painter: the small-caps run's ink is not the plain
+    /// run's, and its last inked column is within 1 px of its laid-out advance (the painters draw the pieces layout
+    /// measured).
+    #[test]
+    fn font_variant_small_caps_ink() {
+        let mut e = font_variant_small_caps_engine();
+        let sc = small_caps_ink_columns(&mut e, "sc");
+        assert!(sc.iter().sum::<usize>() > 20, "the small-caps run paints");
+        assert_ne!(sc, small_caps_ink_columns(&mut e, "plain"), "small capitals are not the lowercase");
+        let w = imgalt_rect(&mut e, "sc").2;
+        let last = sc.iter().rposition(|&n| n > 0).unwrap() as f64;
+        assert!(last <= w + 1.0 && last >= w - 4.0, "the ink ends at the advance ({last} vs {w})");
+    }
+
+    /// AETHERFONTVARIANTSMALLCAPS (SR800): getComputedStyle's `fontVariantCaps`: the `font` shorthand's `small-caps`
+    /// prefix sets it (the CSSOM does not expand `font`: read from the layout), a child inherits it, a child's
+    /// `font-variant-caps: normal` resets it, the longhand-less default is `normal`, `font-variant: small-caps` sets it.
+    #[test]
+    fn font_variant_small_caps_cssom() {
+        let mut e = font_variant_small_caps_engine();
+        let cs = |e: &mut crate::AetherEngine, id: &str| font_synth_eval(e, &format!("getComputedStyle(document.getElementById('{id}')).fontVariantCaps"));
+        for (id, want) in [("f", "small-caps"), ("fk", "small-caps"), ("fn", "normal"), ("dflt", "normal"), ("sc", "small-caps"), ("dsc", "small-caps")] {
+            assert_eq!(cs(&mut e, id), want, "#{id}: computed font-variant-caps");
+        }
+        assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('f')).getPropertyValue('font-variant-caps')"), "small-caps");
+    }
 }
