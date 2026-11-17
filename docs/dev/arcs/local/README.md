@@ -1,4 +1,4 @@
-# Local executor pack 1 (Aether, trunk-ready)
+# Local executor packs (pack 1 Aether; pack 2 Stria)
 
 The cloud seat cuts arcs, measures designs (R131), folds branches into `claude/optimistic-ramanujan-r3qyu5`
 and pushes on green. A local session can run executors on the same protocol; the division is BY TRACK so the
@@ -45,3 +45,21 @@ syntax before the commit. Merge `origin/claude/optimistic-ramanujan-r3qyu5` befo
 `MEASURE: PASS — <the seat's why>` in the body, committer Claude <noreply@anthropic.com>, NEVER push, NEVER `git stash`, NEVER `git reset --hard`,
 NEVER `pkill -f`. Report: sha + parent, `git show --stat`, "code-only, uncompiled", what landed by M1-M3, the wire the fold should see, shared
 vocabulary touched, the blueprint line, the MEASURE line, owed proposals.
+
+## Local pack 2 (Stria: the suite the local machine can carry)
+
+Four Stria arcs, measure-first like pack 1, cut from the trunk tip (SR827-SR830). Same order of one arc as above; the
+EXCEPTION target dir is `$HOME/unaos-local-target-media` (text_host wants alsa's `PKG_CONFIG_PATH` only if the system
+lacks it). Row prefix for every pack-2 arc is `- NLE5b (SR204 owed)` (handlers.md L104, edited IN PLACE). The cloud seat
+stays out of nle.rs `render`, nle_face.rs `paint`, timeline_core `lib.rs` / `view.rs` / `edl.rs` while pack 2 is open;
+the export-message chain (nle_face.rs `job_line` / `export_eta`, stria-view `export_json`) stays the cloud seat's.
+
+| arc | what | the seam to watch |
+|---|---|---|
+| `striawaveform` (SR827) | audio clip bodies paint their peaks (one reduction in timeline_core view.rs, scanned once per source) | view.rs `paint_in` gains ONE optional parameter: every caller edits one line |
+| `striatitleclip` (SR828) | a title card as a generated Source (`* UNA TITLE` in the EDL; text_host renders the still once) | lib.rs `Source` gains ONE field: every literal gains `title: None` |
+| `striaclipspeed` (SR829) | per-clip rate (`rate_q16`; `Clip::len` / `src_at` the one road; CMX `M2` line; `lay_edit_list` stops refusing) | every `src_out - src_in` reader in timeline_core becomes `len()`: count them in the design |
+| `striaexportframe` (SR830) | `frame [<path>]`: the playhead frame as a PNG (preview road + the existing PNG encoder; a Frame button; `"frame"` on the witness) | stays out of `export_json`; `VERBS` 26 -> 27 |
+
+Order: SR830 first (smallest, no model change), then SR827, then SR828 and SR829 (both touch lib.rs `Clip` / `Source`
+literals: run them one after the other, not side by side, or the second one's merge re-touches every literal line).

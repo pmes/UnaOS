@@ -3,7 +3,7 @@
 //
 //! CHARTER: Stria (CODEX §2 A/V; BP-handlers-14) — the command-line harness of the host tool `tools/nle` (NLECLITESTS,
 //! LEDGER SR799): runs the BUILT binary (`CARGO_BIN_EXE_nle`) and pins the surface people type against: the usage, the
-//! refusals (by name where the tool names them; as they are where it does not, owed NLE-CLI-REFUSALS-BY-NAME), a green raw
+//! refusals (every one by name, NLECLIREFUSALSBYNAME SR801), the help roads (stdout, exit 0), a green raw
 //! export of SR718's table timeline, the two-pass stderr lines, and every flag arm's word in the usage. Every pinned string
 //! is one the tool prints today. Fixtures live under `CARGO_TARGET_TMPDIR` through ONE helper ([`scratch`]), never /tmp.
 
@@ -108,7 +108,7 @@ fn has_word(text: &str, w: &str) -> bool {
 
 #[test]
 fn cli_no_verb_prints_usage() {
-    let roads: [&[&str]; 4] = [&[], &["help"], &["--help"], &["export"]];
+    let roads: [&[&str]; 3] = [&[], &["bogus"], &["export"]]; // NLECLIREFUSALSBYNAME (SR801): the help roads moved to cli_help_exits_zero_on_stdout
     for road in roads {
         let (code, out, err) = nle(road);
         assert_eq!(code, 2, "{road:?}: usage exits 2");
@@ -127,8 +127,10 @@ fn cli_export_refuses_by_name() {
     let (dir, edl, srcs) = fixture("refuse");
     let stats = s(&dir.join("pass.stats"));
     let st = stats.as_str();
-    // Refused BY NAME: `nle: <msg>` on stderr, exit 1.
-    let named: [(&[&str], &str); 11] = [
+    // Refused BY NAME: `nle: <msg>` on stderr, exit 1 (NLECLIREFUSALSBYNAME SR801: every refusal; the table words from stria's).
+    let video_want = format!("nle: --video bogus: one of {}", VIDEO_NAMES.join("|"));
+    let audio_want = format!("nle: --audio bogus: one of {}|aac:KBPS", AUDIO_NAMES.join("|"));
+    let named: [(&[&str], &str); 20] = [
         (&["--qblur", "17"], "nle: --qblur 17: not a number within 0..=16"),
         (&["--qblur", "x"], "nle: --qblur x: not a number within 0..=16"),
         (&["--qcomp", "2"], "nle: --qcomp 2: not a fraction within 0..=1"),
@@ -140,33 +142,25 @@ fn cli_export_refuses_by_name() {
         (&["--pass", "1", "--stats", st, "--bitrate", "40"], "nle: --pass needs --video h264"),
         (&["--stats", st], "nle: --stats needs --pass 1|2"),
         (&["--pass", "1", "--bitrate", "40", "--video", "h264"], "nle: --pass needs --stats <file>"),
+        (&["--video", "bogus"], video_want.as_str()),
+        (&["--audio", "bogus"], audio_want.as_str()),
+        (&["--qp", "x"], "nle: --qp x: not a whole number within 0..=255"),
+        (&["--min-keyint", "x"], "nle: --min-keyint x: not a whole number within 0..=4294967295"),
+        (&["--cplxblur", "x"], "nle: --cplxblur x: not a whole number within 0..=4294967295"),
+        (&["--bogus"], "nle: --bogus: unknown flag (nle export --help lists them)"),
+        (&["--src", "AX"], "nle: --src AX: REEL=<media> expected"),
+        (&["--pass", "x"], "nle: --pass x: not 1 or 2"),
+        (&["--out"], "nle: --out: a value is required"),
     ];
     for (i, (extra, want)) in named.iter().enumerate() {
         let out = dir.join(format!("named{i}"));
         let (code, stdout, err) = export(&edl, &srcs, &out, extra);
         assert_eq!((code, err.as_str(), stdout.as_str()), (1, format!("{want}\n").as_str(), ""), "{extra:?}");
+        assert!(!out.exists(), "{extra:?}: refused before the output dir is made");
     }
     // A reel the EDL cites with no --src: refused by name.
     let (code, _, err) = export(&edl, &srcs[..2], &dir.join("nosrc"), &[]);
     assert_eq!((code, err.as_str()), (1, "nle: no --src for reel B\n"));
-    // Refused WITHOUT a name today (bare usage, exit 2): pinned as they are; owed NLE-CLI-REFUSALS-BY-NAME.
-    let unnamed: [&[&str]; 7] = [
-        &["--video", "bogus"],
-        &["--audio", "bogus"],
-        &["--qp", "x"],
-        &["--min-keyint", "x"],
-        &["--cplxblur", "x"],
-        &["--bogus"],
-        &["--src", "AX"],
-    ];
-    for (i, extra) in unnamed.iter().enumerate() {
-        let out = dir.join(format!("unnamed{i}"));
-        let (code, stdout, err) = export(&edl, &srcs, &out, extra);
-        assert_eq!(code, 2, "{extra:?}: {err}");
-        assert_eq!(stdout, "", "{extra:?}");
-        assert_eq!(err.lines().next(), Some(USAGE_FIRST), "{extra:?}");
-        assert!(!out.exists(), "{extra:?}: refused before the output dir is made");
-    }
 }
 
 #[test]
@@ -235,4 +229,20 @@ fn cli_usage_lists_every_flag() {
     let line3 = usage.lines().nth(2).unwrap();
     assert!(line3.contains(&format!("[--video {}]", VIDEO_NAMES.join("|"))), "the video table's words: {line3}");
     assert!(line3.contains(&format!("[--audio {}|aac:KBPS]", AUDIO_NAMES.join("|"))), "the audio table's words: {line3}");
+}
+
+// ---- NLECLIREFUSALSBYNAME (LEDGER SR801): NLE-CLI-HELP, the usage asked for (named tail block) ----
+#[test]
+fn cli_help_exits_zero_on_stdout() {
+    let usage = usage_text();
+    assert_eq!(usage.lines().next(), Some(USAGE_FIRST), "the stderr usage of `nle`");
+    let roads: [&[&str]; 3] = [&["help"], &["--help"], &["export", "--help"]];
+    for road in roads {
+        let (code, out, err) = nle(road);
+        assert_eq!(code, 0, "{road:?}: a person asked for it, exit 0");
+        assert_eq!(err, "", "{road:?}: nothing on stderr");
+        assert_eq!(out.lines().count(), 5, "{road:?}: five usage lines: {out}");
+        assert_eq!(out.lines().next(), Some(USAGE_FIRST), "{road:?}");
+        assert_eq!(out, usage, "{road:?}: stdout carries the same usage `nle` prints on stderr");
+    }
 }
