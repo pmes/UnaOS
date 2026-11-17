@@ -692,7 +692,7 @@ impl EditorState {
     }
     /// The `close-gaps` / `gap <n>` words of [`EditorState::verb`]; `None` when `v` is neither.
     fn gap_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        if v.trim() == "gap" { let s = self.timeline.tb.from_ns(1_000_000_000).max(1); return Some(self.insert_gap(s)); } Some(match gap_words(v)? { // STRIAGAPSBLACK (SR909): a bare `gap` opens one second
+        if v.split_ascii_whitespace().eq(["close-gaps", "all"]) { return Some(self.close_gaps_all()); } if v.trim() == "gap" { let s = self.timeline.tb.from_ns(1_000_000_000).max(1); return Some(self.insert_gap(s)); } Some(match gap_words(v)? { // STRIAGAPSBLACK (SR909): a bare `gap` opens one second; STRIAGAPSALLTRACKS (SR929): `close-gaps all` (file tail)
             None => self.close_gaps(),
             Some(n) => self.insert_gap(n),
         })
@@ -708,4 +708,18 @@ fn gap_words(v: &str) -> Option<Option<i64>> {
         _ => return None,
     };
     w.next().is_none().then_some(n)
+}
+
+// ---- STRIAGAPSALLTRACKS (LEDGER SR929): `close-gaps all` through the one commit (named tail block) ----
+// Every track's gaps close as ONE commit (one undo step) through `Timeline::close_gaps_all`; no selection is needed, a
+// refusal by any track refuses the whole word and commits nothing, and no gap anywhere commits nothing.
+impl EditorState {
+    /// Close every gap on every track (one commit; no gap commits nothing).
+    pub fn close_gaps_all(&mut self) -> Result<(), EditError> {
+        let tl = self.timeline.close_gaps_all().map_err(|(_, e)| e)?;
+        if tl != self.timeline {
+            self.commit(tl);
+        }
+        Ok(())
+    }
 }

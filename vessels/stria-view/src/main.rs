@@ -185,7 +185,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         }
         ["wheel", n] => SMessage::BrowserScroll(0.0, -nle_face::WHEEL_STEP * px(n)?, 0),
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
-        [w @ ("kind" | "ease" | "gap"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`; STRIAGAPCLOSE (SR857): `gap:5`
+        [w @ ("kind" | "ease" | "gap" | "close-gaps"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`; STRIAGAPCLOSE (SR857): `gap:5`; STRIAGAPSALLTRACKS (SR929): `close-gaps:all`
         ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button
         _ => return None,
     };
@@ -950,5 +950,24 @@ mod striagapsblack_tests {
         assert!(drive(&mut face, "at:12:0,gap").is_empty());
         assert_eq!(face.state.timeline, tl0.insert_gap(0, 12, 25).unwrap());
         println!("striagapsblack witness: gap -> {:?}", face.state.timeline.tracks[0].clips);
+    }
+}
+
+// ---- STRIAGAPSALLTRACKS (LEDGER SR929): the witness's `close-gaps:all` token (named tail block) ----
+#[cfg(test)]
+mod striagapsalltracks_tests {
+    use super::*;
+
+    /// `close-gaps:all` (the argument word `close-gaps all`) closes V1's and A1's 20..25 gaps with nothing selected: the
+    /// timeline_core op by hand, no message (no fade removed).
+    #[test]
+    fn striagapsalltracks_witness_token() {
+        let (tl, src) = nle_face::synth_fixture();
+        let tl0 = tl.clone();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(drive(&mut face, "close-gaps:all").is_empty());
+        assert_eq!(face.state.timeline, tl0.close_gaps_all().unwrap());
+        assert_eq!((face.state.timeline.tracks[0].clips[2].at, face.state.timeline.tracks[1].clips[2].at), (20, 20));
+        println!("striagapsalltracks witness: close-gaps:all -> {:?}", face.state.timeline.tracks[1].clips);
     }
 }

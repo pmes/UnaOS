@@ -3705,3 +3705,30 @@ fn striagapsblack_face_names_the_removed_fades() {
     assert_eq!(face.state.timeline, tl.insert_gap(0, 10, 25).unwrap());
     println!("striagapsblack: VERBS[{i}] = gap; V1 after gap at 10: {:?}", face.state.timeline.tracks[0].clips);
 }
+// ---- STRIAGAPSALLTRACKS (LEDGER SR929): `close-gaps all` on the host face names gaps and fades over every track (named tail block) ----
+
+/// The synth fixture (V1 and A1 both A@0|B@10|A@25: a gap 20..25 on each) with a 3-tick to-black at 20 on V1: `close-gaps all`
+/// with nothing selected closes both gaps, removes the fade (its audio fade to silence goes with it) in ONE commit and names
+/// them; a timeline whose A1 would pair onto a zero handle is refused whole and the message names `A1`.
+#[test]
+fn striagapsalltracks_face_closes_every_track() {
+    let (tl, src) = synth_fixture();
+    let (a, b) = (tl.tracks[0].clips[0].src, tl.tracks[0].clips[1].src);
+    let tl = tl.add_transition_to_black(0, 20, timeline_core::TransitionKind::Dissolve, 3).unwrap();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    assert!(face.verb("close-gaps all"));
+    assert_eq!(face.last_error.take().as_deref(), Some("close-gaps all: closed 2 gaps, removed 1 fade"));
+    assert_eq!(face.state.timeline, tl.close_gaps_all().unwrap());
+    assert_eq!(face.state.undo_depth(), 1);
+    let mut k = tl.clone();
+    k.tracks[0].transitions.clear();
+    k.tracks[0].clips = vec![Clip::new(a, 13, 23, 0), Clip::new(b, 0, 10, 10)];
+    k.tracks[1].clips = vec![Clip::new(a, 40, 50, 0), Clip::new(b, 0, 10, 15)];
+    let k = k.add_transition(0, 10, timeline_core::TransitionKind::Dissolve, 3).unwrap();
+    let (_, src) = synth_fixture();
+    let mut face = nlefaceexport_face(k.clone(), src);
+    assert!(face.verb("close-gaps all"));
+    assert_eq!(face.last_error.take(), Some(format!("close-gaps all: A1: {}", EditError::Handle)));
+    assert_eq!((face.state.timeline.clone(), face.state.undo_depth()), (k, 0));
+    println!("striagapsalltracks: V1 {:?} A1 {:?}", face.state.timeline.tracks[0].clips, face.state.timeline.tracks[1].clips);
+}

@@ -3105,7 +3105,7 @@ impl Face {
 impl Face {
     /// The `close-gaps` word with its note; `None` for any other word.
     fn gaps_note_verb(&mut self, v: &str) -> Option<bool> {
-        if v != "close-gaps" {
+        if let Some(r) = self.gaps_all_note_verb(v) { return Some(r); } if v != "close-gaps" { // STRIAGAPSALLTRACKS (SR929): `close-gaps all` and its note (file tail)
             return None;
         }
         let track = self.state.selection.map(|(t, _)| t);
@@ -3118,6 +3118,45 @@ impl Face {
                 if gone > 0 {
                     let s = |n: usize| if n == 1 { "" } else { "s" };
                     self.last_error = Some(format!("{v}: closed {gaps} gap{}, removed {gone} fade{}", s(gaps), s(gone)));
+                }
+            }
+            None => return Some(false),
+        }
+        Some(true)
+    }
+}
+
+// ---- STRIAGAPSALLTRACKS (LEDGER SR929): the `close-gaps all` message row over every track (named tail block) ----
+// `close-gaps all` rides timeline_core's ONE verb dispatch (one commit over every track); this reads the whole timeline before
+// and after to name what went, SR909's rule over all tracks: `close-gaps all: closed 3 gaps, removed 1 fade` only when a fade
+// went. A refusal names the track that refused (`close-gaps all: A1: <why>`: kind letter and 1-based number among its kind;
+// sibling SR922's `Timeline::track_name` and this label become one at the fold).
+impl Face {
+    /// The `close-gaps all` word with its note; `None` for any other word.
+    fn gaps_all_note_verb(&mut self, v: &str) -> Option<bool> {
+        if !v.split_ascii_whitespace().eq(["close-gaps", "all"]) {
+            return None;
+        }
+        let fades = |tl: &Timeline| tl.tracks.iter().map(|k| k.transitions.len()).sum::<usize>();
+        let (gaps, before) = (self.state.timeline.gap_count_all(), fades(&self.state.timeline));
+        match self.state.verb(v) {
+            Some(Err(e)) => {
+                let tl = &self.state.timeline;
+                let name = match tl.close_gaps_all() {
+                    Err((t, _)) => {
+                        let kind = tl.tracks[t].kind;
+                        let n = tl.tracks[..=t].iter().filter(|k| k.kind == kind).count();
+                        format!("{}{n}: ", if kind == Kind::Video { 'V' } else { 'A' })
+                    }
+                    Ok(_) => String::new(),
+                };
+                self.last_error = Some(format!("close-gaps all: {name}{e}"));
+            }
+            Some(Ok(())) => {
+                let gone = before.saturating_sub(fades(&self.state.timeline));
+                if gone > 0 {
+                    let s = |n: usize| if n == 1 { "" } else { "s" };
+                    self.last_error = Some(format!("close-gaps all: closed {gaps} gap{}, removed {gone} fade{}", s(gaps), s(gone)));
                 }
             }
             None => return Some(false),
