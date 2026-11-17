@@ -1064,7 +1064,7 @@ fn inherit_element(inherited: &mut Inherited, tag: &str, spec: &crate::layout::P
     }
     inherited.color = spec.color.unwrap_or_else(|| layout_core::paint::or_tag(Some(spec), layout_core::paint::INHERIT_COLOR, inherited.color, |_| if tag == "a" {
         (0, 0, 238) // UA default link blue
-    } else {
+    } else if control_tag(tag) { (0, 0, 0) } else { // AETHERCSSCONTROLUACOLOR (SR1001): the UA ButtonText / FieldText black, not the parent's
         inherited.color
     }));
 }
@@ -4624,4 +4624,14 @@ pub(crate) fn list_style_of(tag: &str, inherited: u8, spec: &crate::layout::Pain
         list_style = ls;
     }
     list_style
+}
+
+// ---- AETHERCSSCONTROLUACOLOR (LEDGER SR1001): the form controls' UA colour is black, not the parent's (named tail block) ----
+
+/// AETHERCSSCONTROLUACOLOR (SR1001): the tags whose UA colour is ButtonText / FieldText (black in the light scheme), not
+/// inherited from the parent: Chromium's html.css `input, textarea, select, button`. The tag default of
+/// `inherit_element`'s and `css::computed_report`'s colour roads; `color: inherit` / `unset` (the INHERIT_COLOR bit)
+/// still take the parent.
+pub(crate) fn control_tag(tag: &str) -> bool {
+    matches!(tag, "button" | "input" | "select" | "textarea")
 }

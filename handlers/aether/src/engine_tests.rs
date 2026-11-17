@@ -6344,7 +6344,7 @@ mod tests {
             ("display", "block"), ("position", "static"), ("color", "rgb(0, 0, 0)"), ("backgroundColor", "rgba(0, 0, 0, 0)"),
             ("fontSize", "16px"), ("fontWeight", "400"), ("fontStyle", "normal"), ("lineHeight", "normal"), ("textAlign", "start"),
             ("textDecorationLine", "none"), ("visibility", "visible"), ("borderTopWidth", "0px"), ("borderTopStyle", "none"),
-            ("paddingTop", "0px"), ("marginTop", "0px"), ("flexDirection", "row"),
+            ("paddingTop", "0px"), ("marginTop", "0px"), ("flexDirection", "row"), ("direction", "ltr"),
         ] {
             assert_eq!(cssom_inherited_rest_cs(&mut e, "plain", p), want, "#plain: computed {p}");
         }
@@ -6496,6 +6496,211 @@ mod tests {
     fn css_wide_controls_button_inherit_red() {
         let mut e = css_wide_controls_engine();
         assert!(css_wide_color_ink(&mut e, "btn", css_wide_red) > 3, "the button label takes the red parent");
+    }
+
+    // ---- AETHERCSSCOLORCURRENTCOLOR (LEDGER SR841): color: currentcolor is inherit; outline's currentColor pinned (named tail block) ----
+
+    /// AETHERCSSCOLORCURRENTCOLOR (SR841): one row per probe at 20px serif under a red parent, the rules in a sheet:
+    /// `.a { color: blue }` (`#ca`, the armed twin) and its `.a.b { color: currentcolor }` (`#cb`), a same-block
+    /// `color: blue; color: currentColor` (`#cs`), a link `a.b2 { color: currentcolor }` (`#cl`, past the UA link blue),
+    /// and an empty 40x20 box with `outline: 2px solid currentcolor` (`#co`). Rows 12px apart.
+    fn currentcolor_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 12px }
+            .a { color: blue }
+            .a.b { color: currentcolor }
+            a.b2 { color: currentcolor }
+            </style></head><body style="margin:0;font:20px serif">
+            <div style="color:rgb(255, 0, 0)"><span id="ca" class="a">Hello</span></div>
+            <div style="color:rgb(255, 0, 0)"><span id="cb" class="a b">Hello</span></div>
+            <div style="color:rgb(255, 0, 0)"><span id="cs" style="color:blue;color:currentColor">Hello</span></div>
+            <div style="color:rgb(255, 0, 0)"><a id="cl" class="b2" href="#">Hello</a></div>
+            <div style="color:rgb(255, 0, 0);padding:8px"><div id="co" style="width:40px;height:20px;margin:0;outline:2px solid currentcolor"></div></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSCOLORCURRENTCOLOR (SR841): css-color-4 §6.2: `color: currentcolor` is `inherit`: after `.a { color:
+    /// blue }`, in one block after `color: blue`, and on a link, each paints the red parent's ink (no blue) and cssom
+    /// reads rgb(255, 0, 0); the `.a` twin paints blue (armed).
+    #[test]
+    fn currentcolor_color_is_inherit() {
+        let mut e = currentcolor_engine();
+        assert!(css_wide_color_ink(&mut e, "ca", css_wide_blue) > 3, "#ca paints blue (armed)");
+        assert_eq!(css_wide_color_ink(&mut e, "ca", css_wide_red), 0, "#ca paints no red (armed)");
+        for id in ["cb", "cs", "cl"] {
+            assert!(css_wide_color_ink(&mut e, id, css_wide_red) > 3, "#{id} paints the red parent's ink");
+            assert_eq!(css_wide_color_ink(&mut e, id, css_wide_blue), 0, "#{id} paints no blue");
+            assert_eq!(font_shorthand_cs(&mut e, id, "color"), "rgb(255, 0, 0)", "#{id}: cssom");
+        }
+    }
+
+    /// AETHERCSSCOLORCURRENTCOLOR (SR841): pinned: `outline: 2px solid currentcolor` on an empty box under a red parent
+    /// paints red outline ink around it (outline_color Some(None) -> focusring's `current_color`), no blue.
+    #[test]
+    fn currentcolor_outline_pinned() {
+        let mut e = currentcolor_engine();
+        let (l, t, w, h) = imgalt_rect(&mut e, "co");
+        let (sw, sh) = (e.width as usize, e.height as usize);
+        let (x0, x1) = (((l - 3.0).floor().max(0.0)) as usize, ((l + w + 3.0).ceil() as usize).min(sw));
+        let (y0, y1) = (((t - 3.0).floor().max(0.0)) as usize, ((t + h + 3.0).ceil() as usize).min(sh));
+        let (mut red, mut blue) = (0, 0);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let c = imgalt_px(&e, x, y);
+                red += css_wide_red(c) as usize;
+                blue += css_wide_blue(c) as usize;
+            }
+        }
+        assert!(red > 40, "the outline paints the element's red ({red} px)");
+        assert_eq!(blue, 0, "no blue");
+    }
+
+    // ---- AETHERCSSOMDIRECTIONCOLUMN (LEDGER SR1000): getComputedStyle direction reads the render's rtl as the 21st report column (named tail block) ----
+
+    /// AETHERCSSOMDIRECTIONCOLUMN (SR1000): a `dir=rtl` div and its children (a plain p, an inline `direction: ltr`, an
+    /// earlier `p.e { direction: ltr }` beaten by `p.e.i { direction: inherit }`, a `dir=ltr` child), an inline
+    /// `direction: rtl` div and its child, and a plain div.
+    fn cssom_direction_column_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><head><style>
+            p.e { direction: ltr }
+            p.e.i { direction: inherit }
+            </style></head><body style="margin:0;font:16px serif">
+            <div id="r" dir="rtl"><p id="rc">a</p><p id="rl" style="direction:ltr">a</p><p id="re" class="e">a</p><p id="ri" class="e i">a</p><p id="rd" dir="ltr">a</p></div>
+            <div id="c" style="direction:rtl"><p id="cc">a</p></div>
+            <div id="plain">a</div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSOMDIRECTIONCOLUMN (SR1000): `getComputedStyle(el).direction` for element `id`.
+    fn cssom_direction_column_cs(e: &mut crate::AetherEngine, id: &str) -> String {
+        e.js_engine.as_mut().unwrap().eval_string(&format!("getComputedStyle(document.getElementById('{id}')).direction")).unwrap()
+    }
+
+    /// AETHERCSSOMDIRECTIONCOLUMN (SR1000): the `dir` attribute maps onto direction and inherits (was ltr everywhere); an
+    /// author `direction: ltr` and a `dir=ltr` child read ltr; SR831's `direction: inherit` beats the earlier ltr rule.
+    #[test]
+    fn cssom_direction_column_dir_attr() {
+        let mut e = cssom_direction_column_engine();
+        for (id, want) in [("r", "rtl"), ("rc", "rtl"), ("rl", "ltr"), ("re", "ltr"), ("ri", "rtl"), ("rd", "ltr"), ("plain", "ltr")] {
+            assert_eq!(cssom_direction_column_cs(&mut e, id), want, "#{id}: computed direction");
+        }
+    }
+
+    /// AETHERCSSOMDIRECTIONCOLUMN (SR1000): an author `direction: rtl` reads rtl and its child inherits it.
+    #[test]
+    fn cssom_direction_column_css() {
+        let mut e = cssom_direction_column_engine();
+        for (id, want) in [("c", "rtl"), ("cc", "rtl")] {
+            assert_eq!(cssom_direction_column_cs(&mut e, id), want, "#{id}: computed direction");
+        }
+    }
+
+    /// AETHERCSSOMDIRECTIONCOLUMN (SR1000): direction is the 21st column, appended at the END, so the twenty positions
+    /// the a11y tree indexes (display 0, visibility 12) and the style oracle's fixture prefix do not move.
+    #[test]
+    fn cssom_direction_column_report_width() {
+        assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
+        assert_eq!(crate::css::REPORT_COLS, 21);
+        assert_eq!(crate::css::REPORT_PROPS[20], "direction");
+        assert_eq!((crate::css::REPORT_PROPS[0], crate::css::REPORT_PROPS[12]), ("display", "visibility"));
+    }
+
+    // ---- AETHERCSSCONTROLUACOLOR (LEDGER SR1001): an unset control paints the UA ButtonText / FieldText black, not the parent's colour (named tail block) ----
+
+    /// AETHERCSSCONTROLUACOLOR (SR1001): one control per row under a red parent, rows 12px apart: an unstyled `<button>`,
+    /// `button.i { color: inherit }`, `button.u { color: unset }`, an unstyled `<select>` and `<input type=submit>`, a
+    /// `<button>` inside `a.ai { color: inherit }`, and a `<button>` with an author green.
+    fn control_ua_color_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 12px }
+            button.i { color: inherit }
+            button.u { color: unset }
+            a.ai { color: inherit }
+            </style></head><body style="margin:0;font:20px serif">
+            <div style="color:rgb(255, 0, 0)"><button id="b0">Hello</button></div>
+            <div style="color:rgb(255, 0, 0)"><button id="bi" class="i">Hello</button></div>
+            <div style="color:rgb(255, 0, 0)"><button id="bu" class="u">Hello</button></div>
+            <div style="color:rgb(255, 0, 0)"><select id="s0"><option>Hello</option></select></div>
+            <div style="color:rgb(255, 0, 0)"><input id="sub0" type="submit" value="Go"></div>
+            <div style="color:rgb(255, 0, 0)"><a class="ai" href="#"><button id="ba">Hello</button></a></div>
+            <div style="color:rgb(255, 0, 0)"><button id="bg" style="color:rgb(0, 160, 0)">Hello</button></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSCONTROLUACOLOR (SR1001): an unstyled `<button>` under a red parent paints its label black (Chromium's
+    /// ButtonText), no red.
+    #[test]
+    fn control_ua_color_button_black() {
+        let mut e = control_ua_color_engine();
+        assert!(css_wide_color_ink(&mut e, "b0", css_wide_controls_black) > 3, "the unstyled button paints black (armed)");
+        assert_eq!(css_wide_color_ink(&mut e, "b0", css_wide_red), 0, "the unstyled button paints no red");
+    }
+
+    /// AETHERCSSCONTROLUACOLOR (SR1001): `button { color: inherit }` opts back into the parent: red.
+    #[test]
+    fn control_ua_color_button_inherit_red() {
+        let mut e = control_ua_color_engine();
+        assert!(css_wide_color_ink(&mut e, "bi", css_wide_red) > 3, "the inherit button takes the red parent");
+    }
+
+    /// AETHERCSSCONTROLUACOLOR (SR1001): `button { color: unset }` is inherit for an inherited property: red.
+    #[test]
+    fn control_ua_color_button_unset_red() {
+        let mut e = control_ua_color_engine();
+        assert!(css_wide_color_ink(&mut e, "bu", css_wide_red) > 3, "the unset button takes the red parent");
+    }
+
+    /// AETHERCSSCONTROLUACOLOR (SR1001): an unstyled `<select>`'s label and `<input type=submit>`'s caption (SR840's
+    /// reads) stay black under the red parent: no red.
+    #[test]
+    fn control_ua_color_select_submit_black() {
+        let mut e = control_ua_color_engine();
+        for id in ["s0", "sub0"] {
+            assert!(css_wide_color_ink(&mut e, id, css_wide_controls_black) > 3, "#{id} paints black (armed)");
+            assert_eq!(css_wide_color_ink(&mut e, id, css_wide_red), 0, "#{id} paints no red");
+        }
+    }
+
+    /// AETHERCSSCONTROLUACOLOR (SR1001): getComputedStyle reads the UA black on the unstyled button and submit input
+    /// (Chromium: rgb(0, 0, 0)), and the parent's red on the inherit button.
+    #[test]
+    fn control_ua_color_cssom() {
+        let mut e = control_ua_color_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "b0", "color"), "rgb(0, 0, 0)", "the unstyled button reads black");
+        assert_eq!(font_shorthand_cs(&mut e, "sub0", "color"), "rgb(0, 0, 0)", "the unstyled submit input reads black");
+        assert_eq!(font_shorthand_cs(&mut e, "bi", "color"), "rgb(255, 0, 0)", "the inherit button reads the parent's red");
+    }
+
+    /// AETHERCSSCONTROLUACOLOR (SR1001): a `<button>` inside `a { color: inherit }` under red: the link takes red, the
+    /// button's own UA default beats it: black, no red.
+    #[test]
+    fn control_ua_color_in_inherit_link_black() {
+        let mut e = control_ua_color_engine();
+        assert!(css_wide_color_ink(&mut e, "ba", css_wide_controls_black) > 3, "the button in the link paints black (armed)");
+        assert_eq!(css_wide_color_ink(&mut e, "ba", css_wide_red), 0, "the button in the link paints no red");
+    }
+
+    /// AETHERCSSCONTROLUACOLOR (SR1001): an author colour on the control wins as before: green, no red.
+    #[test]
+    fn control_ua_color_author_wins() {
+        let mut e = control_ua_color_engine();
+        assert!(css_wide_color_ink(&mut e, "bg", css_wide_green) > 3, "the author green wins");
+        assert_eq!(css_wide_color_ink(&mut e, "bg", css_wide_red), 0, "the author-green button paints no red");
     }
 
     // ---- AETHERCSSWIDEALL (LEDGER SR1021): css-cascade-4 §3.1 the all shorthand over ONE longhand list (named tail block) ----
