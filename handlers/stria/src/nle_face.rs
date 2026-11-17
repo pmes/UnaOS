@@ -531,7 +531,7 @@ impl Face {
         self.pointer = Some((x, y));
         let Some(mut d) = self.drag.take() else { return if view::snap_badge_hit(&self.layout(), x, y) { true } else { self.click(x, y) } }; // STRIAKSNAPSHOW (SR9104): the badge press's release is no ruler click (a plain ruler press is a Scrub drag)
         d.update(&self.state, x, y);
-        if !d.moved() {
+        if !d.moved() { if let Some(r) = self.release_gain_env_del(&d) { return r; } // STRIAGAINENVDEL (SR9110): a Shift-click on an envelope point removes it (file tail)
             return if d.additive { d.release_still(&mut self.state); true } else { self.click(x, y) }; // STRIAMULTISELECTMORE (SR950): a shift-click on a set member takes it out (timeline_core view.rs `Drag::release_still`)
         }
         if d.kind == DragKind::Scrub {
@@ -10952,7 +10952,7 @@ impl Face {
     }
     /// The source drag at `(x, y)` (the pointer Surface's pixels), a live drag dropped uncommitted; `None` with nothing loaded.
     fn begin_source_drag(&mut self, x: f64, y: f64, mods: u8) -> Option<bool> {
-        let d = Drag::begin_source(&self.state, self.layout(), x, y, mods & bandy::MOD_SHIFT != 0, mods & bandy::MOD_ALT != 0)?;
+        let mut d = Drag::begin_source(&self.state, self.layout(), x, y, mods & bandy::MOD_SHIFT != 0, mods & bandy::MOD_ALT != 0)?; d.snap = mods & bandy::MOD_ALT == 0; // STRIAGAINENVDEL (SR9110): the one press rule: Alt turns the envelope snap off
         self.drag = Some(d);
         Some(true)
     }
@@ -12136,5 +12136,22 @@ impl Face {
             Some(l) => format!("{l}; {clause}"),
             None => clause,
         });
+    }
+}
+
+// ---- STRIAGAINENVDEL (LEDGER SR9110): a Shift-click on an envelope point removes it (named tail block) ----
+// The unmoved release of a Shift press on a point of the selected audio clip's painted envelope (timeline_core's
+// `Drag::gain_env_removal`) is ONE `set_selected_gain_env` of the envelope without it; the NOTE reads `env: removed at
+// <tick>, <n> points` (the point's timeline tick, the points left); a refusal stays `drag: <EditError>` on `last_error`.
+impl Face {
+    /// The release was a Shift-click on an envelope point (`Some(true)`, committed or refused); `None` for any other.
+    fn release_gain_env_del(&mut self, d: &Drag) -> Option<bool> {
+        let (env, s) = d.gain_env_removal(&self.state)?;
+        let c = self.state.selected()?;
+        match self.state.set_selected_gain_env(env) {
+            Ok(()) => self.note = Some(format!("env: removed at {}, {} points", c.at + (s - c.src_in), env.points().len())),
+            Err(e) => self.last_error = Some(format!("drag: {e}")),
+        }
+        Some(true)
     }
 }
