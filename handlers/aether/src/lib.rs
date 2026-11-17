@@ -872,12 +872,12 @@ impl AetherEngine {
                     let w = self.width as usize;
                     let h = self.height as usize;
                     
-                    if idy > 0 && idy < h as i32 {
+                    if idy > 0 && idy < h as i32 && !holds_against_scroll(self.layout_tree.as_ref()) {
                         // Scrolling down, document moves up, shift pixels UP
                         let shift = idy as usize * w * 4;
                         self.surface.copy_within(shift.., 0);
                         self.damage_rects.push((0, (h as i32 - idy) as u32, self.width, idy as u32));
-                    } else if idy < 0 && -idy < h as i32 {
+                    } else if idy < 0 && -idy < h as i32 && !holds_against_scroll(self.layout_tree.as_ref()) {
                         // Scrolling up, document moves down, shift pixels DOWN
                         let shift = (-idy) as usize * w * 4;
                         let src_len = (h - (-idy) as usize) * w * 4;
@@ -2662,4 +2662,11 @@ fn present_rect(src: &[u8], (sw, sh): (usize, usize), out: &mut [u8], (dw, dh): 
             }
         }
     }
+}
+
+// ---- AETHERCSSSTICKYSCROLLBLITDAMAGE (LEDGER SR1135): a box that holds its place against the scroll (named tail block) ----
+/// A `position: fixed` or `sticky` box paints at a viewport place the scroll blit does not move (render's `placed_origin`):
+/// with one present a short scroll repaints the whole viewport. An unstuck sticky box counts (this scroll can stick it).
+fn holds_against_scroll(layout: Option<&layout::LayoutTree>) -> bool {
+    layout.is_some_and(|l| l.paint_map.values().any(|p| matches!(p.position_kind, Some(3 | 4))))
 }
