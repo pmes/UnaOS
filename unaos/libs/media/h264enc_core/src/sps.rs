@@ -66,6 +66,8 @@ pub struct SeqParams {
     pub colour: Option<(u8, u8, u8, bool)>,
     /// H264ENCHRD (SR699): the rate controller's bucket as the VUI's timing_info + nal_hrd_parameters; None writes both flags 0.
     pub hrd: Option<Hrd>,
+    /// H264ENCHRDVCL (SR1060): beside `hrd`, the same table as vcl_hrd_parameters with cbr_flag 0; unread when `hrd` is None.
+    pub hrd_vcl: bool,
 }
 
 /// level_idc for a frame of `mb_w` x `mb_h` macroblocks: the lowest level of Table A-1 whose
@@ -135,7 +137,7 @@ pub fn write_sps(p: &SeqParams) -> Vec<u8> {
     w.flag(false); // chroma_loc_info_present_flag
     w.flag(p.hrd.is_some()); if let Some(h) = p.hrd { timing_info(&mut w, &h); } // timing_info_present_flag (H264ENCHRD SR699: the HRD's clock)
     w.flag(p.hrd.is_some()); if let Some(h) = p.hrd { hrd_parameters(&mut w, &h); } // nal_hrd_parameters_present_flag (H264ENCHRD SR699)
-    w.flag(false); if p.hrd.is_some() { w.flag(false); } // vcl_hrd_parameters_present_flag; low_delay_hrd_flag 0 under the NAL HRD (SR699)
+    let vcl = p.hrd.filter(|_| p.hrd_vcl).map(|h| Hrd { cbr: false, ..h }); w.flag(vcl.is_some()); if let Some(h) = vcl { hrd_parameters(&mut w, &h); } if p.hrd.is_some() { w.flag(false); } // vcl_hrd_parameters_present_flag (+ the NAL table with cbr_flag 0 under Config::hrd_vcl, H264ENCHRDVCL SR1060); low_delay_hrd_flag 0, written once (SR699)
     w.flag(false); // pic_struct_present_flag
     w.flag(true); // bitstream_restriction_flag
     w.flag(true); // motion_vectors_over_pic_boundaries_flag
@@ -373,15 +375,16 @@ fn sei_payload(mut w: BitWriter) -> Vec<u8> {
 }
 
 /// sei_rbsp (7.3.2.3) of one access unit under the HRD: on an IDR (`bp` Some(initial_cpb_removal_delay in 90 kHz units)) a
-/// buffering_period (D.1.2: seq_parameter_set_id 0, the delay and a zero offset for the one NAL CPB), then the pic_timing
+/// buffering_period (D.1.2: seq_parameter_set_id 0, the delay and a zero offset for the one NAL CPB, and with `vcl` (SR1060) the same
+/// pair for the one VCL CPB), then the pic_timing
 /// (D.1.3: cpb_removal_delay and dpb_output_delay in ticks, pic_struct_present_flag 0); rbsp_trailing_bits.
-pub fn sei_rbsp(bp: Option<u32>, cpb_removal_delay: u32, dpb_output_delay: u32) -> Vec<u8> {
+pub fn sei_rbsp(bp: Option<u32>, vcl: bool, cpb_removal_delay: u32, dpb_output_delay: u32) -> Vec<u8> {
     let mut out = Vec::new();
     if let Some(delay) = bp {
         let mut w = BitWriter::new();
         w.ue(0); // seq_parameter_set_id
         w.u(24, delay); // initial_cpb_removal_delay[0]
-        w.u(24, 0); // initial_cpb_removal_delay_offset[0]
+        w.u(24, 0); if vcl { w.u(24, delay); w.u(24, 0); } // initial_cpb_removal_delay_offset[0]; the VCL HRD's pair under Config::hrd_vcl (H264ENCHRDVCL SR1060)
         sei_message(&mut out, 0, &sei_payload(w));
     }
     let mut w = BitWriter::new();

@@ -98,6 +98,8 @@ fn sps_of(nal: &[u8]) -> Sps {
 struct Sei {
     bp: Vec<u32>,
     pt: Vec<(u32, u32)>,
+    /// The VCL HRD's initial_cpb_removal_delay per buffering_period (H264ENCHRDVCL SR1060; empty without `Config::hrd_vcl`).
+    vbp: Vec<u32>,
 }
 
 /// h264_core's decoder fed every access unit's SPS / PPS / SEI NAL units: its HRD notes, per access unit.
@@ -113,7 +115,7 @@ fn seis(aus: &[Access]) -> Vec<Sei> {
                 match note.kind {
                     HrdKind::BufferingPeriod { sps_id, nal, vcl } => {
                         assert_eq!(sps_id, 0, "seq_parameter_set_id");
-                        assert!(vcl.is_empty(), "no VCL HRD");
+                        assert!(vcl.is_empty() || vcl == nal, "the VCL delay set mirrors the NAL set (SR1060)"); s.vbp.extend(vcl.iter().map(|d| d.0));
                         assert_eq!(nal.len(), 1, "one CPB");
                         assert_eq!(nal[0].1, 0, "initial_cpb_removal_delay_offset");
                         s.bp.push(nal[0].0);
@@ -134,13 +136,13 @@ fn bits(au: &Access) -> i128 {
 /// arrival margin in bits at a removal, the largest fullness before a removal). Time is counted in 1 / (90000 x time_scale) s.
 fn replay(aus: &[Access], sps: &Sps) -> (usize, i128, i128) {
     let (nut, ts, _) = sps.timing_info.expect("timing_info");
-    let h = sps.nal_hrd.expect("nal_hrd_parameters");
-    assert!(h.cbr, "the replay is the CBR one");
+    let h = sps.nal_hrd.or(sps.vcl_hrd).expect("nal_hrd_parameters"); // the NAL HRD (Type II, every NAL unit), else the VCL HRD (Type I: VCL + filler, SR1060)
+    // cbr_flag 1: continuous arrival from t = 0 at BitRate; cbr_flag 0 (the VCL HRD, SR1060): on demand, `vbr_road` (C.1.2).
     let (nut, ts, br, cpb) = (nut as i128, ts as i128, h.bit_rate as i128, h.cpb_size as i128);
     let notes = seis(aus);
     let unit = 90_000 * ts;
     let tick = nut * 90_000;
-    let (mut anchor, mut cum, mut fillers) = (None::<i128>, 0i128, 0usize);
+    let (mut anchor, mut cum, mut fillers) = (None::<i128>, 0i128, 0usize); let mut road: Vec<(i128, i128, i128)> = Vec::new();
     let (mut margin, mut peak) = (i128::MAX, 0i128);
     for (n, au) in aus.iter().enumerate() {
         let s = &notes[n];
@@ -155,15 +157,15 @@ fn replay(aus: &[Access], sps: &Sps) -> (usize, i128, i128) {
         }
         assert_eq!(t, aus_first(&notes, ts) + 2 * n as i128 * tick, "access unit {n}: removal times are one frame apart");
         let before = br * t - cum * unit; // CPB fullness x unit just before the removal (bits arrived - bits removed)
-        cum += bits(au);
+        let b = if sps.nal_hrd.is_some() { bits(au) } else { vcl_bits(au) }; cum += b; road.push((t, b, s.bp.first().map_or(road.last().map_or(0, |r| r.2), |&d| d as i128 * ts)));
         let arrived = br * t - cum * unit; // >= 0: all of the access unit has arrived
         margin = margin.min(arrived / unit);
         peak = peak.max(before / unit);
         assert!(arrived >= 0, "access unit {n}: CPB underflow ({} bits short)", -arrived / unit);
-        assert!(before <= cpb * unit, "access unit {n}: CPB overflow ({} bits over {cpb})", (before - cpb * unit) / unit);
+        assert!(!h.cbr || before <= cpb * unit, "access unit {n}: CPB overflow ({} bits over {cpb})", (before - cpb * unit) / unit);
         fillers += au.nals.iter().filter(|x| x[0] & 0x1f == NAL_FILLER).count();
     }
-    (fillers, margin, peak)
+    if h.cbr { (fillers, margin, peak) } else { vbr_road(&road, br, cpb, unit, fillers) }
 }
 
 fn aus_first(notes: &[Sei], ts: i128) -> i128 {
@@ -270,4 +272,79 @@ fn d_no_bucket_no_bytes_moved() {
     for au in run(Config { hrd: false, ..cbr400(30) }, N, false) {
         assert!(au.nals.iter().all(|x| !matches!(x[0] & 0x1f, NAL_SEI | NAL_FILLER)), "hrd off writes no SEI / filler");
     }
+}
+
+// ---- H264ENCHRDVCL (LEDGER SR1060): the VCL HRD beside the NAL HRD, replayed as Annex C's Type I point (named tail block) ----
+
+/// The bits of the access unit the Type I CPB receives (C.1): VCL NAL units (nal_unit_type 1..=5) and filler data.
+fn vcl_bits(au: &Access) -> i128 {
+    au.nals.iter().filter(|n| matches!(n[0] & 0x1f, 1..=5 | NAL_FILLER)).map(|n| n.len() as i128 * 8).sum()
+}
+
+/// `replay`'s cbr_flag 0 road (C.1.2): access unit k starts arriving at max(the previous one's final arrival, its removal less its
+/// buffering period's initial_cpb_removal_delay) and arrives at BitRate. `road` holds (removal time, bits, initial delay) per
+/// access unit in `replay`'s time unit; times are scaled by BitRate (bits x unit). Asserts no underflow (each access unit has
+/// arrived by its removal) and no overflow (the fullness before each removal within CpbSize); returns (fillers, the smallest
+/// arrival margin in bits, the largest fullness before a removal).
+fn vbr_road(road: &[(i128, i128, i128)], br: i128, cpb: i128, unit: i128, fillers: usize) -> (usize, i128, i128) {
+    let mut start = Vec::with_capacity(road.len());
+    let mut end = i128::MIN;
+    let (mut margin, mut peak) = (i128::MAX, 0i128);
+    for (n, &(t, b, d)) in road.iter().enumerate() {
+        let a = end.max((t - d) * br);
+        end = a + b * unit;
+        start.push(a);
+        let m = t * br - end;
+        assert!(m >= 0, "access unit {n}: Type I CPB underflow ({} bits short)", -m / unit);
+        margin = margin.min(m / unit);
+    }
+    for (n, &(t, _, _)) in road.iter().enumerate() {
+        let full: i128 = road[n..].iter().zip(&start[n..]).map(|(&(_, b, _), &a)| (t * br - a).clamp(0, b * unit)).sum();
+        assert!(full <= cpb * unit, "access unit {n}: Type I CPB overflow ({} bits over {cpb})", (full - cpb * unit) / unit);
+        peak = peak.max(full / unit);
+    }
+    (fillers, margin, peak)
+}
+
+/// The VCL HRD (cbr_flag 0) beside the NAL HRD, replayed on two roads: the cbr 1 road (continuous arrival) with the Type I bits
+/// (VCL + filler), a subset of the NAL bits, so its arrival margin is at least the NAL one; and the cbr 0 road (on-demand arrival,
+/// C.1.2) as signalled, which proves itself by `vbr_road`'s own no-underflow / no-overflow asserts (margins printed).
+#[test]
+fn k_vcl_hrd_mirrors_the_nal_bucket() {
+    let aus = run(Config { hrd_vcl: true, ..cbr400(6) }, N, true);
+    assert_eq!(aus.len(), N);
+    let v = sps_of(&aus[0].nals[0]);
+    let nal = v.nal_hrd.expect("nal_hrd_parameters");
+    assert!(nal.cbr);
+    assert_eq!(v.vcl_hrd, Some(h264_core::ps::Hrd { cbr: false, ..nal }), "the VCL table is the NAL table with cbr_flag 0");
+    assert!(!v.low_delay_hrd, "low_delay_hrd_flag 0, written once");
+    assert_eq!(v.timing_info, Some((1, 2 * FPS, true)));
+    let notes = seis(&aus);
+    let off = seis(&run(cbr400(6), N, false));
+    let mut vbps = 0;
+    for (n, (s, o)) in notes.iter().zip(&off).enumerate() {
+        assert_eq!(s.vbp, s.bp, "access unit {n}: the VCL delay set is the NAL set");
+        assert_eq!(s.pt, o.pt, "access unit {n}: pic_timing unchanged by the VCL HRD");
+        vbps += s.vbp.len();
+    }
+    assert_eq!(vbps, 2, "a VCL delay in each IDR's buffering_period");
+    let (f2, m2, p2) = replay(&aus, &v);
+    let (f1, m1, p1) = replay(&aus, &Sps { nal_hrd: None, ..v.clone() });
+    let (_, ms, ps) = replay(&aus, &Sps { nal_hrd: None, vcl_hrd: Some(h264_core::ps::Hrd { cbr: true, ..nal }), ..v.clone() });
+    println!("hrd vcl cbr 400: type II (nal, cbr 1) fillers {f2} margin {m2} peak {p2}; type I bits on the cbr 1 road margin {ms} peak {ps}; type I (vcl, cbr 0 road) margin {m1} peak {p1} / {} bits", nal.cpb_size);
+    assert_eq!(f1, f2);
+    assert!(ms >= m2, "the Type I bits are a subset: their cbr 1 arrival margin {ms} below the NAL one {m2}");
+    assert!(m1 >= 0 && p1 <= nal.cpb_size as i128, "the cbr 0 road: no underflow, no overflow");
+}
+
+#[test]
+fn l_vcl_hrd_off_is_byte_identical() {
+    // d's constant-QP pin with the VCL HRD asked for too: no bucket, no byte.
+    let cfg = Config { width: W as u32, height: H as u32, qp: 26, gop: 30, hrd: true, hrd_vcl: true, ..Default::default() };
+    let samples: Vec<Vec<u8>> = run(cfg, 60, false).iter().map(Access::avcc_sample).collect();
+    assert_eq!(fnv(&samples), 0xd572_6ae5_9a9b_6d9c, "hrd_vcl without a bucket moved the constant-QP bytes");
+    let bytes = |cfg: Config| -> Vec<Vec<u8>> { run(cfg, N, false).iter().map(Access::annexb).collect() };
+    assert_eq!(bytes(Config { hrd: false, hrd_vcl: true, ..cbr400(30) }), bytes(Config { hrd: false, ..cbr400(30) }), "hrd_vcl without hrd moved bytes");
+    assert_eq!(bytes(Config { hrd_vcl: false, ..cbr400(6) }), bytes(cbr400(6)), "hrd_vcl false is the default's bytes");
+    assert_ne!(bytes(Config { hrd_vcl: true, ..cbr400(6) }), bytes(cbr400(6)), "hrd_vcl wrote nothing");
 }
