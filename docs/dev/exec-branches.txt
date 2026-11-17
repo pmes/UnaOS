@@ -1827,3 +1827,7 @@ exec-rmbp-aethercssplaceshorthands|f0fa2f3b5|cut115h
 exec-rmbp-aethercssborderthinthick|f0fa2f3b5|cut115h
 exec-rmbp-h264enctwopassqcompface|f0fa2f3b5|cut115h
 exec-rmbp-aethercsswidecolumngapnormalflex|f0fa2f3b5|cut115h
+exec-rmbp-aethercssomshorthandtableserialize|f31ee1b02|cut116h
+exec-rmbp-aethercssgapshorthandmulticol|f31ee1b02|cut116h
+exec-rmbp-aetherfontsynthesisposition|f31ee1b02|cut116h
+exec-rmbp-hevcwphalfrangeone|f31ee1b02|cut116h

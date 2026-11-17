@@ -101,6 +101,12 @@ pub struct PaintStyle<H: Host> {
     /// AETHERCSSTEXTDECORATIONSTYLETHICKNESS (SR1038): `text-decoration-thickness` (css-text-decor-4 §3.4) in the
     /// decoration_color marker shape: `Some(Some(px))` a length, `Some(None)` auto / from-font (the face's), None unspecified.
     pub decoration_thickness: Option<Option<f32>>,
+    /// AETHERCSSTEXTUNDERLINEOFFSET (SR1045): `text-underline-offset` (css-text-decor-4 §2.6, not inherited) in the same
+    /// marker shape: `Some(Some(px))` added to the underline's auto / under position, `Some(None)` auto, None unspecified.
+    pub underline_offset: Option<Option<f32>>,
+    /// AETHERCSSTEXTUNDERLINEOFFSET (SR1045): `text-underline-position` (css-text-decor-4 §2.5, inherited): 0 auto, 1
+    /// from-font, 2 under ([`crate::css::underline_position_code`]); its explicit inherit is [`INHERIT_UNDERLINE_POSITION`].
+    pub underline_position: Option<u8>,
     /// On TEXT nodes (set by the inline whitespace pass): a collapsible
     /// space survives before / after this run.
     pub ws_lead: Option<bool>,
@@ -305,7 +311,7 @@ impl<H: Host> Default for PaintStyle<H> {
             overflow_wrap: None,
             letter_spacing: None,
             line_through: None,
-            decoration_color: None, decoration_style: None, decoration_thickness: None,
+            decoration_color: None, decoration_style: None, decoration_thickness: None, underline_offset: None, underline_position: None,
             ws_lead: None,
             ws_trail: None,
             display_kind: None,
@@ -913,7 +919,7 @@ pub fn inherit_bit(prop: &str) -> u32 {
         "color" => INHERIT_COLOR,
         "white-space" | "white-space-collapse" => INHERIT_WHITE_SPACE,
         "direction" => INHERIT_DIRECTION,
-        "list-style-type" | "list-style" => INHERIT_LIST_STYLE, "color-scheme" => INHERIT_COLOR_SCHEME,
+        "list-style-type" | "list-style" => INHERIT_LIST_STYLE, "color-scheme" => INHERIT_COLOR_SCHEME, "text-underline-position" => INHERIT_UNDERLINE_POSITION,
         _ => 0,
     }
 }
@@ -933,7 +939,7 @@ impl<H: Host> PaintStyle<H> {
             | on(self.color.is_some(), INHERIT_COLOR)
             | on(self.white_space.is_some(), INHERIT_WHITE_SPACE)
             | on(self.rtl.is_some(), INHERIT_DIRECTION)
-            | on(self.list_style.is_some(), INHERIT_LIST_STYLE) | on(self.color_scheme.is_some(), INHERIT_COLOR_SCHEME)
+            | on(self.list_style.is_some(), INHERIT_LIST_STYLE) | on(self.color_scheme.is_some(), INHERIT_COLOR_SCHEME) | on(self.underline_position.is_some(), INHERIT_UNDERLINE_POSITION)
     }
 
     /// AETHERCSSWIDELONGHANDS (SR815): this style explicitly inherits the field of `bit` (the bit is set and no later
@@ -969,7 +975,7 @@ impl<H: Host> PaintStyle<H> {
         if bits & INHERIT_COLOR != 0 { self.color = None; }
         if bits & INHERIT_WHITE_SPACE != 0 { self.white_space = None; self.nowrap = None; } // SR831: the arm's pair
         if bits & INHERIT_DIRECTION != 0 { self.rtl = None; }
-        if bits & INHERIT_LIST_STYLE != 0 { self.list_style = None; } if bits & INHERIT_COLOR_SCHEME != 0 { self.color_scheme = None; }
+        if bits & INHERIT_LIST_STYLE != 0 { self.list_style = None; } if bits & INHERIT_COLOR_SCHEME != 0 { self.color_scheme = None; } if bits & INHERIT_UNDERLINE_POSITION != 0 { self.underline_position = None; }
         self.inherit |= bits; self.revert &= !bits; // SR1028: a later inherit beats an earlier revert
     }
 
@@ -1084,3 +1090,9 @@ impl<H: Host> PaintStyle<H> {
         }
     }
 }
+
+// ---- AETHERCSSTEXTUNDERLINEOFFSET (LEDGER SR1045): the explicit inherit of text-underline-position (named tail block) ----
+
+/// AETHERCSSTEXTUNDERLINEOFFSET (SR1045): `text-underline-position` (inherited; no tag road: a None field takes the
+/// parent's value in the render walk), so `inherit` / `unset` clear an earlier value through `set_inherit` (SR823's shape).
+pub const INHERIT_UNDERLINE_POSITION: u32 = 4096;
