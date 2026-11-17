@@ -3780,3 +3780,43 @@ fn striaxfademore_face_note_is_not_an_error() {
     println!("striaxfademore: c -> note \"xfade: 10 equal\" (no error); move keeps, undo clears; refusal on last_error");
 }
 
+
+// ---- STRIAXFADETHREE (LEDGER SR9023): the face drags the audio crossfade bracket's edge (named tail block) ----
+
+/// A 4-tick crossfade on A1's cut at 10 (its bracket x 80..112 at zoom 8, in A1's foot band): a press on its right edge
+/// zone, dragged +2 ticks with Alt (no snap), released, is ONE commit to 6 ticks with the curve kept and the incoming clip
+/// selected; `undo` restores the 4; a press in the bracket's middle is the clip press it always was (no length change).
+#[test]
+fn striaxfadethree_face_drags_the_xfade_bracket() {
+    use bandy::SMessage;
+    use timeline_core::view::{Layout, TRANS_H};
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    face.state.select(1, 1).unwrap();
+    assert!(face.verb("xfade 4"));
+    let _ = face.note.take();
+    let (tl0, depth) = (face.state.timeline.clone(), face.state.undo_depth());
+    let x = tl0.audio_xfades[0];
+    assert_eq!((x.track, x.at, x.dur), (1, 10, 4));
+    let l = Layout::of(320, 160, &face.state);
+    let (x0, y0, x1, y1) = l.xfade_rect(&x);
+    assert_eq!((x0, x1, y1 - y0), (80, 112, TRANS_H));
+    let y = (y0 + y1) as f64 / 2.0;
+    face.state.deselect();
+    let btn = |down, x| SMessage::BrowserButton { down, x, y, mods: bandy::MOD_ALT, surface: 0 };
+    face.on(&btn(true, 110.0));
+    assert_eq!(face.dragging().map(|d| d.kind), Some(stria::nle_face::DragKind::XfadeOut));
+    face.on(&SMessage::BrowserMouseMove(126.0, y, 0));
+    face.on(&btn(false, 126.0));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    let after = face.state.timeline.audio_xfades[0];
+    assert_eq!((after.track, after.at, after.dur, after.curve), (1, 10, 6, x.curve));
+    assert_eq!((face.state.selection, face.state.undo_depth()), (Some((1, 1)), depth + 1));
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.timeline, tl0);
+    face.on(&btn(true, 96.0));
+    assert_ne!(face.dragging().map(|d| d.kind), Some(stria::nle_face::DragKind::XfadeOut));
+    face.on(&btn(false, 96.0));
+    assert_eq!(face.state.timeline.audio_xfades, tl0.audio_xfades, "the middle is no edge drag");
+    println!("striaxfadethree: the bracket 80..112 right edge +2 ticks -> 6, one undo step; the middle unchanged");
+}

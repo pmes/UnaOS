@@ -542,3 +542,70 @@ fn striaxfademore_curve_word() {
     println!("striaxfademore: Linear -> linear, EqualPower -> equal");
 }
 
+
+// ---- STRIAXFADETHREE (LEDGER SR9023): the audio crossfade bracket's edge drag (named tail block) ----
+
+/// SR860's fixture at zoom 8 with an 8-tick equal-power crossfade on A1's cut at 20 (its bracket x 160..224); the layout.
+fn striaxfadethree_state() -> (EditorState, timeline_core::view::Layout) {
+    let mut st = striaaudiocrossfade_state();
+    st.zoom = 8;
+    st.select(1, 1).unwrap();
+    assert_eq!(st.verb("xfade 8"), Some(Ok(())));
+    st.deselect();
+    let l = timeline_core::view::Layout::of(320, 160, &st);
+    (st, l)
+}
+
+/// The bracket's one geometry is THE transition widget's rect over the record; a press on its right / left edge zone drags
+/// the length (`dur + delta` / `dur - delta`) in ONE commit with the curve kept and the incoming clip selected; the middle
+/// is no edge drag; past the outgoing's handle the model refuses and nothing changes; the moving edge snaps to a clip edge.
+#[test]
+fn striaxfadethree_xfade_edge_drag() {
+    use timeline_core::view::{Drag, DragKind, ROW_H, TRANS_H};
+    use timeline_core::{Curve, EditError};
+    let (st0, l) = striaxfadethree_state();
+    let y1 = l.row_y(1) + ROW_H as i64 - 2;
+    assert_eq!(l.xfade_rect(&st0.timeline.audio_xfades[0]), (160, y1 - TRANS_H, 224, y1));
+    let y = (y1 - TRANS_H / 2) as f64;
+    assert_eq!(l.xfade_at(&st0.timeline, 200.0, y), Some(0));
+    assert_eq!(l.xfade_at(&st0.timeline, 200.0, (y1 - TRANS_H - 1) as f64), None, "above the bracket");
+    // The right edge, +2 ticks, no snap.
+    let mut st = st0.clone();
+    let mut d = Drag::begin_xfade_edge(&mut st, l, 222.0, y, true).expect("the right edge zone");
+    assert_eq!((d.kind, d.track, d.idx, st.selection), (DragKind::XfadeOut, 1, 1, Some((1, 1))));
+    d.update(&st, 238.0, y);
+    assert_eq!(d.delta, 2);
+    assert_eq!(d.shown(&st).map(|s| s.timeline.audio_xfades[0].dur), Some(10), "the preview");
+    assert_eq!(d.finish(&mut st), Ok(()));
+    let x = st.timeline.audio_xfades[0];
+    assert_eq!((x.track, x.at, x.dur, x.curve), (1, 20, 10, Curve::EqualPower));
+    assert_eq!(st.undo_depth(), st0.undo_depth() + 1, "one undo step");
+    assert!(st.undo());
+    assert_eq!(st.timeline, st0.timeline);
+    // The left edge, -2 ticks: the crossfade lengthens, anchored at the cut.
+    let mut st = st0.clone();
+    let mut d = Drag::begin_xfade_edge(&mut st, l, 161.0, y, true).expect("the left edge zone");
+    assert_eq!(d.kind, DragKind::XfadeIn);
+    d.update(&st, 145.0, y);
+    assert_eq!(d.finish(&mut st), Ok(()));
+    assert_eq!((st.timeline.audio_xfades[0].at, st.timeline.audio_xfades[0].dur), (20, 10));
+    // The middle is a clip press, not an edge drag.
+    let mut st = st0.clone();
+    assert!(Drag::begin_xfade_edge(&mut st, l, 192.0, y, true).is_none());
+    assert_eq!(st.selection, None);
+    // Past the outgoing's handle (20 ticks): refused by name, nothing changes.
+    let mut st = st0.clone();
+    let mut d = Drag::begin_xfade_edge(&mut st, l, 222.0, y, true).unwrap();
+    d.update(&st, 222.0 + 13.0 * 8.0, y);
+    assert!(d.shown(&st).is_none());
+    assert_eq!(d.finish(&mut st), Err(EditError::Handle));
+    assert_eq!((&st.timeline, st.undo_depth()), (&st0.timeline, st0.undo_depth()));
+    // Snap on: the right edge (28) carried 94 px lands 2 px short of the incoming clip's end (40) and snaps there.
+    let mut st = st0.clone();
+    let mut d = Drag::begin_xfade_edge(&mut st, l, 222.0, y, false).unwrap();
+    d.update(&st, 222.0 + 94.0, y);
+    assert_eq!((d.delta, d.guide), (12, Some(40)));
+    assert_eq!(d.finish(&mut st), Ok(()));
+    assert_eq!(st.timeline.audio_xfades[0].dur, 20);
+    println!("striaxfadethree: right +2 -> 10, left -2 -> 10, middle none, +13 refused (Handle), snap -> 40 (dur 20)");
+}
