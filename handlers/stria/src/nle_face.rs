@@ -4625,7 +4625,7 @@ pub const EXPORT_QUEUE_MAX: usize = 16;
 
 /// STRIAEXPORTQUEUE (SR881): one parsed `export` request waiting its turn: exactly [`Face::start_export`]'s arguments
 /// but the test hold (`pause_at`), as `export_verb` resolved them (the range captured at the verb, `--all` as `None`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct ExportRequest {
     dir: std::path::PathBuf,
     fmt: String,
