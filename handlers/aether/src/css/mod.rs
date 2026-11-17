@@ -1408,14 +1408,14 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
                 Some(FlexDirection::RowReverse) => "row-reverse",
                 _ => "row",
             };
-            let side = |i: usize| paint.border.and_then(|b| b[i]);
+            let side = |i: usize| paint.border.map(|b| layout_core::paint::border_ink(b, paint.currentcolor, me.color)).and_then(|b| b[i]);
             let bw_top = paint.border_width.and_then(|w| w[0]).or(side(0).map(|s| s.0)).unwrap_or(0.0);
             let lh = line_height_used(&paint, me.line_height, me.font_size, layout_core::FontSel { family: me.family, weight: me.weight, italic: me.italic, ..Default::default() }).map(px).unwrap_or_else(|| "normal".to_string());
             let values = [
                 display.to_string(),
                 position.to_string(),
                 rgb(me.color),
-                paint.background.map(rgb).unwrap_or_else(|| "rgba(0, 0, 0, 0)".to_string()),
+                paint.background.map(|c| rgb(layout_core::paint::bg_ink(c, paint.currentcolor, me.color))).unwrap_or_else(|| "rgba(0, 0, 0, 0)".to_string()),
                 px(font_size_used(&paint, me.font_size)),
                 me.weight.to_string(),
                 if me.italic { "italic" } else { "normal" }.to_string(),
