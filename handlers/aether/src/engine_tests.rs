@@ -8958,4 +8958,26 @@ b</div>
         let s = edges("start");
         assert!(s[0] < 99.5, "the start twin is ragged: {s:?}");
     }
+
+    // ---- AETHERCSSOMFONTFAMILYQUOTEDGENERIC (LEDGER SR1107): a quoted generic name reads back quoted (named tail block) ----
+
+    /// AETHERCSSOMFONTFAMILYQUOTEDGENERIC (SR1107): `font-family: 'serif'` is a family NAMED serif (css-fonts-4 §2.1):
+    /// getComputedStyle reads `"serif"` (it read bare `serif`, which re-parses as the generic); the generic twin reads
+    /// `serif`; el.style already quoted it (cssom's token serializer) and stays pinned.
+    #[test]
+    fn cssom_font_family_quoted_generic() {
+        let html = r#"<!doctype html><html><body style="margin:0">
+            <div id="q" style="font-family: 'serif'">Hello</div>
+            <div id="g" style="font-family: serif">Hello</div>
+            <div id="m" style="font-family: 'serif', serif">Hello</div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 400));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        assert_eq!(font_shorthand_cs(&mut e, "q", "fontFamily"), r#""serif""#, "a quoted generic is a name");
+        assert_eq!(font_shorthand_cs(&mut e, "g", "fontFamily"), "serif", "the generic twin");
+        assert_eq!(font_shorthand_cs(&mut e, "m", "fontFamily"), r#""serif", serif"#, "the name, then the generic");
+        assert_eq!(font_synth_eval(&mut e, "document.getElementById('q').style.fontFamily"), r#""serif""#, "el.style (kept)");
+    }
 }
