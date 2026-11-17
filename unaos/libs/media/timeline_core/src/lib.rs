@@ -140,6 +140,10 @@ pub struct Track {
     pub clips: Vec<Clip>,
     /// NLE3: the transitions on this track's cuts, ordered by `at` (video tracks only).
     pub transitions: Vec<Transition>,
+    /// STRIATRACKMUTESOLO (SR837): the track is muted (out of [`Timeline::active_tracks`] unless some track is solo).
+    pub muted: bool,
+    /// STRIATRACKMUTESOLO (SR837): the track is soloed (when any track is, only the solo tracks are active).
+    pub solo: bool,
 }
 
 /// An edge wipe's SMPTE pattern (CMX 3600 `W<nnn>`): the incoming source enters behind a moving edge.
@@ -427,7 +431,7 @@ impl Timeline {
     }
     /// Add an empty track (builder); returns its index.
     pub fn add_track(&mut self, kind: Kind) -> usize {
-        self.tracks.push(Track { kind, clips: Vec::new(), transitions: Vec::new() });
+        self.tracks.push(Track { kind, clips: Vec::new(), transitions: Vec::new(), muted: false, solo: false });
         self.tracks.len() - 1
     }
     pub fn source(&self, id: SourceId) -> Option<&Source> {
@@ -1526,5 +1530,109 @@ impl Timeline {
         let mut tl = self.clone();
         tl.marks = m;
         Ok(tl)
+    }
+}
+
+// ---- STRIATRACKMUTESOLO (LEDGER SR837): per-track mute and solo, the ONE active-track rule (named tail block) ----
+// `Track::muted` / `Track::solo` are plain fields of the Timeline value (undo, `dirty`, save follow). The audible / visible
+// set is ONE fn, [`Timeline::active_tracks`]: if any track is solo, the solo tracks; else every track not muted (solo beats
+// mute; all muted: none). `schedule::schedule` (the video winner, a to-black above it) and `schedule::audio_runs` (the
+// mixed tracks) read it, so Stria's render, preview, play path and export, and the kernel Player's EDL mode, follow it;
+// `view::paint_in` dims every inactive row and badges the flags; the EDL carries `* UNA MUTE` / `* UNA SOLO`.
+impl Timeline {
+    /// The active tracks' indices, ascending (see the block comment). No allocation: callers may ask per tick.
+    pub fn active_tracks(&self) -> impl DoubleEndedIterator<Item = usize> + '_ {
+        let any_solo = self.tracks.iter().any(|t| t.solo);
+        (0..self.tracks.len()).filter(move |&i| if any_solo { self.tracks[i].solo } else { !self.tracks[i].muted })
+    }
+    /// The timeline with track `track`'s mute and solo flags set (`EditError::NoTrack` for no such track).
+    pub fn set_track_flags(&self, track: usize, muted: bool, solo: bool) -> Result<Timeline, EditError> {
+        let mut tl = self.clone();
+        let t = tl.tracks.get_mut(track).ok_or(EditError::NoTrack)?;
+        (t.muted, t.solo) = (muted, solo);
+        Ok(tl)
+    }
+}
+
+#[cfg(test)]
+mod striatrackmutesolo_tests {
+    use super::*;
+
+    fn four() -> Timeline {
+        let mut tl = Timeline::new(25);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        tl.add_track(Kind::Audio);
+        tl
+    }
+    fn act(tl: &Timeline) -> Vec<usize> {
+        tl.active_tracks().collect()
+    }
+
+    /// M3: none flagged -> all; one muted -> the rest; one solo -> only it; solo beats mute; all muted -> none; the
+    /// iterator runs backwards too (the schedule's top-down search).
+    #[test]
+    fn striatrackmutesolo_active_tracks_kats() {
+        let tl = four();
+        assert_eq!(act(&tl), alloc::vec![0, 1, 2, 3]);
+        let m = tl.set_track_flags(2, true, false).unwrap();
+        assert_eq!(act(&m), alloc::vec![0, 1, 3]);
+        let s = tl.set_track_flags(1, false, true).unwrap();
+        assert_eq!(act(&s), alloc::vec![1]);
+        let both = m.set_track_flags(2, true, true).unwrap();
+        assert_eq!(act(&both), alloc::vec![2], "solo beats mute");
+        let mut all = tl.clone();
+        for i in 0..4 {
+            all = all.set_track_flags(i, true, false).unwrap();
+        }
+        assert!(act(&all).is_empty());
+        assert_eq!(m.active_tracks().rev().collect::<Vec<_>>(), alloc::vec![3, 1, 0]);
+        assert_eq!(tl.set_track_flags(4, true, false), Err(EditError::NoTrack));
+    }
+
+    /// Every frame a keyframe, lengths unknown.
+    struct AllKeys;
+    impl SourceIndex for AllKeys {
+        fn duration(&self, _: SourceId) -> Option<i64> {
+            None
+        }
+        fn keyframe_ns(&self, _: SourceId, _: Kind, t_ns: i64) -> Option<i64> {
+            Some(t_ns)
+        }
+    }
+
+    /// M3 (the seat's pin): the SHARED schedule follows the rule, so the kernel Player's EDL mode does too: V2 muted over
+    /// V1 -> every video step names V1's source; V1 alone muted -> gaps; every audio track muted -> `audio_runs` still
+    /// covers the range with runs that have no layers (silence), and the schedule keeps one audio header per run.
+    #[test]
+    fn striatrackmutesolo_schedule_follows_the_rule() {
+        let mut tl = Timeline::new(25);
+        let (a, b) = (tl.add_source("A", 50), tl.add_source("B", 50));
+        let (v1, v2) = (tl.add_track(Kind::Video), tl.add_track(Kind::Video));
+        let (a1, a2) = (tl.add_track(Kind::Audio), tl.add_track(Kind::Audio));
+        tl.tracks[v1].clips = alloc::vec![Clip::new(a, 0, 10, 0)];
+        tl.tracks[v2].clips = alloc::vec![Clip::new(b, 0, 10, 0)];
+        tl.tracks[a1].clips = alloc::vec![Clip::new(a, 0, 10, 0)];
+        tl.tracks[a2].clips = alloc::vec![Clip::new(b, 0, 10, 0)];
+        let video = |tl: &Timeline| -> Vec<(Option<usize>, Option<SourceId>)> {
+            schedule::schedule(tl, 0..10, &AllKeys).unwrap().iter().filter(|s| s.kind == Kind::Video).map(|s| (s.track, s.src)).collect()
+        };
+        assert!(video(&tl).iter().all(|&v| v == (Some(v2), Some(b))), "unflagged: the top track wins");
+        let m = tl.set_track_flags(v2, true, false).unwrap();
+        assert!(video(&m).iter().all(|&v| v == (Some(v1), Some(a))), "V2 muted: the lower track shows");
+        let low = tl.set_track_flags(v2, false, false).unwrap().set_track_flags(v1, false, true).unwrap();
+        assert!(video(&low).iter().all(|&v| v == (Some(v1), Some(a))), "V1 solo: it shows");
+        let runs = schedule::audio_runs(&tl.set_track_flags(a1, true, false).unwrap(), 0..10, &AllKeys).unwrap();
+        assert!(runs.iter().all(|r| r.layers.len() == 1 && r.layers[0].track == a2), "A1 muted: A2's layer alone");
+        let mut mute = tl.set_track_flags(a1, true, false).unwrap().set_track_flags(a2, true, false).unwrap();
+        let runs = schedule::audio_runs(&mute, 0..10, &AllKeys).unwrap();
+        assert_eq!(runs.iter().map(|r| r.len).sum::<i64>(), 10);
+        assert!(runs.iter().all(|r| r.layers.is_empty()), "every audio track muted: silence");
+        let audio = schedule::schedule(&mute, 0..10, &AllKeys).unwrap().iter().filter(|s| s.kind == Kind::Audio).count();
+        assert_eq!(audio, runs.len());
+        mute = mute.set_track_flags(v1, true, false).unwrap().set_track_flags(v2, true, false).unwrap();
+        assert!(video(&mute).iter().all(|&v| v == (None, None)), "every video track muted: black steps, one per tick");
+        assert_eq!(video(&mute).len(), 10);
     }
 }

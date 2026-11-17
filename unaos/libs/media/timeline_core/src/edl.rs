@@ -339,6 +339,7 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
         let id = tl.source_by_reel(reel).map(|s| s.id).ok_or(EdlError::Syntax { line })?;
         tl = tl.set_size_policy(id, p).map_err(EdlError::Edit)?;
     }
+    track_flags(text, &mut tl)?; // STRIATRACKMUTESOLO (SR837): the `* UNA MUTE` / `* UNA SOLO` lines, once the tracks exist (file tail)
     tl.validate().map_err(EdlError::Edit)?;
     Ok(tl)
 }
@@ -398,6 +399,8 @@ pub fn write(tl: &Timeline, title: &str) -> Result<String, EdlError> {
         }
     }
     s.push_str(&mark_line(tl)); s.push('\n'); // NLE5DRANGESAVE (SR723): the document's `* UNA MARK` line, last in the header (file tail)
+    s.insert_str(s.len() - 1, &flag_lines(tl, "MUTE", |t| t.muted)); // STRIATRACKMUTESOLO (SR837): the muted tracks' `* UNA MUTE` lines, before the header's blank line (file tail)
+    s.insert_str(s.len() - 1, &flag_lines(tl, "SOLO", |t| t.solo)); // STRIATRACKMUTESOLO (SR837): the soloed tracks' `* UNA SOLO` lines (file tail)
     // NLE3cBLACK: `Err` = a transition TO black, an event at its `at` (no clip).
     let mut ev: Vec<(i64, usize, Result<Clip, Transition>)> = Vec::new();
     for (ti, t) in tl.tracks.iter().enumerate() {
@@ -623,5 +626,109 @@ fn mark_line(tl: &Timeline) -> String {
     match tl.marks {
         (None, None) => String::new(),
         (a, b) => format!("* UNA MARK {} {}\n", word(a), word(b)),
+    }
+}
+
+// ---- STRIATRACKMUTESOLO (LEDGER SR837): the `* UNA MUTE` / `* UNA SOLO` lines (named tail block) ----
+// `* UNA MUTE <ch>` / `* UNA SOLO <ch>` set a track's [`crate::Track::muted`] / [`crate::Track::solo`]; `<ch>` is the
+// event channel word (`V`, `V2`..`V9`, `A`, `A2`..`A9`; `V1` / `A1` read too). One line per flagged track, MUTE lines then
+// SOLO lines, written last in the header (after `* UNA MARK`, before the blank line) and only when a flag is set, so an
+// EDL with no flag writes as before. A flag is written only for a track the EDL carries (a track of its kind at or after it
+// holds a clip: the reader makes tracks up to the highest channel an event names), so `write(parse(write(tl)))` stays
+// byte-identical. Read once the tracks exist; refused as a syntax error: not exactly one word, an unknown channel, a channel
+// naming no track, the same word twice for one track.
+
+/// STRIATRACKMUTESOLO: the header's lines for every carried track `pick` flags: `* UNA <word> <ch>\n` each.
+fn flag_lines(tl: &Timeline, word: &str, pick: fn(&crate::Track) -> bool) -> String {
+    let mut s = String::new();
+    for (ti, t) in tl.tracks.iter().enumerate() {
+        let carried = tl.tracks[ti..].iter().any(|u| u.kind == t.kind && !u.clips.is_empty());
+        if !pick(t) || !carried {
+            continue;
+        }
+        let num = tl.track_number(ti).unwrap_or(1);
+        let k = if t.kind == Kind::Video { "V" } else { "A" };
+        if num == 1 {
+            s.push_str(&format!("* UNA {word} {k}\n"));
+        } else {
+            s.push_str(&format!("* UNA {word} {k}{num}\n"));
+        }
+    }
+    s
+}
+
+/// STRIATRACKMUTESOLO: the post-pass over `text` applying every `* UNA MUTE` / `* UNA SOLO` line to `tl` (its two arms).
+fn track_flags(text: &str, tl: &mut Timeline) -> Result<(), EdlError> {
+    let mut seen: Vec<(bool, usize)> = Vec::new();
+    for (i, raw) in text.lines().enumerate() {
+        let line = i + 1;
+        let l = raw.trim();
+        let (solo, r) = match (l.strip_prefix("* UNA MUTE "), l.strip_prefix("* UNA SOLO ")) {
+            (Some(r), _) => (false, r),
+            (_, Some(r)) => (true, r),
+            _ => continue,
+        };
+        let w: Vec<&str> = r.split_whitespace().collect();
+        if w.len() != 1 {
+            return Err(EdlError::Syntax { line });
+        }
+        let (kind, num) = channel(w[0]).ok_or(EdlError::Syntax { line })?;
+        let ti = (0..tl.tracks.len()).filter(|&t| tl.tracks[t].kind == kind).nth(num - 1).ok_or(EdlError::Syntax { line })?;
+        if seen.contains(&(solo, ti)) {
+            return Err(EdlError::Syntax { line });
+        }
+        seen.push((solo, ti));
+        let t = &tl.tracks[ti];
+        let (m, s) = if solo { (t.muted, true) } else { (true, t.solo) };
+        *tl = tl.set_track_flags(ti, m, s).map_err(|_| EdlError::Syntax { line })?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod striatrackmutesolo_tests {
+    use super::*;
+
+    fn tl() -> Timeline {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        for k in [Kind::Video, Kind::Video, Kind::Audio, Kind::Audio] {
+            let t = tl.add_track(k);
+            tl.tracks[t].clips = alloc::vec![Clip::new(a, 0, 10, 0)];
+        }
+        tl
+    }
+
+    /// M3: a muted A2 and a soloed V round trip; the lines sit last in the header; write(parse(write)) is byte-identical;
+    /// a timeline with no flag writes no line (the goldens' bytes).
+    #[test]
+    fn striatrackmutesolo_edl_round_trip() {
+        let plain = write(&tl(), "T").unwrap();
+        assert!(!plain.contains("* UNA MUTE") && !plain.contains("* UNA SOLO"));
+        let f = tl().set_track_flags(3, true, false).unwrap().set_track_flags(0, false, true).unwrap();
+        let text = write(&f, "T").unwrap();
+        assert!(text.contains("* UNA SOURCE A 00:00:02:00\n* UNA MUTE A2\n* UNA SOLO V\n\n001"), "{text}");
+        let back = parse(&text, 25).unwrap();
+        assert_eq!(back, f);
+        assert_eq!(write(&back, "T").unwrap(), text);
+        assert_eq!(plain.replace("\n\n001", "\n* UNA MUTE A2\n* UNA SOLO V\n\n001"), text, "only the two lines differ");
+    }
+
+    /// M3: each refusal names its line; an empty trailing track's flag is not written (the reader would not make it).
+    #[test]
+    fn striatrackmutesolo_edl_refusals() {
+        let text = write(&tl(), "T").unwrap();
+        let with = |extra: &str| parse(&text.replace("\n\n001", &format!("\n{extra}\n\n001")), 25);
+        let at = text.lines().position(|l| l.is_empty()).unwrap() + 1;
+        assert_eq!(with("* UNA MUTE"), Ok(tl()), "no space after the word: not this line (a comment)");
+        assert_eq!(with("* UNA MUTE A A2"), Err(EdlError::Syntax { line: at }));
+        assert_eq!(with("* UNA SOLO X"), Err(EdlError::Syntax { line: at }));
+        assert_eq!(with("* UNA MUTE A3"), Err(EdlError::Syntax { line: at }));
+        assert_eq!(with("* UNA MUTE V2\n* UNA MUTE V2"), Err(EdlError::Syntax { line: at + 1 }));
+        assert_eq!(with("* UNA MUTE V1\n* UNA SOLO V1").map(|t| (t.tracks[0].muted, t.tracks[0].solo)), Ok((true, true)));
+        let mut empty = tl();
+        let t = empty.add_track(Kind::Audio);
+        empty = empty.set_track_flags(t, true, false).unwrap();
+        assert_eq!(write(&empty, "T").unwrap(), write(&tl(), "T").unwrap());
     }
 }
