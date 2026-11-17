@@ -186,6 +186,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         ["wheel", n] => SMessage::BrowserScroll(0.0, -nle_face::WHEEL_STEP * px(n)?, 0),
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
         [w @ ("kind" | "ease"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
+        [w @ ("insert" | "overwrite"), reel, a, b] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {reel} {a} {b}") }, // STRIAINSERTOVERWRITE (SR852): `insert:A:13:23` (frames: `:` is the token separator)
         ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button
         _ => return None,
     };
@@ -524,6 +525,7 @@ fn transport() -> TetraNode {
         button("gain-", "Gain -"), button("gain+", "Gain +"), button("gain", "0 dB"), button("fade-in", "Fade In"), button("fade-out", "Fade Out"), // STRIACLIPGAINFACE (SR838): the selected clip's gain (1 dB a press, bare `gain` unity) and fades to the playhead
         button("mute", "Mute"), button("solo", "Solo"), // STRIATRACKMUTESOLO (SR837): mute / solo the selected clip's track (help stays the last button)
         button("roll-", "Roll -"), button("roll+", "Roll +"), // STRIAROLLEDIT (SR851): one-frame roll of the cut at the selected clip's out edge
+        button("insert", "Insert"), button("overwrite", "Overwrite"), // STRIAINSERTOVERWRITE (SR852): the selected clip's source range at the playhead, rippling / over its track
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
 }
@@ -995,5 +997,41 @@ mod striamarkers_tests {
         println!("striamarkers witness: {}", markers_json(&face));
         assert_eq!(drive(&mut face, "unmark,ruler:0,unmark"), vec!["unmarked M2 at 00:00:00:12".to_string(), "unmarked M1 at 00:00:00:00".to_string()]);
         assert_eq!(markers_json(&face), "");
+    }
+}
+
+// ---- STRIAINSERTOVERWRITE (LEDGER SR852): the insert / overwrite buttons and the `--do` argument token (named tail block) ----
+
+#[cfg(test)]
+mod striainsertoverwrite_tests {
+    use super::*;
+    use timeline_core::{Clip, SourceId};
+
+    fn face() -> Face {
+        let (tl, src) = nle_face::synth_fixture();
+        Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false)
+    }
+
+    /// STRIAINSERTOVERWRITE M3: the two buttons sit just before `help`; `--do at:12:0,ruler:15,insert` lays the selected
+    /// B 0..10 at 15 on V1 (the witness's `"clip"` reads `15:0:10`), A1 untouched; `insert:A:13:23` is the face's word.
+    #[test]
+    fn striainsertoverwrite_buttons_and_token() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let ids: Vec<String> = row.iter().map(|b| match b { TetraNode::Button { id, .. } => id.clone(), _ => panic!("not a button") }).collect();
+        assert_eq!(ids[ids.len() - 3..], ["insert", "overwrite", "help"]);
+        let mut f = face();
+        let a1 = f.state.timeline.tracks[1].clone();
+        let errors = drive(&mut f, "at:12:0,ruler:15,insert");
+        assert!(errors.is_empty(), "{errors:?}");
+        let c = f.state.selected().expect("the laid clip selected");
+        assert_eq!(format!("{}:{}:{}", c.at, c.src_in, c.src_out), "15:0:10");
+        assert_eq!((c.src, f.state.playhead, f.state.timeline.tracks[0].clips.iter().map(|c| c.end()).max()), (SourceId(1), 25, Some(45)));
+        assert_eq!(f.state.timeline.tracks[1], a1, "insert ripples only the target track");
+        assert!(matches!(token(&f, "insert:A:13:23").as_deref(), Some([SMessage::Input { text, .. }]) if text == "insert A 13 23"));
+        let mut g = face();
+        let errors = drive(&mut g, "ruler:5,overwrite:A:40:45");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(g.state.timeline.tracks[0].clips[1], Clip::new(SourceId(0), 40, 45, 5));
+        println!("striainsertoverwrite witness: at:12:0,ruler:15,insert -> clip 15:0:10, V1 end 45; overwrite:A:40:45 at 5");
     }
 }
