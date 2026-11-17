@@ -425,6 +425,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("D", "overwrite-marked"),
     ("c", "xfade"), // STRIAXFADECURVEBUTTON (SR925): c / C (Shift+c, text) put / take the crossfade and swap its curve (x is the kernel's delete, X the mark clear)
     ("C", "xfade-curve"),
+    ("v", "gain-"), ("V", "gain+"), (":", "track-gain-"), ("\"", "track-gain+"), ("Q", "mute"), ("S", "solo"), // STRIATRACKGAINKEYS (SR926): text keys for the audio words (Face::verb: the buttons' commit and message line; the natural - / = / m / s are taken)
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
@@ -2658,6 +2659,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("overwrite-marked", "overwrite the in / out marks with the clip's source"),
     ("xfade", "put / take the selected audio clip's crossfade"), // STRIAXFADECURVEBUTTON (SR925)
     ("xfade-curve", "switch the crossfade's curve linear / equal"),
+    ("gain-", "clip gain down one step"), ("gain+", "clip gain up one step"), ("track-gain-", "track gain down 1 dB"), ("track-gain+", "track gain up 1 dB"), ("mute", "mute / unmute the clip's track"), ("solo", "solo / unsolo the clip's track"), // STRIATRACKGAINKEYS (SR926)
     ("help", "show / hide this help"),
 ];
 /// NLE5DKEYSHELP (SR744): the help's inset from the band's top and left (px).

@@ -8914,3 +8914,60 @@ fn striaxfadecurvebutton_face_keys_button_and_message() {
     assert_eq!((&face.state.timeline, face.state.undo_depth()), (&before, depth));
     println!("striaxfadecurvebutton: c -> 10 equal, C -> 10 linear, xfade-curve -> 10 equal, xfade -> off; refusals in words");
 }
+
+// ---- STRIATRACKGAINKEYS (LEDGER SR926): text keys for the audio words, their help rows (named tail block) ----
+// `v` / `V` gain- / gain+, `:` / `"` track-gain- / track-gain+, `Q` mute, `S` solo: KEYS rows naming VERBS words, so a
+// press is `Face::verb` — the buttons' one commit and message line; HELP carries a phrase for each.
+
+/// The six keys and their words (the KEYS rows this arc adds).
+const STRIATRACKGAINKEYS: [(&str, &str); 6] = [("v", "gain-"), ("V", "gain+"), (":", "track-gain-"), ("\"", "track-gain+"), ("Q", "mute"), ("S", "solo")];
+
+/// With A1's first clip selected each key edits in one undo step and reads the buttons' line; Ctrl+z undoes the solo;
+/// with nothing selected the keys are refused by the words' names; a one-char key as `BrowserKey` alone is not taken.
+#[test]
+fn striatrackgainkeys_keys_drive_the_audio_words() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    face.state.select(1, 0).unwrap();
+    assert!(nle5drangekeys_press(&mut face, "v"));
+    assert_eq!((face.last_error.take().as_deref(), face.state.selected().unwrap().gain_cdb, face.state.undo_depth()), (Some("gain -1.0 dB"), -100, 1));
+    assert!(nle5drangekeys_press(&mut face, "V"));
+    assert_eq!((face.last_error.take().as_deref(), face.state.selected().unwrap().gain_cdb, face.state.undo_depth()), (Some("gain 0.0 dB"), 0, 2));
+    assert!(nle5drangekeys_press(&mut face, ":"));
+    assert_eq!((face.last_error.take().as_deref(), face.state.timeline.tracks[1].gain_cdb, face.state.undo_depth()), (Some("track-gain: A1 -1.0 dB"), -100, 3));
+    assert!(nle5drangekeys_press(&mut face, "\""));
+    assert_eq!((face.last_error.take().as_deref(), face.state.timeline.tracks[1].gain_cdb, face.state.undo_depth()), (Some("track-gain: A1 0.0 dB"), 0, 4));
+    assert!(nle5drangekeys_press(&mut face, "Q"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!((face.state.timeline.tracks[1].muted, face.state.timeline.tracks[0].muted, face.state.undo_depth()), (true, false, 5));
+    assert!(nle5drangekeys_press(&mut face, "S"));
+    assert_eq!((face.state.timeline.tracks[1].solo, face.state.undo_depth()), (true, 6));
+    assert!(face.on(&bandy::SMessage::BrowserKey("Ctrl+z".into())));
+    assert_eq!((face.state.timeline.tracks[1].solo, face.state.timeline.tracks[1].muted), (false, true), "undo takes the solo back");
+    assert!(!face.on(&bandy::SMessage::BrowserKey("v".into())), "a one-char key is read from the text only");
+    face.state.deselect();
+    assert!(nle5drangekeys_press(&mut face, "v"));
+    assert_eq!(face.last_error.take(), Some(format!("gain-: {}", EditError::NoClip)));
+    assert!(nle5drangekeys_press(&mut face, "Q"));
+    assert_eq!(face.last_error.take(), Some(format!("mute: {}", EditError::NoTrack)));
+    println!("striatrackgainkeys: v / V / : / \" / Q / S each one commit; Ctrl+z undoes S; no selection refused");
+}
+
+/// Each pair is a KEYS row and its key is bound once; its help row names the key with a HELP phrase (not the bare
+/// word); no key is one the kernel's EDIT_KEYS binds (its bytes as a literal) or SR835's `m` / SR923's `;` / `'`.
+#[test]
+fn striatrackgainkeys_help_rows_and_no_collision() {
+    let kernel = ["s", "x", "u", "z", "Z", "[", "]", "{", "}", "i", "o", "+", "=", "-", "0", "f"];
+    let rows = help_rows();
+    for (k, w) in STRIATRACKGAINKEYS {
+        assert!(KEYS.contains(&(k, w)), "{k} -> {w}");
+        assert_eq!(KEYS.iter().filter(|(n, _)| *n == k).count(), 1, "{k} bound once");
+        assert!(VERBS.contains(&w), "{w}: a VERBS word (its button)");
+        assert!(HELP.iter().any(|(a, _)| *a == w), "no phrase for {w}");
+        let row = rows.iter().find(|r| r.0.split(" / ").any(|x| x == k)).expect("a help row");
+        assert_eq!(row.1, help_phrase(w));
+        assert!(!row.1.is_empty() && row.1 != w, "{w}: a phrase, not the word");
+        assert!(!kernel.contains(&k) && !["m", ";", "'"].contains(&k), "{k} collides");
+    }
+    println!("striatrackgainkeys: help rows={} keys={}", rows.len(), KEYS.len());
+}
