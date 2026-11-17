@@ -124,7 +124,7 @@ pub fn timecode(t: i64, fps: u32) -> String {
 }
 
 /// Ticks for `HH:MM:SS:FF` at `fps`.
-fn parse_tc(s: &str, fps: u32, line: usize) -> Result<i64, EdlError> {
+pub(crate) fn parse_tc(s: &str, fps: u32, line: usize) -> Result<i64, EdlError> {
     if s.contains(';') {
         return Err(EdlError::DropFrame { line });
     }

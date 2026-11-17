@@ -295,7 +295,7 @@ fn seek_for(
 
 /// NLE4: clip `c`'s fade envelope at timeline tick (edge) `t`, Q16: rising over `at..at + fade_in`, falling over
 /// `end - fade_out..end`, full between.
-fn env_q16(c: &crate::Clip, t: i64) -> u32 {
+pub(crate) fn env_q16(c: &crate::Clip, t: i64) -> u32 {
     let mut e = ENV_ONE as i64;
     if c.fade_in > 0 && t < c.at + c.fade_in {
         e = e.min((t - c.at).max(0) * ENV_ONE as i64 / c.fade_in);
