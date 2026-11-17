@@ -4558,3 +4558,65 @@ fn striaproxywatch_worker_in_flight_never_blocks_a_reload() {
     let _ = std::fs::remove_dir_all(&dir);
     println!("striaproxywatch worker: reload landed with the worker running, stale head and table dropped, re-asked");
 }
+
+// ---- STRIAPROXYSCAN (LEDGER SR9116): the caches and the export judged by the one sources generation (named tail block) ----
+
+/// A reload drops the reloaded reel's heads and peak table cached before it (the sweep, through `stale_in`); another reel's
+/// table stays; the next paint decodes and scans the new file once.
+#[test]
+fn striaproxyscan_reload_drops_the_reels_cached_heads_and_table() {
+    let (dir, pa, _, mut face, tl) = striaproxyoff_face("scan-cache");
+    let (a, b) = (tl.sources[0].id, tl.sources[1].id);
+    let _ = face.paint();
+    assert!(face.thumb(a, 13).is_some() && face.wave_peaks(a).is_some() && face.wave_peaks(b).is_some());
+    let (scans, decodes) = (face.wave_scans(), face.thumb_decodes());
+    let b_table = face.wave_peaks(b).cloned();
+    let new = synth_source(5000, 50, 25);
+    std::fs::write(&pa, &new).unwrap();
+    let note = striaproxywatch_reload(&mut face, "A");
+    assert_eq!(note, format!("watch: A: reloaded {} bytes", new.len()));
+    assert!(face.thumb(a, 13).is_none(), "A's head of the old media is dropped at the reload");
+    assert!(face.wave_peaks(a).is_none(), "A's table of the old media is dropped at the reload");
+    assert_eq!(face.wave_peaks(b).cloned(), b_table, "B did not reload: its table stays");
+    let _ = face.paint();
+    assert_eq!(face.wave_scans(), scans + 1, "only A is scanned again");
+    assert!(face.thumb_decodes() > decodes, "A's heads are decoded again");
+    let mut alt = Sources::new(&tl);
+    alt.add(a, new.clone()).unwrap();
+    alt.add(b, synth_source(1000, 50, 25)).unwrap();
+    let mut sync = Face::new(EditorState::new(tl.clone()), alt, (320, 160), PixelOrder::Rgba, false);
+    let _ = sync.paint();
+    assert_eq!(face.thumb(a, 13), sync.thumb(a, 13), "the head is the new file's");
+    assert_eq!(face.wave_peaks(a), sync.wave_peaks(a), "the table is the new file's");
+    assert!(!face.dirty(), "a reload and a sweep leave the document clean");
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("striaproxyscan cache: A's head and table swept at the reload, B kept, A re-scanned once");
+}
+
+/// An export whose thread ended (its clone dropped) but is not joined lets the reload through; its result line then says
+/// the reel reloaded after it started. An export started after the reload carries no clause.
+#[test]
+fn striaproxyscan_export_started_before_a_reload_says_so() {
+    let (dir, pa, _, mut face, _) = striaproxyoff_face("scan-export");
+    let out = dir.join("export");
+    assert!(face.verb(&format!("export {} png none", out.display())));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    let new = synth_source(5000, 50, 25);
+    std::fs::write(&pa, &new).unwrap();
+    let note = striaproxywatch_reload(&mut face, "A");
+    assert_eq!(note, format!("watch: A: reloaded {} bytes", new.len()));
+    assert!(face.exporting(), "the ended export is not joined yet");
+    face.last_error = None;
+    assert!(face.wait_export());
+    let line = face.last_error.take().expect("the result line");
+    assert!(line.starts_with("export: 35 frames, "), "{line}");
+    assert!(line.ends_with(&format!(" -> {}; A reloaded after the export started (it holds the old media)", out.display())), "{line}");
+    let again = dir.join("again");
+    assert!(face.verb(&format!("export {} png none", again.display())));
+    assert!(face.wait_export());
+    let line2 = face.last_error.take().expect("the second result line");
+    assert!(line2.ends_with(&format!(" -> {}", again.display())), "started after the reload: no clause: {line2}");
+    assert!(!face.dirty());
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("striaproxyscan export: {line}");
+}

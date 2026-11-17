@@ -2098,6 +2098,7 @@ pub struct ExportJob {
     shown: u64,
     /// NLE5DEXPORTRANGE (SR717): the marked range exported (`None`: the whole timeline), named in the result line.
     range: Option<std::ops::Range<i64>>, video: String, audio: AudioOut, started: std::time::Instant, rate_ema: f64, rate_at: (std::time::Instant, u64), // NLE5DEXPORTMESSAGEAUDIO (SR756): the video word and the audio the result line and the witness name
+    sgen: u64, // STRIAPROXYSCAN (SR9116): the sources generation the export cloned (file tail)
 }
 
 impl Face {
@@ -2172,7 +2173,7 @@ impl Face {
                 export_as_with(&tl, span, &sources, &path, video, audio, Container::Mp4, &mut progress)
             })
             .map_err(|e| format!("{}: {e}", dir.display()))?;
-        let started = std::time::Instant::now(); self.export = Some(ExportJob { dir: dir.to_path_buf(), done, total, cancel, handle: Some(handle), shown: 0, range, video, audio, started, rate_ema: 0.0, rate_at: (started, 0) });
+        let started = std::time::Instant::now(); self.export = Some(ExportJob { dir: dir.to_path_buf(), done, total, cancel, handle: Some(handle), shown: 0, range, video, audio, started, rate_ema: 0.0, rate_at: (started, 0), sgen: self.sources_gen });
         Ok(())
     }
     /// The deterministic seam: start an export of `fmt` into `dir` that holds after frame `k` until it is cancelled (Esc,
@@ -2239,7 +2240,7 @@ impl Face {
             Some(Ok(Err(e))) => format!("export: {e}"),
             _ => "export: the export thread panicked".to_string(),
         };
-        self.last_error = Some(line);
+        self.last_error = Some(line); self.export_stale(j.sgen); // STRIAPROXYSCAN (SR9116): an export cloned before a reload says so (file tail)
     }
 }
 
@@ -3554,7 +3555,7 @@ impl Face {
             self.watched.retain(|(r, _)| *r != reel);
             self.watched.push((reel, now));
         }
-        self.trans_still = None;
+        self.trans_still = None; self.cache_sweep(); // STRIAPROXYSCAN (SR9116): heads, tiles and tables of the reloaded reels dropped (file tail)
         self.meters.reset();
         if !parts.is_empty() {
             self.note = Some(format!("watch: {}", parts.join("; ")));
@@ -3586,6 +3587,7 @@ impl Face {
 pub struct WavePeaks {
     map: std::collections::BTreeMap<timeline_core::SourceId, Option<view::Peaks>>,
     scans: u32,
+    swept: u64, // STRIAPROXYSCAN (SR9116): the sources generation of the last cache sweep (file tail)
     thumbs: Thumbs, // STRIATHUMBNAILS (SR839): each video clip head's still, decoded once per (source, src_in) (file tail)
 }
 
@@ -4070,5 +4072,54 @@ impl Face {
         }
         self.proxy_next();
         true
+    }
+}
+
+// ---- STRIAPROXYSCAN (LEDGER SR9116): the caches and the export judged by the one sources generation (named tail block) ----
+// SR9079's `stale_in` dropped a head or a peak table whose job was IN FLIGHT across a reload, but what the face had CACHED
+// before the reload stayed: `wave_fill`, `Thumbs::fill` and `fill_strip` ask only for absent keys, so the band painted the old
+// media's heads, filmstrip tiles and table for the face's life. And an export whose thread had ended (its clone dropped) but
+// was not yet joined let a reload through, then reported a file of the old media with no word of it. RULES:
+// * CACHE: `WavePeaks.swept` is the generation of the last sweep. `watch_sources` calls `cache_sweep` once after its loop
+//   (beside `trans_still = None`): every `WavePeaks.map` / `Thumbs.map` entry whose source reloaded after `swept`
+//   (`stale_in`, the one rule) goes, then `swept` takes `sources_gen`. No job can have inserted at the new generation yet
+//   (jobs are sent only from a paint), so the sweep drops exactly the old media's entries; the next paint asks again (on the
+//   face's thread, or SR997's worker at the new lease); an old job's queued result is still dropped by `drain_bg`. Another
+//   source's entries stay. SR9071 / SR9098's peak FILE cache keys a table by the media's size and mtime, so a reloaded reel
+//   misses it by its stamp: the sweep and the file cache agree.
+// * EXPORT: `ExportJob.sgen` is the generation at its clone; `finish_export`, after its line is built, calls `export_stale`:
+//   any source reloaded later (`sources_stale(None, ..)`) appends `; <reels> reloaded after the export started (it holds
+//   the old media)` to every outcome. `job_line` / `export_eta` / `export_json` are untouched.
+// No lock: the generation is the face thread's own field. Owed: NLE-PROXY-WATCH-EXPORT-WITNESS (stria-view `export_json`
+// carries no stale flag), NLE-PROXY-WATCH-PREVIEW (the clause names every reloaded reel, not only those in the range).
+
+impl Face {
+    /// STRIAPROXYSCAN (LEDGER SR9116): drop every cached head, tile and peak table of a source reloaded since the last sweep.
+    fn cache_sweep(&mut self) {
+        let swept = self.peaks.swept;
+        if self.sources_gen == swept {
+            return;
+        }
+        let reloaded = &self.reloaded;
+        self.peaks.map.retain(|id, _| !stale_in(reloaded, Some(*id), swept));
+        self.peaks.thumbs.map.retain(|k, _| !stale_in(reloaded, Some(k.0), swept));
+        self.peaks.swept = self.sources_gen;
+    }
+    /// STRIAPROXYSCAN (LEDGER SR9116): an export cloned at `sgen` before a reload: its result line names the reloaded reels.
+    fn export_stale(&mut self, sgen: u64) {
+        if !self.sources_stale(None, sgen) {
+            return;
+        }
+        let reels: Vec<String> = self
+            .reloaded
+            .iter()
+            .filter(|(_, g)| *g > sgen)
+            .map(|(s, _)| self.state.timeline.source(*s).map(|x| x.reel.clone()).unwrap_or_else(|| format!("{s:?}")))
+            .collect();
+        let clause = format!("{} reloaded after the export started (it holds the old media)", reels.join(", "));
+        self.last_error = Some(match self.last_error.take() {
+            Some(l) => format!("{l}; {clause}"),
+            None => clause,
+        });
     }
 }
