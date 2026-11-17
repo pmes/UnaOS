@@ -1305,7 +1305,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
         line_height: f32,
         text_align: u8,
         underline: bool,
-        nowrap: bool,
+        nowrap: bool, white_space: u8, list_style: u8,
         hidden: bool,
     }
     fn num(v: f32) -> String {
@@ -1345,7 +1345,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
     any.with_doc(|doc, _| {
         let root = Inh {
             color: (0, 0, 0), font_size: 16.0, weight: 400, italic: false, family: crate::fonts::STANDARD, line_height: 0.0,
-            text_align: 0, underline: false, nowrap: false, hidden: false,
+            text_align: 0, underline: false, nowrap: false, white_space: 0, list_style: 1, hidden: false,
         };
         let mut inh: HashMap<html_core::NodeId, Inh> = HashMap::new();
         for id in doc.descendants(html_core::Document::ROOT) {
@@ -1378,6 +1378,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
             if let Some(nw) = paint.nowrap {
                 me.nowrap = nw;
             }
+            me.white_space = paint.white_space.unwrap_or_else(|| layout_core::paint::or_tag(Some(&paint), layout_core::paint::INHERIT_WHITE_SPACE, parent.white_space, |w| crate::layout::default_white_space(tag, w))); me.list_style = crate::render::list_style_of(tag, parent.list_style, &paint, &any.node_at(id));
             if let Some(h) = paint.hidden {
                 me.hidden = h;
             }
@@ -1423,9 +1424,9 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
                 lh,
                 match me.text_align { 1 => "center", 2 => "right", 3 => "end", 4 => "left", 5 => "-webkit-center", 6 => "-webkit-right", 7 => "-webkit-left", _ => "start" }.to_string(),
                 if me.underline { "underline" } else { "none" }.to_string(),
-                if me.nowrap { "nowrap" } else { "normal" }.to_string(),
+                white_space_word(me.white_space).to_string(),
                 if me.hidden { "hidden" } else { "visible" }.to_string(),
-                "disc".to_string(),
+                list_style_word(me.list_style).to_string(),
                 px(if side(0).is_some() || bw_top > 0.0 { bw_top } else { 0.0 }),
                 if side(0).is_some() && bw_top > 0.0 { "solid" } else { "none" }.to_string(),
                 rgb(side(3).map(|s| s.1).unwrap_or(me.color)),
@@ -1742,4 +1743,37 @@ fn line_height_used(paint: &crate::layout::PaintStyle, mult: f32, specified: f32
         return None;
     }
     Some(layout_core::Fonts::line_height(&crate::layout::HostFonts, sel, font_size_used(paint, specified), mult))
+}
+
+// ---- AETHERCSSOMINHERITEDRESTREPORT (LEDGER SR842): the report's white-space / list-style-type keywords (named tail block) ----
+
+/// AETHERCSSOMINHERITEDRESTREPORT (SR842): a `PaintStyle::white_space` code as its keyword (the inverse of layout_core's
+/// `white-space` arm: 0 normal, 1 nowrap, 2 pre, 3 pre-wrap, 4 pre-line, 5 break-spaces).
+fn white_space_word(c: u8) -> &'static str {
+    match c {
+        1 => "nowrap",
+        2 => "pre",
+        3 => "pre-wrap",
+        4 => "pre-line",
+        5 => "break-spaces",
+        _ => "normal",
+    }
+}
+
+/// AETHERCSSOMINHERITEDRESTREPORT (SR842): a `PaintStyle::list_style` code as its keyword (the inverse of layout_core's
+/// `counter_style_code`; the `-latin` aliases serialize as their `-alpha` names).
+fn list_style_word(c: u8) -> &'static str {
+    match c {
+        0 => "none",
+        2 => "circle",
+        3 => "square",
+        4 => "decimal",
+        5 => "lower-alpha",
+        6 => "upper-alpha",
+        7 => "lower-roman",
+        8 => "upper-roman",
+        9 => "decimal-leading-zero",
+        10 => "lower-greek",
+        _ => "disc",
+    }
 }

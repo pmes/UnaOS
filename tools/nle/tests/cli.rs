@@ -333,10 +333,10 @@ fn cli_completions_scripts() {
         assert_eq!((code, err.as_str()), (0, ""), "completions {shell}");
         out
     };
-    // bash: ONE `complete` line naming every word.
+    // bash: the `_nle` fn naming every word, then ONE `complete -F` line (NLECLICOMPLETIONSVALUES SR847).
     let bash = script("bash");
-    assert_eq!(bash.lines().count(), 1, "{bash}");
-    assert!(bash.starts_with("complete ") && bash.ends_with(" nle\n"), "{bash}");
+    assert!(bash.starts_with("_nle() {\n"), "{bash}"); /* SR847 */
+    assert!(bash.ends_with("\ncomplete -o default -F _nle nle\n"), "{bash}"); /* SR847 */
     // zsh: `#compdef nle` first, every word in the script.
     let zsh = script("zsh");
     assert_eq!(zsh.lines().next(), Some("#compdef nle"), "{zsh}");
@@ -347,13 +347,13 @@ fn cli_completions_scripts() {
     }
     // fish: one line per word, a `--name` word as `-l name`, a verb as `-a` at the first word.
     let fish = script("fish");
-    assert_eq!(fish.lines().count(), words.len(), "{fish}");
+    assert_eq!(fish.lines().count(), words.len() + 1, "{fish}"); /* SR847 */ // + the size policy line
     for w in &words {
         let line = match w.strip_prefix("--") {
             Some(l) => format!("complete -c nle -l {l}"),
             None => format!("complete -c nle -n __fish_use_subcommand -a {w}"),
         };
-        assert!(fish.lines().any(|x| x == line), "fish: {line:?} in {fish}");
+        assert!(fish.lines().any(|x| x == line || x.starts_with(&format!("{line} -xa "))), "fish: {line:?} in {fish}"); /* SR847 */
     }
     // Refusals by SR801's grammar, exit 1, nothing on stdout.
     let refused: [(&[&str], &str); 2] = [
@@ -372,4 +372,56 @@ fn cli_completions_scripts() {
     assert_eq!(lines[0], "nle: completoins: unknown verb; did you mean completions?");
     assert_eq!(lines[1], USAGE_FIRST);
     assert_eq!(lines[6], "       nle completions bash|zsh|fish");
+}
+
+// ---- NLECLICOMPLETIONSVALUES (LEDGER SR847): the words a flag's value takes in every completion script (named tail block) ----
+/// NLECLICOMPLETIONSVALUES (SR847): the value table built from the OWNERS' tables (stria's `VIDEO_NAMES` / `AUDIO_NAMES` +
+/// `aac:` / `PASS2_KEYS` as `k=`), never from literals: a new word in a table must reach every script.
+fn completion_values() -> Vec<(&'static str, String)> {
+    let audio: Vec<String> = AUDIO_NAMES.iter().map(|w| w.to_string()).chain(["aac:".to_string()]).collect();
+    vec![
+        ("--video", VIDEO_NAMES.join(" ")),
+        ("--audio", audio.join(" ")),
+        ("--pass2", stria::nle_export::PASS2_KEYS.iter().map(|k| format!("{k}=")).collect::<Vec<_>>().join(" ")),
+    ]
+}
+
+#[test]
+fn cli_completions_values() {
+    let flags = const_words("FLAGS");
+    let table = completion_values();
+    let size = timeline_core::SizePolicy::ALL.map(timeline_core::SizePolicy::name).join(" ");
+    let script = |shell: &str| {
+        let (code, out, err) = nle(&["completions", shell]);
+        assert_eq!((code, err.as_str()), (0, ""), "completions {shell}");
+        out
+    };
+    let (bash, zsh, fish) = (script("bash"), script("zsh"), script("fish"));
+    for (f, words) in &table {
+        assert!(flags.contains(f), "{f}: a valued flag is in main.rs FLAGS {flags:?}");
+        let l = f.trim_start_matches('-');
+        assert!(bash.contains(&format!("        {f}) w=\"{words}\" ;;\n")), "bash: {f} -> {words} in {bash}");
+        assert!(zsh.contains(&format!(" '*{f}:{l}:({words})'")), "zsh: {f} -> {words} in {zsh}");
+        let fl = format!("complete -c nle -l {l} -xa \"{words}\"");
+        assert!(fish.lines().any(|x| x == fl), "fish: {fl:?} in {fish}");
+    }
+    // Exactly the table's flags carry values (no word list the owners' tables do not hold).
+    assert_eq!(bash.matches(") w=\"").count(), table.len(), "{bash}");
+    assert_eq!(zsh.matches(":(").count(), table.len() + 1, "{zsh}"); // + SR821's `1:verb:(..)`
+    assert_eq!(fish.lines().filter(|x| x.contains(" -xa ")).count(), table.len() + 1, "{fish}");
+    // The size policies, timeline_core's `SizePolicy::ALL`, at `nle size <edl> <reel> _` in each shell.
+    assert!(bash.contains(&format!("[[ ${{COMP_WORDS[1]}} == size && $COMP_CWORD == 4 ]] && w=\"{size}\"\n")), "{bash}");
+    assert!(zsh.contains(&format!(" '4:policy:{{if [[ $words[2] == size ]]; then compadd -- {size}; else _files; fi}}'")), "{zsh}");
+    assert!(fish.contains(&format!("__fish_seen_subcommand_from size; and test (count (commandline -opc)) -eq 4\" -xa \"{size}\"\n")), "{fish}");
+    // Each script parses in its own shell (`-n`: read, not run); zsh / fish skipped by name when the binary is absent.
+    let dir = scratch("completions");
+    for (shell, text) in [("bash", &bash), ("zsh", &zsh), ("fish", &fish)] {
+        let p = dir.join(format!("nle.{shell}"));
+        std::fs::write(&p, text).unwrap();
+        match Command::new(shell).arg("-n").arg(&p).output() {
+            Ok(o) => assert!(o.status.success(), "{shell} -n: {}\n{text}", String::from_utf8_lossy(&o.stderr)),
+            Err(e) if shell != "bash" => eprintln!("cli_completions_values: {shell} -n skipped: {shell} absent ({e})"),
+            Err(e) => panic!("bash -n: {e}"),
+        }
+    }
 }

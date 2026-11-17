@@ -1051,20 +1051,7 @@ fn inherit_element(inherited: &mut Inherited, tag: &str, spec: &crate::layout::P
         .unwrap_or_else(|| crate::layout::default_line_through(tag, inherited.line_through));
     // html.css list styles: ul disc (circle one level down,
     // square deeper), ol decimal; inherited into the items.
-    match layout_core::paint::or_tag(Some(spec), layout_core::paint::INHERIT_LIST_STYLE, "", |_| tag) {
-        "ul" | "menu" | "dir" => {
-            let depth = dom_node
-                .ancestors()
-                .filter(|a| a.as_element().is_some_and(|e| matches!(e.name.local.as_ref(), "ul" | "ol" | "menu" | "dir")))
-                .count();
-            inherited.list_style = [1, 2, 3][depth.min(2)];
-        }
-        "ol" => inherited.list_style = 4,
-        _ => {}
-    }
-    if let Some(ls) = spec.list_style {
-        inherited.list_style = ls;
-    }
+    inherited.list_style = list_style_of(tag, inherited.list_style, spec, dom_node);
     // Blink: super raises by parent-size/3 + 1, sub lowers by
     // parent-size/5 + 1.
     match tag {
@@ -4613,4 +4600,28 @@ fn small_caps_shadows(
         draw_text_shadows(&t, &a, origin_x + pen, baseline_y, shadows, surface, width, height, damage_rects, clip);
         pen += a.str(&t);
     }
+}
+
+// ---- AETHERCSSOMINHERITEDRESTREPORT (LEDGER SR842): the list-style tag road, one fn for render and the report (named tail block) ----
+
+/// AETHERCSSOMINHERITEDRESTREPORT (SR842): the list-style-type code an element takes (html.css: `ul` disc, circle one level
+/// down, square deeper; `ol` decimal; SR831: an explicit inherit skips the tag road), then its own declared value; lifted
+/// verbatim from `inherit_element` so `css::computed_report` reads the value the painter draws.
+pub(crate) fn list_style_of(tag: &str, inherited: u8, spec: &crate::layout::PaintStyle, dom_node: &crate::dom::NodeRef) -> u8 {
+    let mut list_style = inherited;
+    match layout_core::paint::or_tag(Some(spec), layout_core::paint::INHERIT_LIST_STYLE, "", |_| tag) {
+        "ul" | "menu" | "dir" => {
+            let depth = dom_node
+                .ancestors()
+                .filter(|a| a.as_element().is_some_and(|e| matches!(e.name.local.as_ref(), "ul" | "ol" | "menu" | "dir")))
+                .count();
+            list_style = [1, 2, 3][depth.min(2)];
+        }
+        "ol" => list_style = 4,
+        _ => {}
+    }
+    if let Some(ls) = spec.list_style {
+        list_style = ls;
+    }
+    list_style
 }

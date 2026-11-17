@@ -483,7 +483,7 @@ fn project_lists(m: &crate::picture::PuMotion, s_poc: i32, c_poc: i32) -> [Optio
 fn conceal_fetch(r: &crate::picture::Plane, c: usize, cx: i32, cy: i32, cw: i32, ch: i32, cand: &[Option<[i32; 2]>; 2], sub: (i32, i32), bd: u32, wp: Option<[(i32, i32, u32); 2]>, inv: bool, out: &mut [i32]) {
     let n = (cw * ch) as usize;
     let max = (1i32 << bd) - 1;
-    let mut second = [0i32; 64];
+    let mut second = [0i32; CONCEAL_BLOCK_SAMPLES];
     let mut got = 0;
     for mv in cand.iter().flatten() {
         let buf: &mut [i32] = if got == 0 { &mut out[..n] } else { &mut second[..n] };
@@ -628,3 +628,12 @@ fn forward_blocks(pic: &Picture, c_poc: i32) -> u32 {
     }
     n
 }
+
+// ---- HEVCCONCEALBI444 (LEDGER SR845): the concealment block's sample bound (named tail block) ----
+/// HEVCCONCEALBI444 (SR845): the most samples [`conceal_fetch`] fetches per plane per candidate, the size of its second
+/// candidate's stack buffer. [`Dpb::conceal_motion`] walks the picture in 8x8 blocks (`step_by(8)`, `min(8)`) on every
+/// chroma_format_idc, so a block is 8x8 = 64 luma samples and (8 / SubWidthC) x (8 / SubHeightC) chroma samples: 16 at
+/// 4:2:0, 32 at 4:2:2, 64 at 4:4:4 (idc 0 has no chroma plane). The bound is the decoder's block step, never a
+/// bitstream value (a CU's size does not enter), so a 4:4:4 bi-predicted block fills the whole buffer and no stream can
+/// exceed it. The step and this bound move together (HEVC-CONCEAL-BLOCK-STEP-CONST owed: one shared const).
+const CONCEAL_BLOCK_SAMPLES: usize = 64;
