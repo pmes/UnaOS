@@ -10218,3 +10218,82 @@ fn striapanmore_alt_keys_pan_and_read() {
     assert_eq!(face.state.undo_depth(), d0 + 1);
     println!("striapanmore: Alt keys -> R 25 / centre / L 13; set of two audio + one video -> 16, 16, 0");
 }
+
+// ---- STRIALOUDNESSMORE (LEDGER SR961): the measure decodes no video; its progress on the export band (named tail block) ----
+
+/// A sink that declines every frame and keeps the PCM (the loudness sink's shape, observable).
+#[derive(Default)]
+struct StriaLoudnessMoreSink {
+    asked: Vec<i64>,
+    frames: usize,
+    pcm: Vec<f32>,
+}
+
+impl stria::nle::RenderSink for StriaLoudnessMoreSink {
+    fn frame(&mut self, _out_t: i64, _width: u32, _height: u32, _rgba: &[u8]) {
+        self.frames += 1;
+    }
+    fn pcm(&mut self, _out_t: i64, _rate: u32, _channels: u16, interleaved: &[f32]) {
+        self.pcm.extend_from_slice(interleaved);
+    }
+    fn frame_wanted(&mut self, out_t: i64) -> bool {
+        self.asked.push(out_t);
+        false
+    }
+}
+
+/// Rule: a sink answering `frame_wanted` false is asked once per video step (in output order) and never handed a frame;
+/// the report counts no frames; the PCM is the very PCM a frame-taking render sends.
+#[test]
+fn strialoudnessmore_unwanted_frames_decode_nothing() {
+    let (tl, src) = synth_fixture();
+    let range = 0..tl.end();
+    let video: Vec<i64> = schedule(&tl, range.clone(), &src).unwrap().iter().filter(|s| s.kind == Kind::Video).map(|s| s.out_t).collect();
+    let mut sink = StriaLoudnessMoreSink::default();
+    let r = render(&tl, range.clone(), &src, &mut sink).unwrap();
+    assert_eq!((sink.frames, r.frames), (0, 0));
+    assert_eq!(sink.asked, video);
+    let mut full = StriaLoudnessPcm::default();
+    render(&tl, range, &src, &mut full).unwrap();
+    assert!(!full.pcm.is_empty(), "the fixture has audio");
+    assert_eq!(sink.pcm, full.pcm);
+    println!("strialoudnessmore: {} video steps asked, 0 decoded, {} PCM samples alike", video.len(), full.pcm.len());
+}
+
+/// Rule: the measure (which now declines every frame) still reads BS.1770 over exactly the PCM a full render mixes, and
+/// its watched count still moves inside the range.
+#[test]
+fn strialoudnessmore_measure_unchanged_without_video() {
+    let (tl, src) = synth_fixture();
+    let range = 0..tl.end();
+    let mut full = StriaLoudnessPcm::default();
+    render(&tl, range.clone(), &src, &mut full).unwrap();
+    let (rate, ch) = full.fmt.expect("the fixture has audio");
+    let want = gneiss_pal::dsp::audio::meter::integrated_lufs(&full.pcm, ch as usize, rate);
+    assert_eq!(stria::nle::loudness(&tl, range.clone(), &src).unwrap(), Some(want));
+    let total = (range.end - range.start) as u64;
+    let w = stria::nle::LoudnessWatch::new(&range);
+    assert_eq!(stria::nle::loudness_watched(&tl, range, &src, Some(w.clone())).unwrap(), Some(want));
+    let done = w.done.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(done > 0 && done <= total, "done {done} of {total}");
+    println!("strialoudnessmore: {want:.2} LUFS with no video decoded, done {done}/{total}");
+}
+
+/// Rule: the export band's fraction falls back to the running measure's: none before the word, a fraction in [0, 1]
+/// while it runs, none once reported; the idle paint is byte-identical before and after.
+#[test]
+fn strialoudnessmore_band_follows_the_measure() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert_eq!(face.loudness_frac(), None);
+    let idle = face.paint();
+    assert!(face.verb("loudness"));
+    let f = face.loudness_frac().expect("a running measure has a fraction");
+    assert!((0.0..=1.0).contains(&f), "{f}");
+    assert!(face.wait_loudness());
+    assert_eq!(face.loudness_frac(), None);
+    face.last_error = None;
+    assert_eq!(stria::nle_face::fnv1a(&face.paint()), stria::nle_face::fnv1a(&idle), "no band once the measure is reported");
+    println!("strialoudnessmore: band fraction {f:.3} while running, none after");
+}
+

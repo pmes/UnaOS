@@ -2238,7 +2238,7 @@ impl Face {
     }
     /// What the band shows: the done fraction while an export runs, `None` otherwise.
     fn export_frac(&self) -> Option<f64> {
-        self.export_progress().map(|(d, t)| if t == 0 { 0.0 } else { (d as f64 / t as f64).min(1.0) })
+        self.export_progress().map(|(d, t)| if t == 0 { 0.0 } else { (d as f64 / t as f64).min(1.0) }).or_else(|| self.loudness_frac()) // STRIALOUDNESSMORE (SR961): else the running loudness measure's fraction (file tail)
     }
     /// NLE5DEXPORTMESSAGEETA (SR796): the running export's remaining time from its rate so far ([`eta_of`] over the
     /// [`Face::export_progress`] pair and the job's `started`, SR756); `None` with no export, before the first frame, or under 1 ms.
@@ -7510,5 +7510,18 @@ pub fn reel_words(name: String, summary: Option<String>, note: String) -> Option
         Some(s) => Some(format!("{name}: {s}{note}")),
         None if !note.is_empty() => Some(format!("{name}: {}", note.trim_start())),
         None => None,
+    }
+}
+
+// ---- STRIALOUDNESSMORE (LEDGER SR961): the running measure on the export band (named tail block) ----
+
+impl Face {
+    /// STRIALOUDNESSMORE (SR961): the running loudness measure's done fraction (SR903's ticks done over the range's
+    /// ticks, clamped to 1; 0.0 for an empty range), `None` when no measure runs. `export_frac` falls back to it, so the
+    /// export's band (SR694's `paint_export`) shows the measure; a running export's reading comes first.
+    pub fn loudness_frac(&self) -> Option<f64> {
+        let j = self.loudness.as_ref()?;
+        let done = j.watch.done.load(Relaxed);
+        Some(if j.total == 0 { 0.0 } else { (done.min(j.total) as f64 / j.total as f64).min(1.0) })
     }
 }
