@@ -2374,3 +2374,50 @@ fn outline_transparent_border_hsla() {
     assert_eq!(s.paint.border, Some([Some((2.0, (255, 0, 0))); 4]), "armed: four 2px red-RGB sides");
     assert_eq!(s.paint.border_alpha, Some([Some(0.0); 4]), "armed: alpha 0 on every side");
 }
+
+// ---- AETHERCSSCOLORALPHAZEROONEROAD (LEDGER SR1126): `color` keeps its alpha (named tail block) ----
+
+/// AETHERCSSCOLORALPHAZEROONEROAD (SR1126): `color: rgba(255, 0, 0, 0.5)` keeps its RGB and its alpha (before SR1126
+/// the alpha was dropped: opaque text).
+#[test]
+fn color_alpha_rgba_half() {
+    let s = styled(&[("color", "rgba(255, 0, 0, 0.5)")]);
+    assert_eq!(s.paint.color, Some((255, 0, 0)));
+    assert_eq!(s.paint.color_alpha, Some(0.5), "armed: the half alpha is kept");
+}
+
+/// AETHERCSSCOLORALPHAZEROONEROAD (SR1126): `color: transparent` is rgba(0, 0, 0, 0) (before SR1126 the arm skipped it
+/// as a neutral keyword: the inherited ink stayed), and `rgba(0, 0, 0, 0)` is the same colour (it was a `color-value:` refusal).
+#[test]
+fn color_alpha_transparent() {
+    let s = styled(&[("color", "red"), ("color", "transparent")]);
+    assert_eq!((s.paint.color, s.paint.color_alpha), (Some((0, 0, 0)), Some(0.0)), "armed: transparent is black at alpha 0");
+    let z = styled(&[("color", "rgba(0, 0, 0, 0)")]);
+    assert_eq!((z.paint.color, z.paint.color_alpha), (Some((0, 0, 0)), Some(0.0)), "armed: an alpha-0 function colour");
+}
+
+/// AETHERCSSCOLORALPHAZEROONEROAD (SR1126): an opaque colour writes no alpha (None = opaque), and `#rrggbbaa` reads its
+/// fourth byte (128 / 255).
+#[test]
+fn color_alpha_opaque_and_hex8() {
+    let s = styled(&[("color", "red")]);
+    assert_eq!((s.paint.color, s.paint.color_alpha), (Some((255, 0, 0)), None), "an opaque colour has no alpha");
+    let h = styled(&[("color", "#ff000080")]);
+    assert_eq!(h.paint.color, Some((255, 0, 0)));
+    let a = h.paint.color_alpha.expect("armed: #ff000080 has an alpha");
+    assert!((a - 128.0 / 255.0).abs() <= 1.0 / 255.0, "#ff000080 alpha {a}");
+}
+
+/// AETHERCSSCOLORALPHAZEROONEROAD (SR1126): the alpha moves with the colour across rules (`merge_paint`): a later opaque
+/// `color` drops an earlier rule's alpha, a later rule with no colour keeps it, and `inherit` clears the pair.
+#[test]
+fn color_alpha_cascade_moves_with_color() {
+    let half: &[(&str, &str)] = &[("color", "rgba(0, 0, 0, 0.5)")];
+    let c = cascade(&[half, &[("color", "red")]]);
+    assert_eq!((c.paint.color, c.paint.color_alpha), (Some((255, 0, 0)), None), "a later red is opaque");
+    let k = cascade(&[half, &[("font-size", "20px")]]);
+    assert_eq!(k.paint.color_alpha, Some(0.5), "a later rule with no colour keeps the alpha");
+    let i = cascade(&[half, &[("color", "inherit")]]);
+    assert_eq!((i.paint.color, i.paint.color_alpha), (None, None), "inherit clears the colour and its alpha");
+    assert!(i.paint.inherits(INHERIT_COLOR), "inherit writes the bit");
+}

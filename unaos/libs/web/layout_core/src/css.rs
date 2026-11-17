@@ -1328,9 +1328,9 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             }
         }
         "color" => { sys_slot(&mut style.paint.sys_color, value);
-            if !is_neutral_keyword(value) {
-                match parse_color_str::<H>(value) {
-                    Some(c) => style.paint.color = Some(c),
+            if value.trim().eq_ignore_ascii_case("transparent") { (style.paint.color, style.paint.color_alpha) = (Some((0, 0, 0)), Some(0.0)); } else if !is_neutral_keyword(value) { // AETHERCSSCOLORALPHAZEROONEROAD (SR1126): css-color-4 §4.4 transparent = rgba(0, 0, 0, 0)
+                match border_rgb::<H>(value) {
+                    Some(c) => (style.paint.color, style.paint.color_alpha) = (Some(c), Some(color_alpha::<H>(value)).filter(|a| *a < 1.0)), // SR1126: the alpha rides with the RGB
                     None => H::record_css(&format!("color-value:{}", clip(value))),
                 }
             }
@@ -2515,7 +2515,7 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
     macro_rules! clone {
         ($($f:ident),* $(,)?) => { $( if src.$f.is_some() { dst.$f = src.$f.clone(); } )* };
     }
-    merge_border_pending(dst, src); merge_border_alpha(dst, src); copy!(
+    merge_border_pending(dst, src); merge_border_alpha(dst, src); if src.color.is_some() { dst.color_alpha = src.color_alpha; } copy!(
         background, color, font_size, weight, border, line_height, hidden, clip, underline,
         nowrap, family, italic, text_transform, border_width, bg_repeat, text_hidden,
         mask_repeat, text_align, text_align_last, object_fit, flex_container, border_style, radius,
