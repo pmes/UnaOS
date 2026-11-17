@@ -469,10 +469,7 @@ fn audio_comment(l: &str, fps: u32, line: usize, clip: Option<&mut Clip>) -> Res
 
 /// NLE3: a transition's CMX transition field: `D    ddd` or `Wnnn ddd`.
 fn code_field(x: &Transition) -> String {
-    match x.kind {
-        TransitionKind::Dissolve => format!("D    {:03}", x.dur),
-        TransitionKind::Wipe(d) => format!("W{:03} {:03}", d.code(), x.dur),
-    }
+    format!("{:<4} {:03}", kind_code(x.kind), x.dur) // STRIAHISTORYNAMES (SR9106): the code text is the one `kind_code` (file tail)
 }
 
 /// NLE3cBLACK (LEDGER SR323): a transition TO black as its two-line event: the outgoing's zero-length `C` line at its
@@ -2069,5 +2066,16 @@ pub fn tc_delta(s: &str, tl: &Timeline) -> Result<i64, String> {
         Some(b'+') => tc_entry(&s[1..], tl),
         Some(b'-') => tc_entry(&s[1..], tl).map(|t| -t),
         _ => tc_entry(s, tl),
+    }
+}
+
+// ---- STRIAHISTORYNAMES (LEDGER SR9106): a transition kind's code text, ONE fn (named tail block) ----
+// The CMX transition field's code (`code_field`) and the editor's `kind <code>` undo word read the same text.
+
+/// A transition kind's code: `D` or `Wnnn` (the inverse of [`transition_kind`]'s `D` / `W` arms).
+pub(crate) fn kind_code(k: TransitionKind) -> String {
+    match k {
+        TransitionKind::Dissolve => String::from("D"),
+        TransitionKind::Wipe(d) => format!("W{:03}", d.code()),
     }
 }

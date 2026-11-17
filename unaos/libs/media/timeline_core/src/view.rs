@@ -2844,7 +2844,7 @@ impl Drag {
     /// THE commit of the gesture: one `trim`, `move_selected` / `move_set` or marquee selection (a scrub commits nothing),
     /// its undo entry named by the drag's kind ([`DragKind::word`]).
     pub fn finish(&self, st: &mut EditorState) -> Result<(), EditError> {
-        let armed = self.word().map_or(false, |w| st.arm_word(w)); // STRIAHISTORYRIPPLE (SR9072): the one word fn of a drag (file tail)
+        let armed = self.word().map_or(false, |w| st.arm_word(&w)); // STRIAHISTORYNAMES (SR9106): the word is owned (its delta); STRIAHISTORYRIPPLE (SR9072): the one word fn of a drag (file tail)
         let r = self.finish_unnamed(st);
         st.disarm_word(armed);
         r
@@ -6172,8 +6172,8 @@ mod striakwaveform_tests {
 
 impl Drag {
     /// The word this drag names its undo entry with; `None` for the kinds that commit nothing (marquee, scrub).
-    pub fn word(&self) -> Option<&'static str> {
-        self.kind.word()
+    pub fn word(&self) -> Option<alloc::string::String> {
+        self.kind.word().map(|w| alloc::format!("{w} {:+}", self.delta)) // STRIAHISTORYNAMES (SR9106): the kind's word and the delta it commits (`drag slip -5`)
     }
 }
 

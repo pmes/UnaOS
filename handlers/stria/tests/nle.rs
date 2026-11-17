@@ -3713,8 +3713,8 @@ fn striaexportframe_face_verb_writes_and_names_it() {
     let (tl, src) = synth_fixture();
     let mut bare = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
     assert!(bare.verb("frame"));
-    assert_eq!(bare.last_error.take().as_deref(), Some("frame: no file (no document path)"));
-    assert_eq!(bare.frame_saved(), None);
+    assert_eq!(bare.last_error.take().as_deref(), Some("frame: no file (no document path)transition +1"));
+    assert_eq!(bare.frame_saved(), None); // STRIAHISTORYNAMES (SR9106): the face's `]` names what it commits
     println!("striaexportframe: face frame -> {}; refused: {e}", png.display());
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -4838,7 +4838,8 @@ fn striaaudiocrossfade_face_refusal_on_the_message_line() {
     let (tl, src) = synth_fixture();
     let mut face = nlefaceexport_face(tl.clone(), src);
     assert!(face.verb("xfade"));
-    assert_eq!(face.last_error.take().as_deref(), Some("xfade: no clip selected (select the incoming audio clip)")); // STRIAXFADECURVE (SR904): the audio wording
+    let mv = format!("drag move {:+} (2 clips)", face.state.selected().unwrap().at - 10); // STRIAHISTORYNAMES (SR9106): the drag's word carries its delta
+    assert_eq!(face.last_error.take(), Some(format!("xfade: no clip selected (select the incoming audio clip)")); // STRIAXFADECURVE (SR904): the audio wording
     face.state.select(0, 1).unwrap();
     assert!(face.verb("xfade"));
     assert_eq!(face.last_error.take().as_deref(), Some("xfade: the selected clip is not on an audio track")); // STRIAXFADECURVE (SR904): the audio wording
@@ -4849,9 +4850,9 @@ fn striaaudiocrossfade_face_refusal_on_the_message_line() {
 // ---- STRIAXFADECURVE (LEDGER SR904): the face's crossfade curve words and the audio refusal text (named tail block) ----
 
 /// `xfade linear` on the selected audio clip puts a LINEAR record of the default length through ONE commit, `xfade equal`
-/// swaps the curve keeping the length, `xfade 6 linear` replaces it; refusals read the audio wording and move nothing.
+/// swaps the curve keeping the length, `xfade 6 linear` replaces it; refusals read the audio wording and{mv}"nothing.
 #[test]
-fn striaxfadecurve_face_curve_word_and_refusal_text() {
+fn striaxfadecurve_face_curve_word_and_refusal_text){
     use timeline_core::Curve;
     let (tl, src) = synth_fixture();
     let mut face = nlefaceexport_face(tl.clone(), src);
@@ -4859,7 +4860,7 @@ fn striaxfadecurve_face_curve_word_and_refusal_text() {
     assert!(face.verb("xfade linear"));
     assert_eq!(face.last_error, None);
     assert_eq!(face.state.timeline, tl.add_audio_xfade(1, 10, 10, Curve::Linear).unwrap());
-    assert!(face.verb("xfade equal"));
+    assert!(face.verb("xfade equal));
     assert_eq!(face.state.timeline, tl.add_audio_xfade(1, 10, 10, Curve::EqualPower).unwrap());
     assert!(face.verb("xfade 6 linear"));
     assert_eq!(face.state.timeline, tl.add_audio_xfade(1, 10, 6, Curve::Linear).unwrap());
@@ -4977,7 +4978,7 @@ fn striatimecodedisplay_readout_follows_the_playhead() {
     let (a, ta) = (face.paint(), face.tc_readout());
     face.state.seek(30);
     let (b, tb) = (face.paint(), face.tc_readout());
-    assert_eq!((ta.as_deref(), tb.as_deref()), (Some("00:00:00:00"), Some("00:00:01:05")));
+    assert_eq!((ta, tb.as_deref()), (Some(format!("00:00:00:00"), Some("00:00:01:05")));
     assert_ne!(striatimecodedisplay_halves(&a, m).0, striatimecodedisplay_halves(&b, m).0);
     println!("striatimecodedisplay: playhead 0 -> 30: {ta:?} -> {tb:?}");
 }
@@ -4989,15 +4990,15 @@ fn striatimecodedisplay_readout_follows_the_playhead() {
 /// with a paste back into the hole restoring the timeline.
 #[test]
 fn striacopypaste_face_copy_cut_paste() {
-    assert!(["copy", "cut", "paste"].iter().all(|w| VERBS.contains(w)) && VERBS.last() == Some(&"help"));
-    let (tl, src) = synth_fixture();
+    assert!(["copy", "cut", "paste"].iter().all(|w| VERBS.contains(w)) &&{mv}"VERBS.last() == Some(&"help"));
+    lettl,src) = synth_fixture();
     let mut face = nlefaceexport_face(tl.clone(), src);
     face.state.select(0, 1).unwrap();
     assert!(face.verb("copy"));
     assert!(!face.dirty(), "copy is no edit");
     face.state.seek(35);
     assert!(face.verb("paste"));
-    assert_eq!(face.state.timeline.tracks[0].clips[3], Clip::new(SourceId(1), 0, 10, 35));
+    assert_eq!(face.state.timeline.tracks[0].[3], Clip::new(SourceId(1), 0, 10, 35));
     assert_eq!((face.state.undo_depth(), face.dirty(), face.last_error.clone()), (1, true, None));
     assert!(face.verb("undo"));
     assert_eq!(face.state.timeline, tl);
@@ -8334,20 +8335,21 @@ fn striaundohistorydrag_drag_names_its_step() {
     assert!(face.last_error.is_none(), "{:?}", face.last_error);
     assert_eq!(face.state.undo_depth(), 1);
     assert!(face.verb("history"));
-    assert_eq!(face.last_error.take().as_deref(), Some("history: 1 drag move"));
+    let mv = format!("drag move {:+}", face.state.selected().unwrap().at - 10); // STRIAHISTORYNAMES (SR9106): the drag's word carries its delta
+    assert_eq!(face.last_error.take(), Some(format!("history: 1 {mv}")));
     let l = face.layout();
     let at = face.state.selected().map(|c| c.at).unwrap();
     let (x, y) = l.point(0, at + 2);
     nle3eslipdrag_drag(&mut face, x, y, 40.0, bandy::MOD_CONTROL);
     assert!(face.last_error.is_none(), "{:?}", face.last_error);
     assert!(face.verb("history"));
-    assert_eq!(face.last_error.take().as_deref(), Some("history: 2 drag slip | 1 drag move"));
+    assert_eq!(face.last_error.take(), Some(format!("history: 2 drag slip +5 | 1 {mv}")));
     assert!(face.verb("undo"));
     assert!(face.verb("history"));
-    assert_eq!(face.last_error.take().as_deref(), Some("history: 1 drag move"));
+    assert_eq!(face.last_error.take(), Some(format!("history: 1 {mv}")));
     assert!(face.verb("redo"));
     assert!(face.verb("history"));
-    assert_eq!(face.last_error.take().as_deref(), Some("history: 2 drag slip | 1 drag move"));
+    assert_eq!(face.last_error.take(), Some(format!("history: 2 drag slip +5 | 1 {mv}")));
 
     let (tl, src) = synth_fixture();
     let tl = tl.add_transition(0, 10, timeline_core::TransitionKind::Dissolve, 4).unwrap();
@@ -8368,7 +8370,7 @@ fn striaundohistorydrag_drag_names_its_step() {
     assert_eq!(face.state.timeline.tracks[0].transitions[0].dur, 5);
     assert!(face.verb("history"));
     let line = face.last_error.take();
-    assert_eq!(line.as_deref(), Some("history: 1 drag transition out"));
+    assert_eq!(line.as_deref(), Some("history: 1 drag transition out +1"));
     println!("striaundohistorydrag: {line:?}");
 }
 
@@ -15663,4 +15665,32 @@ fn striaxformhover_face_hover_repaints() {
     assert_eq!(&face.paint_role(Role::Whole)[o..o + 4], &timeline_core::view::HANDLE, "back to the plain handle");
     assert!(!face.on(&SMessage::BrowserMouseMove(cx + 1.0, cy, 0)), "a body move: nothing to repaint");
     assert_eq!((&face.state.timeline, face.state.undo_depth()), (&tl, depth), "hover edits nothing");
+}
+
+// ---- STRIAHISTORYNAMES (LEDGER SR9106): the face's undo words name what they commit, with the amount (named tail block) ----
+
+/// A Ctrl 40 px drag on B's body (8 px a tick, no snap) is `drag slip +5`; the face's `]` on a selected transition is
+/// `transition +1`; the bare `kind` cycle names its result `kind W001` (the first built wipe after the dissolve).
+#[test]
+fn striahistorynames_face_words() {
+    let (mut face, _twin, _tl) = nle3eslipface_pair();
+    let l = face.layout();
+    let (x, y) = l.point(0, 12);
+    nle3eslipdrag_drag(&mut face, x, y, 40.0, bandy::MOD_CONTROL);
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.verb("history"));
+    assert_eq!(face.last_error.take().as_deref(), Some("history: 1 drag slip +5"));
+
+    let (tl, src) = synth_fixture();
+    let tl = tl.add_transition(0, 10, timeline_core::TransitionKind::Dissolve, 4).unwrap();
+    let mut face = nlefaceexport_face(tl, src);
+    face.state.select_transition(0, 0).unwrap();
+    assert!(face.verb("]"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.verb("kind"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.verb("history"));
+    let line = face.last_error.take();
+    assert_eq!(line.as_deref(), Some("history: 2 kind W001 | 1 transition +1"));
+    println!("striahistorynames: {line:?}");
 }
