@@ -1187,7 +1187,7 @@ pub fn default_font_size(tag: &str, inherited: f32) -> f32 {
 fn propagate_text_align<H: Host>(tree: &mut LayoutTree<H>) {
     fn walk<H: Host>(tree: &mut LayoutTree<H>, id: taffy::NodeId, inherited: Option<u8>) {
         let effective = tree.paint_map.get(&id).and_then(|p| p.text_align).or(inherited); rtl_start_blocks(tree, id, effective);
-        if let Some(align) = effective.filter(|&a| a != 0 && a != 4 && a != 7) {
+        if let Some(align) = effective.filter(|&a| a != 0 && a != 4 && a != 7 && a != 8) {
             if let Ok(st) = tree.taffy.style(id) {
                 let mut st = st.clone();
                 let row = matches!(st.flex_direction, FlexDirection::Row | FlexDirection::RowReverse);
@@ -3508,7 +3508,7 @@ mod img_alt_wrap_kat {
 /// `justify_content` / `align_items` are never touched. AETHERTEXTALIGNCODES (SR724): code 4 (`text-align: left`) is
 /// admitted (inline content only, so the blocks sit at the inline start); 7 (`align=left`, `-webkit-left`) is not.
 fn rtl_start_blocks<H: Host>(tree: &mut LayoutTree<H>, id: taffy::NodeId, effective: Option<u8>) {
-    if !matches!(effective, None | Some(0) | Some(4)) {
+    if !matches!(effective, None | Some(0) | Some(4) | Some(8)) {
         return;
     }
     let Ok(st) = tree.taffy.style(id).cloned() else { return };
