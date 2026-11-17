@@ -3655,7 +3655,7 @@ fn nle5dexportmessageetastallwitness_paused_face_export_stall() {
 fn striaexportframe_frame_path_kats() {
     use stria::nle_face::frame_path;
     use std::path::{Path, PathBuf};
-    assert_eq!(frame_path(Some(Path::new("/x/reel.edl")), "00:00:01:12"), PathBuf::from("/x/reel-00-00-01-12.png"));
+    assert!(frame_path(Some(Path::new("/x/reel.edl"contains&)"00:00:01:12"), PathBuf::from("/x/reel-00-00-01-12.png"))); // STRIAXFADECURVEBUTTON (SR925): siblings add words before help, so no position index
     assert_eq!(frame_path(None, "00:00:01:12"), PathBuf::from("untitled-00-00-01-12.png"));
     assert!(frame_path(None, "00:00:01:12").is_relative());
     assert_eq!(frame_path(Some(Path::new("/x/reel.edl")), &edl::timecode(37, 25)), PathBuf::from("/x/reel-00-00-01-12.png"), "edl's own timecode");
@@ -3971,7 +3971,7 @@ fn striasnapdrag_face_drag_snaps_to_the_in_mark_and_alt_does_not() {
     face.state.seek(22);
     assert!(face.verb("in"));
     face.state.seek(0);
-    assert_eq!(face.marks(), (Some(22), None));
+    assert_eq!(face.marks(), (Some(22).take().as_deref(), Some("xfade: 10 linear")));
     let tl0 = face.state.timeline.clone();
     let l = face.layout();
     let y = l.point(0, 28).1;
@@ -3987,7 +3987,7 @@ fn striasnapdrag_face_drag_snaps_to_the_in_mark_and_alt_does_not() {
     let px = face.paint();
     assert_eq!(at(&px, l.x_of(22)), timeline_core::view::GUIDE, "the guide through the row");
     face.on(&nle3eslipdrag_btn(false, to, y, 0));
-    assert!(face.dragging().is_none());
+    assert!(face.dragging().is_none()); // STRIAXFADECURVEBUTTON (SR925): the message row reads the crossfade
     assert_eq!(face.state.timeline, tl0.move_clip(0, 2, 0, 22).unwrap(), "flush on the mark");
     assert_ne!(at(&face.paint(), l.x_of(22)), timeline_core::view::GUIDE, "the guide is gone after the release");
     assert!(face.verb("undo"));
@@ -4824,12 +4824,12 @@ fn striaaudiocrossfade_face_word_is_one_undo_step() {
     let mut face = nlefaceexport_face(tl.clone(), src);
     face.state.select(1, 1).unwrap();
     assert!(face.verb("xfade"));
-    assert_eq!(face.last_error, None);
+    assert_eq!(face.last_error.take().as_deref(), Some("xfade: 10 equal")); // STRIAXFADECURVEBUTTON (SR925): the message row reads the crossfade
     assert_eq!(face.state.timeline, tl.add_audio_xfade(1, 10, 10, Curve::EqualPower).unwrap());
     assert_eq!(face.state.undo_depth(), 1);
     assert!(face.verb("undo"));
     assert_eq!(face.state.timeline, tl);
-    println!("striaaudiocrossfade: VERBS[{}] = xfade; (1,1) -> 10 ticks EqualPower at 10; undo", VERBS.len() - 2);
+    println!("striaaudiocrossfade: VERBS has xfade, help last of {}; (1,1) -> 10 ticks EqualPower at 10; undo", VERBS.len());
 }
 
 /// A refused `xfade` reads the editor's name on the message line (`{v}: {e}`) and moves nothing.
@@ -8874,4 +8874,43 @@ fn striainsertmarkskeys_w_d_at_the_playhead() {
         assert_eq!(face.message_text(), Some(format!("{word}: B 00:00:00:10 at 00:00:00:15")));
     }
     println!("striainsertmarkskeys: w / d at 15 -> insert / overwrite: B 00:00:00:10 at 00:00:00:15");
+}
+
+// ---- STRIAXFADECURVEBUTTON (LEDGER SR925): the crossfade curve word, its keys, button phrase and the message row (named tail block) ----
+
+/// `xfade-curve` is a transport word just before `help`; `c` puts the crossfade (row `xfade: 10 equal`), `C` swaps its curve
+/// (row `xfade: 10 linear`), each one undo step; the help names both keys; a refusal reads its words and moves nothing.
+#[test]
+fn striaxfadecurvebutton_face_keys_button_and_message() {
+    use timeline_core::Curve;
+    assert!(VERBS.contains(&"xfade-curve"));
+    assert_eq!(VERBS.last(), Some(&"help"));
+    assert!(KEYS.contains(&("c", "xfade")) && KEYS.contains(&("C", "xfade-curve")));
+    let rows = help_rows();
+    for (k, w) in [("c", "xfade"), ("C", "xfade-curve")] {
+        let row = rows.iter().find(|r| r.0.split(" / ").any(|x| x == k)).expect("a help row");
+        assert_eq!(row.1, help_phrase(w));
+        assert!(!row.1.is_empty() && row.1 != w, "{w}: a phrase, not the word");
+    }
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    face.state.select(1, 1).unwrap();
+    assert!(nle5drangekeys_press(&mut face, "c"));
+    assert_eq!(face.last_error.take().as_deref(), Some("xfade: 10 equal"));
+    assert!(nle5drangekeys_press(&mut face, "C"));
+    assert_eq!(face.last_error.take().as_deref(), Some("xfade: 10 linear"));
+    assert_eq!(face.state.timeline, tl.add_audio_xfade(1, 10, 10, Curve::Linear).unwrap());
+    assert!(face.verb("xfade-curve"));
+    assert_eq!(face.last_error.take().as_deref(), Some("xfade: 10 equal"));
+    assert_eq!(face.state.undo_depth(), 3);
+    assert!(face.verb("xfade"));
+    assert_eq!(face.last_error.take().as_deref(), Some("xfade: off"));
+    let (before, depth) = (face.state.timeline.clone(), face.state.undo_depth());
+    assert!(face.verb("xfade-curve"));
+    assert_eq!(face.last_error.take().as_deref(), Some("xfade-curve: no crossfade on the selected clip's head cut (xfade puts one)"));
+    face.state.select(0, 1).unwrap();
+    assert!(face.verb("xfade-curve"));
+    assert_eq!(face.last_error.take().as_deref(), Some("xfade-curve: the selected clip is not on an audio track"));
+    assert_eq!((&face.state.timeline, face.state.undo_depth()), (&before, depth));
+    println!("striaxfadecurvebutton: c -> 10 equal, C -> 10 linear, xfade-curve -> 10 equal, xfade -> off; refusals in words");
 }
