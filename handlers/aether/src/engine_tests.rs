@@ -5109,14 +5109,14 @@ mod tests {
     #[test]
     fn font_synthesis_smallcaps_parse() {
         use layout_core::css::parse_font_synthesis as p;
-        assert_eq!(p("font-synthesis", "small-caps"), Some((Some(false), Some(false), Some(true))));
-        assert_eq!(p("font-synthesis", "weight style"), Some((Some(true), Some(true), Some(false))));
-        assert_eq!(p("font-synthesis", "initial"), Some((Some(true), Some(true), Some(true))));
-        assert_eq!(p("font-synthesis", "none"), Some((Some(false), Some(false), Some(false))));
-        assert_eq!(p("font-synthesis-small-caps", "none"), Some((None, None, Some(false))));
-        assert_eq!(p("font-synthesis-small-caps", "auto"), Some((None, None, Some(true))));
+        assert_eq!(p("font-synthesis", "small-caps"), Some((Some(false), Some(false), Some(true), Some(false))));
+        assert_eq!(p("font-synthesis", "weight style"), Some((Some(true), Some(true), Some(false), Some(false))));
+        assert_eq!(p("font-synthesis", "initial"), Some((Some(true), Some(true), Some(true), Some(false))));
+        assert_eq!(p("font-synthesis", "none"), Some((Some(false), Some(false), Some(false), Some(false))));
+        assert_eq!(p("font-synthesis-small-caps", "none"), Some((None, None, Some(false), None)));
+        assert_eq!(p("font-synthesis-small-caps", "auto"), Some((None, None, Some(true), None)));
         assert_eq!(p("font-synthesis-small-caps", "bogus"), None);
-        assert_eq!(p("font-synthesis-weight", "none"), Some((Some(false), None, None)));
+        assert_eq!(p("font-synthesis-weight", "none"), Some((Some(false), None, None, None)));
     }
 
     /// AETHERFONTSYNTHESISSMALLCAPS (SR772): `el.style.fontSynthesis` expands into three longhands and serializes in
@@ -8325,5 +8325,35 @@ mod tests {
         assert!(!wavy.is_empty(), "#lw paints red");
         assert!((wavy[0] as i64 - tw) < (solid[0] as i64 - ts), "#lw reaches above: {wavy:?} vs {solid:?}");
         assert!((*wavy.last().unwrap() as i64 - tw) > (*solid.last().unwrap() as i64 - ts), "#lw reaches below");
+    }
+
+    // ---- AETHERFONTSYNTHESISPOSITION (LEDGER SR1080): getComputedStyle reads the fourth font-synthesis half (named tail block) ----
+
+    /// AETHERFONTSYNTHESISPOSITION (SR1080): a box declaring only `font-synthesis-position: auto` computes
+    /// `weight style small-caps position`; a plain box keeps the initial `weight style small-caps` and its longhand reads
+    /// the spec initial `none`; `el.style.fontSynthesisPosition` is its own property.
+    #[test]
+    fn font_synthesis_position_computed() {
+        let html = r#"<!doctype html><html><body>
+              <div id="a"></div>
+              <div id="p" style="font-synthesis-position:auto"></div>
+              <div id="wp" style="font-synthesis:weight position"></div>
+            </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        let cs = |e: &mut crate::AetherEngine, id: &str, p: &str| {
+            font_synth_eval(e, &format!("getComputedStyle(document.getElementById('{id}')).getPropertyValue('{p}')"))
+        };
+        assert_eq!(cs(&mut e, "a", "font-synthesis"), "weight style small-caps");
+        assert_eq!(cs(&mut e, "a", "font-synthesis-position"), "none");
+        assert_eq!(cs(&mut e, "p", "font-synthesis"), "weight style small-caps position");
+        assert_eq!(cs(&mut e, "p", "font-synthesis-position"), "auto");
+        assert_eq!(cs(&mut e, "wp", "font-synthesis"), "weight position");
+        assert_eq!(
+            font_synth_eval(&mut e, "var s = document.getElementById('a').style; s.fontSynthesisPosition = 'auto'; [s.fontSynthesisPosition, s.getPropertyValue('font-synthesis-position')].join('|')"),
+            "auto|auto"
+        );
     }
 }

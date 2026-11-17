@@ -781,3 +781,47 @@ fn text_decoration_style_thickness_merge() {
     merge_paint(&mut dst.paint, &styled(&[("text-decoration-style", "double")]).paint);
     assert_eq!(dst.paint.decoration_style, Some(1), "a later longhand wins");
 }
+// ---- AETHERFONTSYNTHESISPOSITION (LEDGER SR1080): css-fonts-4 §6.4 font-synthesis-position, the fourth half (named tail block) ----
+
+fn synth4(s: &SpecifiedStyle<TH>) -> (Option<bool>, Option<bool>, Option<bool>, Option<bool>) {
+    (s.paint.synth_weight, s.paint.synth_style, s.paint.synth_small_caps, s.paint.synth_position)
+}
+
+/// AETHERFONTSYNTHESISPOSITION (SR1080): the longhand `auto | none` (Some(true) = auto); `initial` is the spec initial
+/// `none`; an invalid value changes nothing.
+#[test]
+fn font_synthesis_position_longhand() {
+    assert_eq!(styled(&[("font-synthesis-position", "none")]).paint.synth_position, Some(false));
+    assert_eq!(styled(&[("font-synthesis-position", "auto")]).paint.synth_position, Some(true));
+    assert_eq!(styled(&[("font-synthesis-position", "initial")]).paint.synth_position, Some(false), "initial is none");
+    assert_eq!(styled(&[("font-synthesis-position", "sub")]).paint.synth_position, None);
+}
+
+/// AETHERFONTSYNTHESISPOSITION (SR1080): the shorthand's `position` word (before: the whole declaration was dropped,
+/// every half stayed None); a word it omits is none; `none` all four; `initial` position none; an invalid list nothing.
+#[test]
+fn font_synthesis_position_shorthand() {
+    assert_eq!(synth4(&styled(&[])), (None, None, None, None), "armed before: a fresh style carries none of the four");
+    assert_eq!(synth4(&styled(&[("font-synthesis", "weight style position")])), (Some(true), Some(true), Some(false), Some(true)));
+    assert_eq!(synth4(&styled(&[("font-synthesis", "none")])), (Some(false), Some(false), Some(false), Some(false)));
+    assert_eq!(styled(&[("font-synthesis", "weight")]).paint.synth_position, Some(false));
+    assert_eq!(synth4(&styled(&[("font-synthesis", "initial")])), (Some(true), Some(true), Some(true), Some(false)));
+    assert_eq!(synth4(&styled(&[("font-synthesis", "weight sideways")])), (None, None, None, None));
+    assert_eq!(synth4(&styled(&[("font-synthesis", "position position")])), (None, None, None, None), "a repeated word is invalid");
+}
+
+/// AETHERFONTSYNTHESISPOSITION (SR1080): merge_paint carries it later-wins; a rule without it keeps it.
+#[test]
+fn font_synthesis_position_merge() {
+    let mut dst = styled(&[("font-synthesis-position", "auto")]);
+    merge_paint(&mut dst.paint, &styled(&[("color", "blue")]).paint);
+    assert_eq!(dst.paint.synth_position, Some(true), "a rule without it keeps it");
+    merge_paint(&mut dst.paint, &styled(&[("font-synthesis", "weight")]).paint);
+    assert_eq!(dst.paint.synth_position, Some(false), "a later shorthand resets it");
+}
+
+/// AETHERFONTSYNTHESISPOSITION (SR1080): `all: initial` reaches the longhand through ALL_LONGHANDS: none.
+#[test]
+fn font_synthesis_position_all_initial() {
+    assert_eq!(styled(&[("font-synthesis-position", "auto"), ("all", "initial")]).paint.synth_position, Some(false));
+}

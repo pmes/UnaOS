@@ -165,8 +165,8 @@ pub struct PaintStyle<H: Host> {
     pub font_rel: Option<Vec<(String, String)>>,
     /// font-stretch in percent (css-fonts-4 §2.3).
     pub stretch: Option<u16>,
-    /// AETHERFONTSYNTHESISPROPERTY (SR750): css-fonts-4 §6 font-synthesis-weight / -style / -small-caps (SR772), Some(true) = auto.
-    pub synth_weight: Option<bool>, pub synth_style: Option<bool>, pub synth_small_caps: Option<bool>, pub small_caps: Option<Caps>, pub inherit: u32, pub revert: u32, // fold seam SR806/SR815
+    /// AETHERFONTSYNTHESISPROPERTY (SR750): css-fonts-4 §6 font-synthesis-weight / -style / -small-caps (SR772) / -position (SR1080: nothing paints it), Some(true) = auto.
+    pub synth_weight: Option<bool>, pub synth_style: Option<bool>, pub synth_small_caps: Option<bool>, pub synth_position: Option<bool>, pub small_caps: Option<Caps>, pub inherit: u32, pub revert: u32, // fold seam SR806/SR815
     /// word-spacing in px (css-text-3 §7.1).
     pub word_spacing: Option<f32>,
     /// direction: rtl (true) / ltr (false) (css-writing-modes-4 §2.1; `dir` maps onto it).
@@ -330,7 +330,7 @@ impl<H: Host> Default for PaintStyle<H> {
             font_size_rel: None,
             used_font_size: None,
             font_rel: None,
-            stretch: None, synth_weight: None, synth_style: None, synth_small_caps: None, small_caps: None, inherit: 0, revert: 0,
+            stretch: None, synth_weight: None, synth_style: None, synth_small_caps: None, synth_position: None, small_caps: None, inherit: 0, revert: 0,
             word_spacing: None,
             rtl: None, unicode_bidi: None,
             text_shadows: None,

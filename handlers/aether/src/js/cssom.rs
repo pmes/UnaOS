@@ -45,7 +45,7 @@ pub const PROPERTIES: &[&str] = &[
     "content", "counter-increment", "counter-reset", "cursor", "direction", "display", "empty-cells", "fill",
     "filter", "flex", "flex-basis", "flex-direction", "flex-flow", "flex-grow", "flex-shrink", "flex-wrap",
     "float", "font", "font-family", "font-feature-settings", "font-kerning", "font-size", "font-stretch",
-    "font-style", "font-synthesis", "font-synthesis-small-caps", "font-synthesis-style", "font-synthesis-weight", "font-variant", "font-variant-caps", "font-weight", "gap", "grid", "grid-area", "grid-auto-columns",
+    "font-style", "font-synthesis", "font-synthesis-position", "font-synthesis-small-caps", "font-synthesis-style", "font-synthesis-weight", "font-variant", "font-variant-caps", "font-weight", "gap", "grid", "grid-area", "grid-auto-columns",
     "grid-auto-flow", "grid-auto-rows", "grid-column", "grid-column-end", "grid-column-start", "grid-row",
     "grid-row-end", "grid-row-start", "grid-template", "grid-template-areas", "grid-template-columns",
     "grid-template-rows", "height", "hyphens", "image-rendering", "inline-size", "inset", "isolation",
@@ -538,10 +538,10 @@ fn expand(prop: &str, v: &[CV]) -> Result<Vec<(String, String)>, ()> {
                 .collect()),
             None => Ok(vec![(prop.to_string(), serialize_generic(prop, v))]),
         },
-        "font-synthesis" | "font-synthesis-weight" | "font-synthesis-style" | "font-synthesis-small-caps" => {
-            let (w, s, c) = layout_core::css::parse_font_synthesis(prop, &css_core::serialize::to_css(tv)).ok_or(())?;
+        "font-synthesis" | "font-synthesis-weight" | "font-synthesis-style" | "font-synthesis-small-caps" | "font-synthesis-position" => {
+            let (w, s, c, p) = layout_core::css::parse_font_synthesis(prop, &css_core::serialize::to_css(tv)).ok_or(())?;
             let kw = |b: bool| (if b { "auto" } else { "none" }).to_string();
-            Ok([("font-synthesis-weight", w), ("font-synthesis-style", s), ("font-synthesis-small-caps", c)].into_iter().filter_map(|(p, b)| Some((p.to_string(), kw(b?)))).collect())
+            Ok([("font-synthesis-weight", w), ("font-synthesis-style", s), ("font-synthesis-small-caps", c), ("font-synthesis-position", p)].into_iter().filter_map(|(p, b)| Some((p.to_string(), kw(b?)))).collect())
         }
         "border-image" => expand_border_image(v).map(Vec::from),
         "word-wrap" => normalize_value("overflow-wrap", v).map(|x| vec![("overflow-wrap".into(), x)]).ok_or(()),
@@ -1152,7 +1152,7 @@ fn initial_value(p: &str) -> &'static str {
         "direction" => "ltr", "unicode-bidi" => "normal",
         "pointer-events" => "auto",
         "letter-spacing" | "word-spacing" => "normal",
-        "font-synthesis" => "weight style small-caps", "font-synthesis-weight" | "font-synthesis-style" | "font-synthesis-small-caps" => "auto", "font-variant" | "font-variant-caps" => "normal",
+        "font-synthesis" => "weight style small-caps", "font-synthesis-weight" | "font-synthesis-style" | "font-synthesis-small-caps" => "auto", "font-synthesis-position" => "none", "font-variant" | "font-variant-caps" => "normal",
         "min-width" | "min-height" => "0px",
         "margin-right" | "margin-bottom" | "margin-left" | "padding-right" | "padding-bottom" | "padding-left" => "0px",
         "border-right-width" | "border-bottom-width" | "border-left-width" => "0px",
@@ -1909,9 +1909,10 @@ fn font_synthesis_computed(el: usize) -> String {
 /// AETHERFONTSYNTHESISSMALLCAPS (SR772): `font-synthesis` from its `weight` / `style` / `small-caps` longhands' values
 /// (in `longhands` order): each one that is `auto` names its keyword, in Chromium's canonical order (weight, style,
 /// small-caps); all three `none` is `none`; any other value (a mix with a CSS-wide keyword) has no shorthand.
+/// AETHERFONTSYNTHESISPOSITION (SR1080): the fourth longhand `position` last (css-fonts-4 §6 order).
 fn font_synthesis_words(vals: &[&str]) -> Option<String> {
     let mut on = Vec::new();
-    for (k, v) in ["weight", "style", "small-caps"].iter().zip(vals.iter()) {
+    for (k, v) in ["weight", "style", "small-caps", "position"].iter().zip(vals.iter()) {
         match *v {
             "auto" => on.push(*k),
             "none" => {}
@@ -1957,7 +1958,7 @@ const SHORTHANDS: &[(&str, &[&str])] = &[
     ("inset", &["top", "right", "bottom", "left"]),
     ("gap", &["row-gap", "column-gap"]),
     ("overflow", &["overflow-x", "overflow-y"]),
-    ("font-synthesis", &["font-synthesis-weight", "font-synthesis-style", "font-synthesis-small-caps"]),
+    ("font-synthesis", &["font-synthesis-weight", "font-synthesis-style", "font-synthesis-small-caps", "font-synthesis-position"]),
     ("flex", &["flex-grow", "flex-shrink", "flex-basis"]),
     ("outline", &["outline-color", "outline-style", "outline-width"]),
     (
@@ -1996,7 +1997,7 @@ padding=padding-top padding-right padding-bottom padding-left
 inset=top right bottom left
 gap=row-gap column-gap
 overflow=overflow-x overflow-y
-font-synthesis=font-synthesis-weight font-synthesis-style font-synthesis-small-caps
+font-synthesis=font-synthesis-weight font-synthesis-style font-synthesis-small-caps font-synthesis-position
 flex=flex-grow flex-shrink flex-basis
 outline=outline-color outline-style outline-width
 border-radius=border-top-left-radius border-top-right-radius border-bottom-right-radius border-bottom-left-radius
@@ -2042,6 +2043,7 @@ column-gap>gap
 flex-basis>flex
 flex-grow>flex
 flex-shrink>flex
+font-synthesis-position>font-synthesis
 font-synthesis-small-caps>font-synthesis
 font-synthesis-style>font-synthesis
 font-synthesis-weight>font-synthesis
@@ -2104,7 +2106,7 @@ top>inset";
         }
         assert_eq!(keys, SHORTHANDS.len(), "every old shorthand is a table row and no more");
         let names = universe();
-        assert_eq!(names.len(), 243) /* SR800 fold: + font-variant-caps */;
+        assert_eq!(names.len(), 244) /* SR800 fold: + font-variant-caps; SR1080: + font-synthesis-position */;
         for p in &names {
             let want = if FIXED.contains(&p.as_str()) { Vec::new() } else { old_of.get(p.as_str()).cloned().unwrap_or_default() };
             assert_eq!(shorthands_of(p), want, "shorthands_of({p})");
@@ -2155,7 +2157,7 @@ top>inset";
 
     #[test]
     fn shorthand_font_synthesis_longhands_map_back() {
-        for l in ["font-synthesis-weight", "font-synthesis-style", "font-synthesis-small-caps"] {
+        for l in ["font-synthesis-weight", "font-synthesis-style", "font-synthesis-small-caps", "font-synthesis-position"] {
             assert_eq!(shorthands_of(l), vec!["font-synthesis"], "{l}");
         }
     }
@@ -2452,5 +2454,59 @@ mod border_image_tests {
         let b = Block::parse("border: 1px solid red; border-image: url(a.png) 30");
         assert_eq!(b.get("border"), "");
         assert_eq!(b.serialize(), "border-width: 1px; border-style: solid; border-color: red; border-image: url(\"a.png\") 30;");
+    }
+}
+
+// ---- AETHERFONTSYNTHESISPOSITION (LEDGER SR1080): css-fonts-4 §6.4 font-synthesis-position in the CSSOM (named tail block) ----
+
+#[cfg(test)]
+mod font_synthesis_position_tests {
+    use super::*;
+
+    /// AETHERFONTSYNTHESISPOSITION (SR1080): the shorthand's `position` word reaches its longhand and reads back in
+    /// canonical order (it was dropped whole before: `position` was no keyword).
+    #[test]
+    fn cssom_font_synthesis_position_shorthand_round_trip() {
+        let b = Block::parse("font-synthesis: weight position");
+        assert_eq!(b.get("font-synthesis"), "weight position");
+        assert_eq!(b.get("font-synthesis-position"), "auto");
+        assert_eq!(b.get("font-synthesis-small-caps"), "none");
+        let b = Block::parse("font-synthesis: weight style");
+        assert_eq!(b.get("font-synthesis-position"), "none", "a word the shorthand omits is none");
+    }
+
+    /// AETHERFONTSYNTHESISPOSITION (SR1080): the longhand reads back `none` / `auto`; an invalid value is dropped.
+    #[test]
+    fn cssom_font_synthesis_position_longhand() {
+        assert_eq!(Block::parse("font-synthesis-position: none").get("font-synthesis-position"), "none");
+        assert_eq!(Block::parse("font-synthesis-position: AUTO").get("font-synthesis-position"), "auto");
+        assert!(Block::parse("font-synthesis-position: sub").decls.is_empty(), "bogus is dropped");
+    }
+
+    /// AETHERFONTSYNTHESISPOSITION (SR1080): the table row has four longhands; `none` expands to four `none`.
+    #[test]
+    fn cssom_font_synthesis_position_table_row() {
+        assert_eq!(longhands("font-synthesis").map(|l| l.len()), Some(4));
+        assert_eq!(shorthands_of("font-synthesis-position"), vec!["font-synthesis"]);
+        let pairs = expand("font-synthesis", &css_core::parser::parse_component_values("none")).unwrap();
+        assert_eq!(pairs.len(), 4);
+        assert!(pairs.iter().all(|(_, v)| v == "none"));
+        assert_eq!(pairs[3].0, "font-synthesis-position");
+    }
+
+    /// AETHERFONTSYNTHESISPOSITION (SR1080): the longhand's initial is `none` (css-fonts-4 §6.4), so the shorthand's
+    /// initial serialization stays `weight style small-caps`; four `auto` longhands (what `font_synthesis_computed`
+    /// serializes for a box declaring only `font-synthesis-position: auto`) read `weight style small-caps position`.
+    #[test]
+    fn cssom_font_synthesis_position_initial_and_computed_words() {
+        assert_eq!(initial_value("font-synthesis-position"), "none");
+        assert_eq!(initial_value("font-synthesis"), "weight style small-caps");
+        let mut b = Block::default();
+        for (l, v) in [("font-synthesis-weight", "auto"), ("font-synthesis-style", "auto"), ("font-synthesis-small-caps", "auto"), ("font-synthesis-position", "auto")] {
+            b.decls.push(Decl { name: l.to_string(), value: v.to_string(), important: false });
+        }
+        assert_eq!(serialize_shorthand(&b, "font-synthesis").map(|x| x.0), Some("weight style small-caps position".to_string()));
+        b.decls[3].value = "none".to_string();
+        assert_eq!(serialize_shorthand(&b, "font-synthesis").map(|x| x.0), Some("weight style small-caps".to_string()));
     }
 }
