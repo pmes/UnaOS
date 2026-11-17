@@ -3231,9 +3231,9 @@ fn frame_walk(
 
                 // A focused text field shows Chromium's focus ring (`:focus-visible` always matches a
                 // text field): 2px #101010 over the border box's outer edge.
-                let focused_field = is_control && focus_of(dom_node).is_some();
+                let focused_field = is_control && focus_of(dom_node).is_some(); let mut border_a = border.as_mut().map_or(1.0, |b| layout_core::css::border_visible(&spec, b)); // SR1112: alpha-0 sides dropped, the stroke alpha of the rest
                 if focused_field {
-                    border = Some([Some((2.0, (16, 16, 16))); 4]);
+                    border = Some([Some((2.0, (16, 16, 16))); 4]); border_a = 1.0;
                 }
                 // Chromium's control frame (fields, selects, textareas) is a rounded rect whose four
                 // corner pixels stay unpainted: keep what is under them.
@@ -3260,7 +3260,7 @@ fn frame_walk(
                         for i in 0..4 {
                             bs[i] = sides[i].filter(|(w, _)| *w > 0.0).map(|(w, c)| (w, c, styles[i]));
                         }
-                        let bda = spec.border_alpha.unwrap_or(1.0);
+                        let bda = border_a;
                         let mut blend_at = |x: u32, y: u32, c: (u8, u8, u8), a: f32| {
                             let a = a * bda;
                             if !in_damage(x, y, damage_rects) || !in_clip(x, y, clip) {
@@ -3289,7 +3289,7 @@ fn frame_walk(
                         // bottom border across the last visible row.
                         let (bx0, by0) = (box_sx, box_sy);
                         let (bx1, by1) = (box_sx + bw, box_sy + bh);
-                        let bda = (spec.border_alpha.unwrap_or(1.0).clamp(0.0, 1.0) * 255.0).round() as u8;
+                        let bda = (border_a.clamp(0.0, 1.0) * 255.0).round() as u8;
                         let mut stroke = |x0: f32, y0: f32, x1: f32, y1: f32, color: (u8, u8, u8)| {
                             let x0 = x0.max(0.0) as u32;
                             let y0 = y0.max(0.0) as u32;
@@ -3746,7 +3746,7 @@ fn frame_walk(
                         let rounded = radius.iter().any(|&r| r != 0.0)
                             || sides.iter().any(|s| s.is_some_and(|s| s.2 != 0));
                         let bga = spec.bg_alpha.unwrap_or(1.0);
-                        let bda = spec.border_alpha.unwrap_or(1.0);
+                        let bda = layout_core::css::border_visible(spec, &mut sides);
                         let bg_rgb = spec.background.map(|c| layout_core::paint::bg_ink(c, spec.currentcolor, inh.get(node).map_or((0, 0, 0), |i| i.color)));
                         let mut blend_at = |x: u32, y: u32, c: (u8, u8, u8), a: f32| {
                             // Background and border colours composite at their alpha.

@@ -1610,7 +1610,7 @@ mod tests {
     }
 
     /// A later, more specific `opacity: 1` un-hides what `opacity: 0` hid,
-    /// and `border-color: transparent` drops the UA control stroke.
+    /// and `border-color: transparent` drops the UA control stroke (SR1112: the sides kept at alpha 0, painting nothing).
     #[test]
     fn test_opacity_and_transparent_border_override() {
         let html = r#"<html><body class="on"><button class="b" id="q">go</button></body></html>"#;
@@ -1630,7 +1630,8 @@ mod tests {
             })
             .expect("button has a paint entry");
         assert_eq!(p.hidden, Some(false), "opacity:1 must win over an earlier opacity:0");
-        assert_eq!(p.border, Some([None; 4]), "transparent border-color = no stroke");
+        assert_eq!(p.border, Some([Some((1.0, (0, 0, 0))); 4]), "SR1112 (flipped in place; was Some([None; 4])): the sides are kept, black RGB");
+        assert_eq!(p.border_alpha, Some([Some(0.0); 4]), "SR1112: transparent border-color = alpha 0 on every side, no stroke (the UA frame stays off: spec.border is Some)");
     }
 
     /// float:left/right sizes to content and hugs its edge (approximation).
@@ -9183,5 +9184,74 @@ b</div>
         assert!((s - c).abs() <= 0.5, "safe center centres like center: {s} vs {c}");
         let snap = crate::ledger::snapshot();
         assert!(snap.contains(crate::ledger::ApiCategory::Css, "align-overflow:safe"), "the safe modifier is recorded");
+    }
+
+    // ---- AETHERCSSBORDERPENDINGTRANSPARENT (LEDGER SR1112): a transparent border colour keeps the side at alpha 0 (named tail block) ----
+
+    /// AETHERCSSBORDERPENDINGTRANSPARENT (SR1112): one 40x20 box per row under a green parent: `#ta` `border: 2px solid
+    /// transparent`, `#tb` its borderless twin, `#td` `border: 2px solid red; border-color: transparent`, and `#th` the
+    /// reserve-space idiom: a transparent frame that `:hover` colours red.
+    fn border_transparent_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div div { width: 40px; height: 20px; margin: 0 0 12px }
+            .f { border: 2px solid; border-color: transparent }
+            .f:hover { border-color: red }
+            </style></head><body style="margin:0">
+            <div style="background:rgb(0, 160, 0);padding:8px">
+            <div id="ta" style="border:2px solid transparent"></div>
+            <div id="tb"></div>
+            <div id="td" style="border:2px solid red;border-color:transparent"></div>
+            <div id="th" class="f"></div>
+            </div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 400));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    fn border_transparent_not_green(c: (u8, u8, u8)) -> bool {
+        !css_wide_green(c)
+    }
+
+    /// AETHERCSSBORDERPENDINGTRANSPARENT (SR1112): `border: 2px solid transparent` reserves its 2px (a 44x24 border box)
+    /// and paints nothing over the green parent (before SR1112 a grey 2px frame: the shorthand read no colour); the
+    /// borderless twin is 40x20.
+    #[test]
+    fn border_transparent_shorthand_reserves_and_paints_nothing() {
+        let mut e = border_transparent_engine();
+        let (_, _, w, h) = imgalt_rect(&mut e, "ta");
+        assert_eq!((w, h), (44.0, 24.0), "#ta: the transparent 2px sides size the box");
+        assert_eq!(css_wide_color_ink(&mut e, "ta", border_transparent_not_green), 0, "#ta: no ink over the green parent");
+        let (_, _, w, h) = imgalt_rect(&mut e, "tb");
+        assert_eq!((w, h), (40.0, 20.0), "#tb: the borderless twin");
+    }
+
+    /// AETHERCSSBORDERPENDINGTRANSPARENT (SR1112): `border-color: transparent` over `border: 2px solid red` keeps the
+    /// sides (44x24; before SR1112 the sides were dropped and the box was 40x20) and paints no red.
+    #[test]
+    fn border_transparent_color_keeps_box() {
+        let mut e = border_transparent_engine();
+        let (_, _, w, h) = imgalt_rect(&mut e, "td");
+        assert_eq!((w, h), (44.0, 24.0), "#td: border-color: transparent keeps the 2px sides");
+        assert_eq!(css_wide_color_ink(&mut e, "td", css_wide_red), 0, "#td: paints no red");
+        assert_eq!(css_wide_color_ink(&mut e, "td", border_transparent_not_green), 0, "#td: paints nothing");
+    }
+
+    /// AETHERCSSBORDERPENDINGTRANSPARENT (SR1112): the reserve-space idiom: `#th`'s transparent frame is 44x24 before and
+    /// under the pointer, so `:hover { border-color: red }` paints red without a layout shift (before SR1112 the frame
+    /// was dropped: 40x20 and no red on hover).
+    #[test]
+    fn border_transparent_hover_no_shift() {
+        let mut e = border_transparent_engine();
+        let (l, t, w, h) = imgalt_rect(&mut e, "th");
+        assert_eq!((w, h), (44.0, 24.0), "#th: the transparent frame reserves its space");
+        assert_eq!(css_wide_color_ink(&mut e, "th", css_wide_red), 0, "#th: no red before hover");
+        e.handle_event(crate::api::events::Event::MouseMove(l + w / 2.0, t + h / 2.0));
+        e.render_frame();
+        let (_, _, w2, h2) = imgalt_rect(&mut e, "th");
+        assert_eq!((w2, h2), (44.0, 24.0), "#th: hover does not shift the box");
+        assert!(css_wide_color_ink(&mut e, "th", css_wide_red) > 0, "#th: the hover colour paints the reserved frame");
     }
 }
