@@ -1605,7 +1605,7 @@ impl Face {
         if role == Role::Preview {
             return paint_meters(px, l, self.order, &self.meter_levels());
         }
-        { let px = paint_marks(paint_export(paint_meters(view::paint_drag(self.paint_transition_still(px, l), l, vo(self.order), self.drag.as_ref()), l, self.order, &self.meter_levels()), l, self.order, self.export_frac()), l, self.order, self.marks()); self.paint_help(px, l) } // NLEFACEEXPORT (SR694): the progress band over the ruler's foot; NLE5DEXPORTRANGE (SR717): the in / out marks over the ruler; NLE5DKEYSHELP (SR744): the keys help over the timeline band, last (file tail)
+        { let px = paint_marks(paint_export(paint_meters(view::paint_source_ghost(view::paint_drag(self.paint_transition_still(px, l), l, vo(self.order), self.drag.as_ref()), l, vo(self.order), self.drag.as_ref(), self.still.as_ref()), l, self.order, &self.meter_levels()), l, self.order, self.export_frac()), l, self.order, self.marks()); self.paint_help(px, l) } // NLEFACEEXPORT (SR694): the progress band over the ruler's foot; NLE5DEXPORTRANGE (SR717): the in / out marks over the ruler; NLE5DKEYSHELP (SR744): the keys help over the timeline band, last (file tail); STRIASOURCEGHOST (SR9115): the source drag's ghost over the guide (view.rs tail)
     }
     /// Every Surface's blit: [`Face::frame`] alone on one Surface; split, the preview's then the tracks'.
     pub fn frames(&mut self) -> Vec<SMessage> {
@@ -3706,5 +3706,72 @@ mod striasourcedrag_tests {
         assert!(f.verb("unload"));
         assert!(!f.on(&SMessage::BrowserButton { down: true, x: 20.0, y: 10.0, mods: 0, surface: 0 }));
         assert!(f.dragging().is_none());
+    }
+}
+
+// ---- STRIASOURCEGHOST (LEDGER SR9115): the source frame following a source drag (named tail block) ----
+// `paint_role`'s Tracks / Whole chain folds timeline_core view's `paint_source_ghost` over `paint_drag`: while a source
+// drag's pointer is over the tracks, a framed thumb of `self.still` (during a source drag, the loaded source's frame the
+// preview band rendered: `Drag::shown` carries the source) sits above the pointer. A tracks-only paint outside
+// `frames` shows the last preview paint's still. Nothing else paints differently.
+
+#[cfg(test)]
+mod striasourceghost_tests {
+    use super::*;
+    use timeline_core::SourceId;
+
+    fn loaded() -> Face {
+        let (tl, src) = synth_fixture();
+        let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert_eq!(f.state.load_source(SourceId(1), &[Kind::Video, Kind::Audio]), Ok(()));
+        f.state.source.as_mut().unwrap().marks = (Some(1), Some(3));
+        f
+    }
+
+    fn at(px: &[u8], w: u32, x: i64, y: i64) -> [u8; 4] {
+        let i = (y as usize * w as usize + x as usize) * 4;
+        [px[i], px[i + 1], px[i + 2], px[i + 3]]
+    }
+
+    /// One Surface: a source drag over V1 paints the GUIDE-outlined ghost above the pointer, the still being the loaded
+    /// source's frame; after the release the ghost is gone.
+    #[test]
+    fn striasourceghost_one_surface_ghost_follows_the_drag() {
+        let mut f = loaded();
+        let l = f.layout();
+        assert!(f.on(&SMessage::BrowserButton { down: true, x: 20.0, y: 10.0, mods: bandy::MOD_ALT, surface: 0 }));
+        let (x, y) = l.point(0, 15);
+        assert!(f.on(&SMessage::BrowserMouseMove(x, y, 0)));
+        let px = f.paint();
+        let want = preview(&f.state.source_view().unwrap(), &f.sources, 0).unwrap();
+        assert!(want.is_some(), "B's frame");
+        assert_eq!(f.still().cloned(), want, "the ghost's still is the source's frame");
+        let (x0, y0) = view::ghost_box(&l, (x, y));
+        let foot = y0 + THUMB_H - 1;
+        assert_eq!(at(&px, l.w, x0, foot), GUIDE);
+        assert_eq!(at(&px, l.w, x0 + THUMB_W - 1, foot), GUIDE);
+        assert!(f.on(&SMessage::BrowserButton { down: false, x, y, mods: 0, surface: 0 }));
+        assert!(f.dragging().is_none());
+        let after = f.paint();
+        assert_ne!(at(&after, l.w, x0, foot), GUIDE, "no ghost without a live source drag");
+    }
+
+    /// Split: the tracks Surface's blit carries the ghost at the translated pointer; the preview's carries none.
+    #[test]
+    fn striasourceghost_split_tracks_surface_carries_the_ghost() {
+        let mut f = loaded().on_surfaces(0, 1);
+        let ph = f.split().unwrap().preview_canvas.1 as f64;
+        let l = f.layout();
+        let (x, yt) = l.point(0, 15);
+        assert!(f.on(&SMessage::BrowserButton { down: true, x: 20.0, y: 10.0, mods: bandy::MOD_ALT, surface: 0 }));
+        let before = f.paint_role(Role::Preview);
+        assert!(f.on(&SMessage::BrowserMouseMove(x, yt + ph, 0)));
+        let frames = f.frames();
+        let SMessage::SurfaceBlit { pixels: preview_px, .. } = &frames[0] else { panic!("not a blit") };
+        let SMessage::SurfaceBlit { pixels: tracks_px, width, .. } = &frames[1] else { panic!("not a blit") };
+        assert_eq!(preview_px, &before, "the preview Surface paints no ghost");
+        let (x0, y0) = view::ghost_box(&l, (x, yt));
+        assert_eq!(at(tracks_px, *width, x0, y0 + THUMB_H - 1), GUIDE);
+        assert_eq!(at(tracks_px, *width, x0, y0), GUIDE);
     }
 }
