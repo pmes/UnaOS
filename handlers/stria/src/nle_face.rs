@@ -78,12 +78,12 @@ fn po(o: Order) -> PixelOrder {
 }
 
 /// The view's label hook over text_host: the clip names and the ruler's seconds.
-struct Labels<'a>(&'a TextStyle);
+struct Labels<'a>(&'a TextStyle, Option<&'a LabelCache>); // STRIAPERFLABELSHAPE (SR935): the face's shaped-line cache, `None` shapes every call (file tail)
 
 impl view::Text for Labels<'_> {
     fn text(&mut self, c: &mut Canvas, s: &str, x: f32, baseline: f32, clip: (i32, i32)) {
         let (w, h, order) = (c.w, c.h, po(c.order));
-        self.0.shape(s).paint(&mut c.px, w, h, w as usize * 4, order, x, baseline, LABEL, clip);
+        shaped(self.0, self.1, s).paint(&mut c.px, w, h, w as usize * 4, order, x, baseline, LABEL, clip); // STRIAPERFLABELSHAPE (SR935): a cached line by text (file tail)
     }
 }
 
@@ -96,8 +96,8 @@ pub fn paint(st: &EditorState, w: u32, h: u32, order: PixelOrder, labels: Option
 /// [`paint`] in a given layout (the face's view, which a wheel zoom anchors at the pointer: [`Face::layout`]): timeline_core's
 /// `view::paint_in`, the labels through [`Labels`].
 pub fn paint_in(st: &EditorState, l: Layout, order: PixelOrder, labels: Option<&TextStyle>, preview: Option<&Still>, peaks: Option<&dyn view::PeakSource>) -> Vec<u8> {
-    let mut lab = labels.map(Labels);
-    view::paint_in(st, l, vo(order), lab.as_mut().map(|t| t as &mut dyn view::Text), preview, peaks)
+    let lab = labels.map(|s| Labels(s, None)); // STRIAPERFLABELSHAPE (SR935): the free paint shapes uncached (file tail)
+    paint_labelled(st, l, order, lab, preview) // STRIAPERFLABELSHAPE (SR935): the one view::paint_in call (file tail), peaks
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -211,13 +211,14 @@ pub struct Face {
     zoom_fit: Option<(bool, u32, Option<(i64, i64)>)>, // STRIAZOOMFITKEYS (SR907): the last fit (sel, zoom, view); a resize refits while it still holds (file tail)
     pcache: PreviewCache, // STRIAPERFPREVIEWCACHE (SR918): the preview still's key and the reel summaries (file tail)
     laid: Option<String>, // STRIAINSERTMARKSKEYS (SR924): the last laid insert's line (file tail)
+    lcache: LabelCache, // STRIAPERFLABELSHAPE (SR935): the shaped label lines by text (file tail)
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, frame_saved: None, peaks: WavePeaks::default(), tc: None, slip_view: None, loudness: None, meter_hold: MeterHold::default(), help_query: None, info: None, export_queue: std::collections::VecDeque::new(), snap_off: false, autosave: Autosave::default(), keymap: Keymap::default(), proxy: None, reel_paths: Vec::new(), zoom_fit: None, pcache: PreviewCache::default(), proxy_queue: Vec::new(), proxy_hold: None, laid: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, frame_saved: None, peaks: WavePeaks::default(), tc: None, slip_view: None, loudness: None, meter_hold: MeterHold::default(), help_query: None, info: None, export_queue: std::collections::VecDeque::new(), snap_off: false, autosave: Autosave::default(), keymap: Keymap::default(), proxy: None, reel_paths: Vec::new(), zoom_fit: None, pcache: PreviewCache::default(), proxy_queue: Vec::new(), proxy_hold: None, laid: None, lcache: LabelCache::default() }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -1642,7 +1643,7 @@ impl Face {
             };
         }
         let still = if role == Role::Tracks { None } else { self.slip_view().or(self.still.as_ref()) }; // STRIASLIPVIEW (SR858): the pair replaces the playhead frame while it shows
-        let px = self.paint_message(paint_in(st, l, self.order, self.labels.as_ref(), still, Some(&self.peaks as &dyn view::PeakSource)), l, role); // STRIAINFOREEL (SR743): the message line at the preview band's foot (file tail)
+        let px = self.paint_message(paint_labelled(st, l, self.order, self.labels.as_ref().map(|s| Labels(s, Some(&self.lcache))), still, Some(&self.peaks as &dyn view::PeakSource)), l, role); // STRIAINFOREEL (SR743): the message line at the preview band's foot (file tail); STRIAPERFLABELSHAPE (SR935): labels through the face's cache (file tail)
         if role == Role::Preview {
             return paint_meter_clips(paint_meters(px, l, self.order, &self.meter_levels()), l, self.order, self.meter_hold.clipped());
         }
@@ -2411,7 +2412,7 @@ impl Face {
         }
         let px = self.paint_tc(px, l); let Some(text) = self.message_text() else { return px }; // STRIATIMECODEDISPLAY (SR872): the readout on the row's left half first (file tail)
         let mut c = Canvas { w: l.w, h: l.h, order: vo(self.order), px };
-        view::Text::text(&mut Labels(style), &mut c, &text, (self.tc_split(l) + 4) as f32, (l.message_y + l.message_h) as f32 - 4.0, (self.tc_split(l) as i32, l.w as i32)); // STRIATIMECODEDISPLAY (SR872): the right half while the readout shows (x 4, the whole row, off)
+        view::Text::text(&mut Labels(style, Some(&self.lcache)), &mut c, &text, (self.tc_split(l) + 4) as f32, (l.message_y + l.message_h) as f32 - 4.0, (self.tc_split(l) as i32, l.w as i32)); // STRIATIMECODEDISPLAY (SR872): the right half while the readout shows (x 4, the whole row, off) // STRIAPERFLABELSHAPE (SR935): the message line through the cache (file tail)
         c.px
     }
 }
@@ -2744,7 +2745,7 @@ impl Face {
         if !self.help || l.ruler_y >= l.h {
             return px;
         }
-        let (ascent, descent, gap) = style.metrics();
+        let (ascent, descent, gap) = self.lcache.metrics(style); // STRIAPERFLABELSHAPE (SR935): metrics once per style (file tail)
         let pitch = (ascent + descent + gap).max(1.0);
         let top = l.ruler_y as f32 + HELP_PAD;
         let per = ((l.h as f32 - top) / pitch).floor().max(0.0) as usize;
@@ -2757,8 +2758,8 @@ impl Face {
         let (mut x, mut start) = (HELP_PAD, 0usize);
         while start < rows.len() {
             let chunk = &rows[start..(start + per).min(rows.len())];
-            let kw = chunk.iter().map(|r| style.width(&r.0)).fold(0.0f32, f32::max);
-            let pw = chunk.iter().map(|r| style.width(r.1)).fold(0.0f32, f32::max);
+            let kw = chunk.iter().map(|r| self.lcache.width(style, &r.0)).fold(0.0f32, f32::max); // STRIAPERFLABELSHAPE (SR935): a cached width (file tail)
+            let pw = chunk.iter().map(|r| self.lcache.width(style, r.1)).fold(0.0f32, f32::max); // STRIAPERFLABELSHAPE (SR935): a cached width (file tail)
             if !cols.is_empty() && x + kw + HELP_KEY_GAP + pw > l.w as f32 {
                 break;
             }
@@ -2769,7 +2770,7 @@ impl Face {
         let cut = start < rows.len();
         let mut c = Canvas { w: l.w, h: l.h, order: vo(self.order), px };
         c.rect(0, l.ruler_y as i64, l.w as i64, l.h as i64, view::BG);
-        let mut lab = Labels(style);
+        let mut lab = Labels(style, Some(&self.lcache)); // STRIAPERFLABELSHAPE (SR935): the help rows through the cache (file tail)
         let mut x = HELP_PAD;
         for (ci, &(first, kw, pw)) in cols.iter().enumerate() {
             let end = (first + per).min(rows.len());
@@ -6601,5 +6602,177 @@ impl Face {
         };
         self.last_error = Some(line);
         Some(true)
+    }
+}
+
+// ---- STRIAPERFLABELSHAPE (LEDGER SR935): shaped label lines cached by text on the face (named tail block) ----
+// SR890 measured the face's `Labels` hook running a full `TextStyle::shape` for every clip label, every ruler timecode, the
+// message line and every help row on every paint (the help also measured each row by a second shape). The face now keeps the
+// shaped `Line`s by text in one bounded `LabelCache` (a Mutex: `paint_message` / `paint_help` take `&self`): a text is shaped
+// once per style and painted from the cache after. A `Line` does not depend on the byte order (`Line::paint` takes it), so the
+// key is the style alone; a style change drops every entry; a full cache (LABEL_CACHE_MAX texts, e.g. the export message's
+// churn) is cleared. The cached Line is the one `shape` gives for the same (style, text), painted by the same `Line::paint`,
+// so every golden is byte-identical; labels-off paints never reach `Labels`, and the free `paint` / `paint_in` shape uncached.
+// timeline_core view.rs is not edited (the kernel Player has its own hook). Owed: NLE-PERF-LABEL-STRING, NLE-PERF-HELP-ROWS,
+// NLE-PERF-HELP-COLS, NLE-PERF-LABEL-PAINT.
+
+/// STRIAPERFLABELSHAPE (SR935): the most texts the face's label cache holds before it is cleared.
+const LABEL_CACHE_MAX: usize = 512;
+
+/// STRIAPERFLABELSHAPE (SR935): the shaped label lines, locked for a lookup and the one shape a miss makes.
+#[derive(Default)]
+struct LabelCache {
+    inner: std::sync::Mutex<LabelLines>,
+}
+
+/// STRIAPERFLABELSHAPE (SR935): the style the lines were shaped in, the lines by text, the style's metrics, the shapes made.
+#[derive(Default)]
+struct LabelLines {
+    style: Option<TextStyle>,
+    lines: std::collections::HashMap<String, std::sync::Arc<text_host::line::Line>>,
+    metrics: Option<(f32, f32, f32)>,
+    shapes: u64,
+}
+
+impl LabelLines {
+    /// A style other than the cached one drops every line and the metrics.
+    fn restyle(&mut self, style: &TextStyle) {
+        if self.style.as_ref() != Some(style) {
+            self.lines.clear();
+            self.metrics = None;
+            self.style = Some(style.clone());
+        }
+    }
+}
+
+impl LabelCache {
+    /// `s` shaped in `style`: the cached line, else one `TextStyle::shape` (counted) kept by text.
+    fn line(&self, style: &TextStyle, s: &str) -> std::sync::Arc<text_host::line::Line> {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.restyle(style);
+        if let Some(l) = g.lines.get(s) {
+            return l.clone();
+        }
+        if g.lines.len() >= LABEL_CACHE_MAX {
+            g.lines.clear();
+        }
+        let l = std::sync::Arc::new(style.shape(s));
+        g.shapes += 1;
+        g.lines.insert(s.to_string(), l.clone());
+        l
+    }
+    /// The advance of `s` in `style` (the value `TextStyle::width` gives), from the cached line.
+    fn width(&self, style: &TextStyle, s: &str) -> f32 {
+        self.line(style, s).width
+    }
+    /// `style.metrics()`, once per style.
+    fn metrics(&self, style: &TextStyle) -> (f32, f32, f32) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.restyle(style);
+        if let Some(m) = g.metrics {
+            return m;
+        }
+        let m = style.metrics();
+        g.metrics = Some(m);
+        m
+    }
+}
+
+/// STRIAPERFLABELSHAPE (SR935): `s` shaped in `style`, through `cache` when the face gives one.
+fn shaped(style: &TextStyle, cache: Option<&LabelCache>, s: &str) -> std::sync::Arc<text_host::line::Line> {
+    cache.map_or_else(|| std::sync::Arc::new(style.shape(s)), |k| k.line(style, s))
+}
+
+/// STRIAPERFLABELSHAPE (SR935): timeline_core's `view::paint_in` with the caller's [`Labels`] (the free [`paint_in`]'s uncached
+/// hook, or the face's cached one).
+fn paint_labelled(st: &EditorState, l: Layout, order: PixelOrder, lab: Option<Labels<'_>>, preview: Option<&Still>) -> Vec<u8> {
+    let mut lab = lab;
+    view::paint_in(st, l, vo(order), lab.as_mut().map(|t| t as &mut dyn view::Text), preview)
+}
+
+impl Face {
+    /// STRIAPERFLABELSHAPE (SR935): how many label lines the face has shaped (one per text per style while cached).
+    pub fn label_shapes(&self) -> u64 {
+        self.lcache.inner.lock().unwrap_or_else(|e| e.into_inner()).shapes
+    }
+}
+
+#[cfg(test)]
+mod striaperflabelshape_tests {
+    use super::*;
+
+    fn face() -> Face {
+        let (tl, src) = synth_fixture();
+        let mut f = Face::new(EditorState::new(tl), src, (640, 480), PixelOrder::Rgba, true);
+        f.state.playhead = 3;
+        f
+    }
+
+    fn pixels(blits: Vec<SMessage>) -> Vec<u8> {
+        match blits.into_iter().last() {
+            Some(SMessage::SurfaceBlit { pixels, .. }) => pixels,
+            _ => panic!("a blit"),
+        }
+    }
+
+    /// STRIAPERFLABELSHAPE M3: a repaint of an unchanged face shapes no label.
+    #[test]
+    fn striaperflabelshape_repaint_shapes_nothing() {
+        let mut f = face();
+        f.frames();
+        let n = f.label_shapes();
+        assert!(n > 0, "the first paint shapes the ruler and clip labels");
+        f.frames();
+        f.frames();
+        assert_eq!(f.label_shapes(), n, "every label is a cache hit");
+    }
+
+    /// STRIAPERFLABELSHAPE M3: a paint from cached lines is byte-identical to a fresh face's paint (every line shaped).
+    #[test]
+    fn striaperflabelshape_bytes_identical() {
+        let mut a = face();
+        a.frames();
+        let cached = pixels(a.frames());
+        let mut b = face();
+        assert_eq!(cached, pixels(b.frames()));
+        assert!(a.verb("help"));
+        assert!(b.verb("help"));
+        a.frames();
+        assert_eq!(pixels(a.frames()), pixels(b.frames()), "the help from cached lines");
+    }
+
+    /// STRIAPERFLABELSHAPE M3: the help shapes its rows on the first paint it shows, none on the next.
+    #[test]
+    fn striaperflabelshape_help_shapes_once() {
+        let mut f = face();
+        f.frames();
+        let n = f.label_shapes();
+        assert!(f.verb("help"));
+        f.frames();
+        let m = f.label_shapes();
+        assert!(m > n, "the help rows are shaped once");
+        f.frames();
+        assert_eq!(f.label_shapes(), m, "a second help paint shapes nothing");
+    }
+
+    /// STRIAPERFLABELSHAPE M3: the cache is bounded, a style change drops it, and its width is `TextStyle::width`'s.
+    #[test]
+    fn striaperflabelshape_bounded_and_style_drop() {
+        let k = LabelCache::default();
+        let a = TextStyle::new(&["sans"], 11.0);
+        for i in 0..=LABEL_CACHE_MAX {
+            k.line(&a, &i.to_string());
+        }
+        assert!(k.inner.lock().unwrap().lines.len() <= LABEL_CACHE_MAX);
+        assert_eq!(k.inner.lock().unwrap().shapes, LABEL_CACHE_MAX as u64 + 1);
+        assert_eq!(k.width(&a, "00:00:01:00"), a.width("00:00:01:00"));
+        let shapes = k.inner.lock().unwrap().shapes;
+        k.width(&a, "00:00:01:00");
+        assert_eq!(k.inner.lock().unwrap().shapes, shapes, "a hit");
+        let b = TextStyle::new(&["sans"], 12.0);
+        k.width(&b, "00:00:01:00");
+        assert_eq!(k.inner.lock().unwrap().shapes, shapes + 1, "a new style shapes again");
+        assert_eq!(k.inner.lock().unwrap().lines.len(), 1, "the old style's lines are gone");
+        assert_eq!(k.metrics(&b), b.metrics());
     }
 }
