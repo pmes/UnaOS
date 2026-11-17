@@ -1049,3 +1049,39 @@ fn h264enctwopassclitable_pass2_words_reads_the_default_plan() {
     assert_eq!(pass2_words(&pass2_cli_of("qcomp=0.6,cplxblur=20,qblur=0.5,qpstep=4").unwrap()), want, "x264's defaults spelled out");
     println!("h264enctwopassclitable: {want}");
 }
+
+// ---- NLE5DEXPORTMESSAGEETATOTAL (LEDGER SR820): the export's one frame count (named tail block) ----
+#[test]
+fn nle5dexportmessageetatotal_export_total_kat() {
+    use stria::nle_export::export_total;
+    let tl = timeline();
+    let mut audio = tl.clone();
+    audio.tracks.retain(|t| t.kind == Kind::Audio);
+    assert!(!audio.tracks.is_empty() && audio.tracks.len() < tl.tracks.len(), "the fixture's audio track alone");
+    let rows: [(&Timeline, std::ops::Range<i64>, u64); 5] = [(&tl, 0..tl.end(), 35), (&tl, 10..20, 10), (&tl, 5..5, 0), (&tl, 20..10, 0), (&audio, 0..tl.end(), 0)];
+    for (t, r, want) in &rows {
+        assert_eq!(export_total(t, r), *want, "export_total({r:?}) over {} tracks", t.tracks.len());
+    }
+    println!("nle5dexportmessageetatotal: export_total {} KAT rows (0..{} -> 35)", rows.len(), tl.end());
+}
+
+#[test]
+fn nle5dexportmessageetatotal_thread_reports_the_seed() {
+    use stria::nle_export::{Container, export_as_with, export_total};
+    let tl = timeline();
+    let src = sources(&tl);
+    let dir = fresh("etatotal-thread");
+    std::fs::create_dir_all(&dir).unwrap();
+    let want = export_total(&tl, &(0..TICKS));
+    let mut seen = Vec::new();
+    let r = export_as_with(&tl, 0..TICKS, &src, &dir, Box::new(PngSequence), AudioOut::None, Container::Mp4, &mut |n, of| {
+        seen.push((n, of));
+        Ok(())
+    })
+    .unwrap();
+    assert!(seen.iter().all(|&(_, of)| of == want), "every reading's total is the seed {want}: {seen:?}");
+    assert_eq!(seen.last().map(|&(n, _)| n), Some(want), "the last reading is the seed");
+    assert_eq!((r.frames, seen.len() as u64), (want, want), "one reading per frame, frames == the seed");
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("nle5dexportmessageetatotal: {} readings, total {want} each, report.frames {}", seen.len(), r.frames);
+}
