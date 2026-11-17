@@ -157,7 +157,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
     }
     if matches!(tok, "key:Ctrl+a" | "key:Meta+a") {
         return Some(vec![SMessage::BrowserSelectAll]);
-    }
+    } if let Some(m) = striapastekeys_token(tok) { return Some(m); } // STRIAPASTEKEYS (SR921): `key:Ctrl+c` / `key:Ctrl+v` (and Meta) are the BrowserCopy / BrowserPaste the surfaces send (file tail)
     if let Some(name) = tok.strip_prefix("key:") {
         let (key, text) = if name == "space" { (name, " ") } else { (name, name) };
         let mut out = vec![SMessage::BrowserKey(key.to_string())];
@@ -2085,4 +2085,45 @@ mod striagapsblack_tests {
 /// prefs get (`chrome_rows::stored_str`, read once here at the open), else "" (the built-in KEYS). The witness never calls it.
 fn window_keys(c: &Cli) -> String {
     nle_face::keys_text(c.keys.as_deref(), || quartzite::widgets::chrome_rows::stored_str(nle_face::KEYS_NS, nle_face::KEYS_KEY))
+}
+
+// ---- STRIAPASTEKEYS (LEDGER SR921): the clipboard chords as the surfaces send them (named tail block) ----
+
+/// `key:Ctrl+c` / `key:Meta+c` is the `BrowserCopy` and `key:Ctrl+v` / `key:Meta+v` the `BrowserPaste` (an empty text:
+/// the face ignores it) both surfaces send for the chord; `None` for any other token (`key:Ctrl+x` and
+/// `key:Ctrl+Shift+V` go on as `BrowserKey`).
+fn striapastekeys_token(tok: &str) -> Option<Vec<SMessage>> {
+    match tok {
+        "key:Ctrl+c" | "key:Meta+c" => Some(vec![SMessage::BrowserCopy]),
+        "key:Ctrl+v" | "key:Meta+v" => Some(vec![SMessage::BrowserPaste(String::new())]),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod striapastekeys_tests {
+    use super::*;
+
+    /// `--do at:12:0,key:Ctrl+c,ruler:35,key:Ctrl+v`: B copied off V1 through the copy chord, laid at tick 35 through the
+    /// paste chord (one undo step); then `ruler:12,key:Ctrl+Shift+V` pastes rippling V1.
+    #[test]
+    fn striapastekeys_witness_chord_tokens() {
+        let (tl, src) = nle_face::synth_fixture();
+        let tl0 = tl.clone();
+        assert!(matches!(striapastekeys_token("key:Meta+c").as_deref(), Some([SMessage::BrowserCopy])));
+        assert!(striapastekeys_token("key:Ctrl+x").is_none());
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut face, "at:12:0,key:Ctrl+c,ruler:35,key:Ctrl+v");
+        assert!(errors.is_empty(), "{errors:?}");
+        let v1 = &face.state.timeline.tracks[0].clips;
+        assert_eq!(v1.last().map(|c| (c.src_in, c.src_out, c.at)), Some((0, 10, 35)));
+        assert_eq!(face.state.timeline.tracks[1], tl0.tracks[1]);
+        assert_eq!((face.state.undo_depth(), face.last_error.clone()), (1, None));
+        let mut face = Face::new(EditorState::new(tl0.clone()), nle_face::synth_fixture().1, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut face, "at:12:0,key:Ctrl+c,ruler:12,key:Ctrl+Shift+V");
+        assert!(errors.is_empty(), "{errors:?}");
+        let v1: Vec<(i64, i64, i64)> = face.state.timeline.tracks[0].clips.iter().map(|c| (c.src_in, c.src_out, c.at)).collect();
+        assert!(v1.contains(&(0, 10, 12)) && v1.contains(&(2, 10, 22)), "{v1:?}");
+        println!("striapastekeys witness: V1 {v1:?}");
+    }
 }

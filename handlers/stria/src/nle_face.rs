@@ -224,7 +224,7 @@ impl Face {
     }
     /// One message from the surface or the buttons; true when the canvas must be repainted.
     pub fn on(&mut self, msg: &SMessage) -> bool {
-        if let Some(r) = self.bin_input(msg) { return r; } if !self.takes(msg) { return false; } if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's; STRIAPROJECTBIN (SR885): the bin Surface's pointer first (file tail)
+        if let Some(r) = self.bin_input(msg) { return r; } if !self.takes(msg) { return false; } if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } if let Some(r) = self.clipboard_key(msg) { return r; } // STRIAPASTEKEYS (SR921): BrowserCopy / BrowserPaste reach Face::key as the Ctrl+c / Ctrl+v chords (file tail); NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's; STRIAPROJECTBIN (SR885): the bin Surface's pointer first (file tail)
         match msg {
             SMessage::Input { target, text } if target == SURFACE => self.verb(text),
             SMessage::BrowserClick(x, y, _) if !self.buttons => self.click(*x, *y),
@@ -410,6 +410,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("(", "roll-"), (")", "roll+"), ("Ctrl+Shift+parenleft", "roll-10"), ("Meta+Shift+parenleft", "roll-10"), ("Ctrl+Shift+parenright", "roll+10"), ("Meta+Shift+parenright", "roll+10"), // STRIAROLLKEYS (SR893): ( / ) roll the cut at the selected clip's out edge one frame; Ctrl / Cmd + Shift + ( / ) SLIP_STEP frames (names by analogy to SR752)
     ("t", "tc"), // STRIATCSET (SR908): `t` (text) cycles the playhead readout through the `tc` word (file tail)
     ("\\", "zoom-fit"), ("|", "zoom-sel"), // STRIAZOOMFITKEYS (SR907): `\` / `|` (Shift+\, text) fit the timeline / the selection (Shift+Z is redo)
+    ("Ctrl+c", "copy"), ("Meta+c", "copy"), ("Ctrl+x", "cut"), ("Meta+x", "cut"), ("Ctrl+v", "paste"), ("Meta+v", "paste"), ("Ctrl+Shift+V", "paste-insert"), ("Meta+Shift+V", "paste-insert"), // STRIAPASTEKEYS (SR921): the clipboard words as chords (GTK / AppKit send Ctrl / Cmd+c as BrowserCopy and Ctrl / Cmd+v as BrowserPaste: Face::on routes them here, file tail)
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
@@ -2631,6 +2632,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("roll-", "roll the cut one frame earlier"), ("roll+", "roll the cut one frame later"), ("roll-10", "roll the cut 10 frames earlier"), ("roll+10", "roll the cut 10 frames later"), // STRIAROLLKEYS (SR893)
     ("tc", "playhead readout: off / timecode / frames / seconds"), // STRIATCSET (SR908)
     ("zoom-fit", "fit the whole timeline in the window"), ("zoom-sel", "fit the selection in the window"), // STRIAZOOMFITKEYS (SR907)
+    ("copy", "copy the selection"), ("cut", "cut the selection (the gap stays)"), ("paste", "paste at the playhead"), ("paste-insert", "paste at the playhead, pushing later clips on"), // STRIAPASTEKEYS (SR921): the clipboard chords' phrases
     ("help", "show / hide this help"),
 ];
 /// NLE5DKEYSHELP (SR744): the help's inset from the band's top and left (px).
@@ -6075,5 +6077,22 @@ pub fn keys_text(flag: Option<&str>, stored: impl FnOnce() -> Option<String>) ->
     match flag {
         Some(t) => t.to_string(),
         None => stored().unwrap_or_default(),
+    }
+}
+
+// ---- STRIAPASTEKEYS (LEDGER SR921): the clipboard chords through KEYS (named tail block) ----
+// The surfaces never send Ctrl / Cmd + c or v as a key: GTK and AppKit send `BrowserCopy` for c and GTK `BrowserPaste(text)`
+// for v (Shift included, only when the OS clipboard holds text). Each is routed into `Face::key` under its chord name, so
+// the help's dismiss, the VERBS road and the refusal line are the one existing path; the platform text is ignored (Stria's
+// clipboard is the editor's, SR854). Ctrl+x and Ctrl+Shift+V arrive as `BrowserKey` from a surface that sends them.
+// Owed: NLE-PASTE-KEYS-MAC, NLE-PASTE-KEYS-SHIFTV, NLE-PASTE-KEYS-EMPTY, NLE-PASTE-KEYS-KERNEL.
+impl Face {
+    /// `BrowserCopy` / `BrowserPaste` as the `Ctrl+c` / `Ctrl+v` KEYS chords (`Some(repaint)`); `None` for any other message.
+    fn clipboard_key(&mut self, msg: &SMessage) -> Option<bool> {
+        match msg {
+            SMessage::BrowserCopy => Some(self.key("Ctrl+c", false)),
+            SMessage::BrowserPaste(_) => Some(self.key("Ctrl+v", false)),
+            _ => None,
+        }
     }
 }
