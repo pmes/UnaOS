@@ -2088,7 +2088,7 @@ pub struct ExportJob {
     /// The `done` the last [`Face::export_tick`] reported (a repaint only when it moved).
     shown: u64,
     /// NLE5DEXPORTRANGE (SR717): the marked range exported (`None`: the whole timeline), named in the result line.
-    range: Option<std::ops::Range<i64>>, video: String, audio: AudioOut, // NLE5DEXPORTMESSAGEAUDIO (SR756): the video word and the audio the result line and the witness name
+    range: Option<std::ops::Range<i64>>, video: String, audio: AudioOut, started: std::time::Instant, // NLE5DEXPORTMESSAGEAUDIO (SR756): the video word and the audio the result line and the witness name
 }
 
 impl Face {
@@ -2163,7 +2163,7 @@ impl Face {
                 export_as_with(&tl, span.unwrap_or(0..tl.end()), &sources, &path, video, audio, Container::Mp4, &mut progress)
             })
             .map_err(|e| format!("{}: {e}", dir.display()))?;
-        self.export = Some(ExportJob { dir: dir.to_path_buf(), done, total, cancel, handle: Some(handle), shown: 0, range, video, audio });
+        self.export = Some(ExportJob { dir: dir.to_path_buf(), done, total, cancel, handle: Some(handle), shown: 0, range, video, audio, started: std::time::Instant::now() });
         Ok(())
     }
     /// The deterministic seam: start an export of `fmt` into `dir` that holds after frame `k` until it is cancelled (Esc,
@@ -2210,13 +2210,13 @@ impl Face {
         self.finish_export();
         true
     }
-    /// Join the job and put its outcome on the message line: `export: <n> frames, <bytes> bytes, <video> + <audio> -> <dir>` (`<video>, no audio`), the cancel
+    /// Join the job and put its outcome on the message line: `export: <n> frames, <bytes> bytes, <video> + <audio> in <t> -> <dir>` (`<video>, no audio in <t>`), the cancel
     /// `export: cancelled at d/t frames; partial files left in <dir>`, or the refusal `export: <ExportError>`.
     fn finish_export(&mut self) {
         let Some(mut j) = self.export.take() else { return };
         let (d, t) = (j.done.load(Relaxed), j.total.load(Relaxed));
         let line = match j.handle.take().map(|h| h.join()) {
-            Some(Ok(Ok(r))) => format!("export: {} frames{}, {} bytes, {} -> {}", r.frames, ticks_note(&j.range), r.bytes, export_words(&j.video, j.audio), j.dir.display()),
+            Some(Ok(Ok(r))) => format!("export: {} frames{}, {} bytes, {} -> {}", r.frames, ticks_note(&j.range), r.bytes, export_words(&j.video, j.audio, j.started.elapsed()), j.dir.display()),
             Some(Ok(Err(ExportError::Io(e)))) if e.kind() == std::io::ErrorKind::Interrupted && j.cancel.load(Relaxed) => {
                 format!("export: cancelled at {d}/{t} frames; partial files left in {}", j.dir.display())
             }
@@ -2722,11 +2722,11 @@ impl Face {
 
 // ---- NLE5DEXPORTMESSAGEAUDIO (LEDGER SR756): the result line and the refusal name the words (named tail block) ----
 /// The result line's words for what was written: `<video> + <audio>` (the audio as the table spells it,
-/// [`crate::nle_export::audio_word`]: `wav`, `mp4`, `aac`, `aac:K`), or `<video>, no audio` under `AudioOut::None`.
-fn export_words(video: &str, audio: AudioOut) -> String {
+/// [`crate::nle_export::audio_word`]: `wav`, `mp4`, `aac`, `aac:K`), or `<video>, no audio` under `AudioOut::None`; then ` in <t>`, the job's wall time ([`wall_words`], NLE5DEXPORTMESSAGEDURATION SR775).
+fn export_words(video: &str, audio: AudioOut, wall: Duration) -> String {
     match audio {
-        AudioOut::None => format!("{video}, no audio"),
-        a => format!("{video} + {}", crate::nle_export::audio_word(&a)),
+        AudioOut::None => format!("{video}, no audio in {}", wall_words(wall)),
+        a => format!("{video} + {} in {}", crate::nle_export::audio_word(&a), wall_words(wall)),
     }
 }
 
@@ -2775,5 +2775,27 @@ impl Face {
             return None;
         }
         Some(self.labels.is_some() && self.hovered_clip() != was)
+    }
+}
+
+// ---- NLE5DEXPORTMESSAGEDURATION (LEDGER SR775): the export's wall time on the result line (named tail block) ----
+// `ExportJob.started` is set in `start_export` and read after the join in `finish_export`, both on the face's thread;
+// the export thread never sees it. Owed: NLE5D-EXPORT-MESSAGE-DURATION-WITNESS (the elapsed on stria-view's export
+// JSON), NLE5D-EXPORT-MESSAGE-RATE (the export's frames per second).
+
+/// A wall time as a person reads it, the way a stopwatch reads (each unit FLOORED, so nothing carries): under 10 s one
+/// decimal (`0.8 s`, `9.9 s`), under a minute whole seconds (`12 s`), under an hour minutes and zero-padded seconds
+/// (`1 min 05 s`), else hours and zero-padded minutes (`1 h 02 min`, `25 h 00 min`).
+pub fn wall_words(d: Duration) -> String {
+    let ms = d.as_millis();
+    let s = ms / 1000;
+    if s < 10 {
+        format!("{s}.{} s", (ms % 1000) / 100)
+    } else if s < 60 {
+        format!("{s} s")
+    } else if s < 3600 {
+        format!("{} min {:02} s", s / 60, s % 60)
+    } else {
+        format!("{} h {:02} min", s / 3600, (s % 3600) / 60)
     }
 }

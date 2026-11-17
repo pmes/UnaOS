@@ -731,5 +731,50 @@ mod hevcconcealweightedbimixed_tests {
             assert_eq!(explicit_weight_of(Some(&pw), 2, 0, r, bd, high), cr, "Cr bd {bd} high {high} ref_idx {r}");
         }
     }
+
+    /// HEVCCONCEALBIDIRECTFORWARD (SR778): `uni_explicit_inv` undoes 8-252: a sample L weighted by (w, o, log2WD) to q
+    /// (unclipped) comes back within the rounding bound (1 << denom) / (2 |w|) + 1, and identity weights give L exactly.
+    #[test]
+    fn uni_explicit_inv_undoes_uni_explicit() {
+        use super::{uni_explicit, uni_explicit_inv};
+        for bd in [8u32, 10] {
+            let shift1 = (14 - bd as i32).max(2) as u32;
+            let max = (1i32 << bd) - 1;
+            let denom = 6u32;
+            for (w, o) in [(64i32, 0i32), (48, 5), (16, -3), (100, 0), (127, -20), (-32, 127)] {
+                let o = o << (bd - 8);
+                let wt = (w, o, denom + shift1);
+                let bound = (1 << denom) / (2 * w.abs()) + 1;
+                for l in 0..=max {
+                    let q = uni_explicit(l << shift1, wt);
+                    if q < 0 || q > max {
+                        continue;
+                    }
+                    let back = uni_explicit_inv(q << shift1, wt, bd);
+                    if (w, o) == (64, 0) {
+                        assert_eq!(back, l, "bd {bd}: identity weights are the copy");
+                    }
+                    assert!((back - l).abs() <= bound, "bd {bd} (w {w}, o {o}) L {l}: q {q} back {back}, bound {bound}");
+                }
+            }
+        }
+    }
 }
 
+// ---- HEVCCONCEALBIDIRECTFORWARD (LEDGER SR778): the inverse of 8-252 for the forward refinement (named tail block) ----
+/// HEVCCONCEALBIDIRECTFORWARD (SR778): the inverse of [`uni_explicit`] for dpb.rs's forward refinement (`conceal_fetch`
+/// with `inv`): the referencer C coded pred = w0 * L + o0, so the lost picture is L ~ (C - o0) * 2^denom / w0. On the 14-bit
+/// intermediate `p` of C (shift1 = Max(2, 14 - bitDepth), denom = log2WD - shift1): p' = ((p - (o0 << shift1)) << denom)
+/// / w0 rounded half away from zero, then 8-261's rounding (`uni_default`), clipped to `bd`. Identity weights (1 << denom, 0)
+/// give p' = p (the copy); w0 == 0 (C does not depend on L) is the copy.
+pub(crate) fn uni_explicit_inv(p: i32, (w0, o0, lwd): (i32, i32, u32), bd: u32) -> i32 {
+    let max = (1i32 << bd) - 1;
+    if w0 == 0 {
+        return uni_default(p, bd).clamp(0, max);
+    }
+    let shift1 = (14 - bd as i32).max(2) as u32;
+    let num = (p as i64 - ((o0 as i64) << shift1)) << lwd.saturating_sub(shift1);
+    let (n, d) = if w0 < 0 { (-num, -(w0 as i64)) } else { (num, w0 as i64) };
+    let q = if n >= 0 { (n + d / 2) / d } else { -((-n + d / 2) / d) };
+    uni_default(q.clamp(-(1 << 24), 1 << 24) as i32, bd).clamp(0, max)
+}
