@@ -663,7 +663,7 @@ pub fn author_declarations(
     });
     let parsed: Vec<css_core::stylesheet::Stylesheet> = all.iter().map(|s| css_core::stylesheet::parse_stylesheet(s)).collect();
     let env = media_environment(vw, vh);
-    let supports = |d: &css_core::parser::Declaration| property_supported(&d.name.to_ascii_lowercase());
+    let supports = |d: &css_core::parser::Declaration| declaration_supported(&d.name, &d.value);
     let import = |_: &str| -> Option<&css_core::stylesheet::Stylesheet> { None };
     let cond = css_core::cascade::Conditions { env: &env, supports: &supports, import: &import };
     let mut rules = css_core::cascade::RuleSet::new();
@@ -737,7 +737,7 @@ fn apply_stylesheets_with(
         crate::fonts::webfont::apply_rules(&parsed, &crate::images::page_base());
     }
     let env = media_environment(vw, vh);
-    let supports = |d: &css_core::parser::Declaration| property_supported(&d.name.to_ascii_lowercase());
+    let supports = |d: &css_core::parser::Declaration| declaration_supported(&d.name, &d.value);
     let import = |_: &str| -> Option<&css_core::stylesheet::Stylesheet> { None };
     let cond = css_core::cascade::Conditions { env: &env, supports: &supports, import: &import };
     // AETHERAPIS (SR145): the user-agent rules of the top layer (HTML §15.5.x rendering: a dialog without `open`
@@ -1447,7 +1447,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
 /// Properties this engine genuinely implements (the honest support set for @supports). AETHERCSSSUPPORTSLIST (SR1039):
 /// never hand-kept — the names layout_core's parser takes: every `apply_declaration` arm (SR1021's `ALL_LONGHANDS` +
 /// `ALL_SKIPPED`, which its scan pins to the arms), a vendor spelling through `vendor_alias_base` (the alias arm's
-/// own list), and [`ROAD_PROPS`]. The value is not checked (AETHER-CSS-SUPPORTS-VALUE owed).
+/// own list), and [`ROAD_PROPS`]. The value is checked by `declaration_supported` (SR1048).
 fn property_supported(prop: &str) -> bool {
     let base = layout_core::css::vendor_alias_base(prop).unwrap_or(prop);
     [layout_core::css::ALL_LONGHANDS, layout_core::css::ALL_SKIPPED, ROAD_PROPS].iter().any(|l| l.contains(&base))
@@ -1860,6 +1860,86 @@ mod supports_list_tests {
             assert!(property_supported(p), "{p:?} answers true");
             assert!(!unknown(*p), "@supports answers true for {p:?} but the parser records it unknown");
         }
+        crate::ledger::reset();
+    }
+}
+
+// ---- AETHERCSSSUPPORTSVALUE (LEDGER SR1048): @supports checks the whole declaration, the value through layout_core's parse road (named tail block) ----
+
+thread_local! {
+    /// AETHERCSSSUPPORTSVALUE (SR1048): set when a `@supports` probe's declaration recorded a coverage note (dropped).
+    static SUPPORTS_DROPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// AETHERCSSSUPPORTSVALUE (SR1048): the probe's sink: this thread's [`SUPPORTS_DROPPED`] (never the page's ledger).
+#[derive(Clone, Copy, Debug, Default)]
+struct SupportsProbe;
+
+impl layout_core::css::ProbeSink for SupportsProbe {
+    fn reset() {
+        SUPPORTS_DROPPED.with(|f| f.set(false));
+    }
+    fn mark() {
+        SUPPORTS_DROPPED.with(|f| f.set(true));
+    }
+    fn marked() -> bool {
+        SUPPORTS_DROPPED.with(|f| f.get())
+    }
+}
+
+/// AETHERCSSSUPPORTSVALUE (SR1048): css-conditional-3 §6.1 `@supports (name: value)` — the name is one this engine
+/// parses ([`property_supported`], SR1039) AND the value parses (`layout_core::css::declaration_parses` under the
+/// engine's own hooks): `(display: grid)` is false, so a page's `not (display: grid)` fallback applies.
+fn declaration_supported(name: &str, value: &[css_core::CV]) -> bool {
+    let name = name.to_ascii_lowercase();
+    property_supported(&name)
+        && layout_core::css::declaration_parses::<AetherHost, SupportsProbe>(&name, &value_text(value), &parse_cx())
+}
+
+#[cfg(test)]
+mod supports_value_tests {
+    use super::{apply_declaration, declaration_supported, SpecifiedStyle};
+
+    fn sup(name: &str, value: &str) -> bool {
+        declaration_supported(name, &css_core::parser::parse_component_values(value))
+    }
+
+    /// AETHERCSSSUPPORTSVALUE (SR1048): the values Aether parses answer true (Chromium: true).
+    #[test]
+    fn supports_value_parsed_true() {
+        for (n, v) in [
+            ("display", "flex"), ("color", "red"), ("width", "10px"), ("color", "inherit"), ("display", "inherit"),
+            ("text-decoration-color", "red"), ("clear", "left"), ("color", "var(--x)"), ("-moz-box-sizing", "border-box"),
+        ] {
+            assert!(sup(n, v), "@supports ({n}: {v}) answers true");
+        }
+    }
+
+    /// AETHERCSSSUPPORTSVALUE (SR1048): a value Aether drops answers false (`display: grid`: Chromium true, Aether
+    /// cannot lay it out), as does a bad colour and an unknown name.
+    #[test]
+    fn supports_value_dropped_false() {
+        for (n, v) in [("display", "grid"), ("color", "bogus"), ("bogus", "1"), ("DISPLAY", "grid")] {
+            assert!(!sup(n, v), "@supports ({n}: {v}) answers false");
+        }
+    }
+
+    /// AETHERCSSSUPPORTSVALUE (SR1048): `width: fit-content` as Aether parses it (AETHERFIT SR189: a sizing keyword).
+    #[test]
+    fn supports_value_fit_content_pin() {
+        assert!(sup("width", "fit-content"), "@supports (width: fit-content) answers true");
+    }
+
+    /// AETHERCSSSUPPORTSVALUE (SR1048): the probe never writes the page's ledger; armed: the engine's own
+    /// `apply_declaration` records `display:grid`.
+    #[test]
+    fn supports_value_probe_leaves_ledger() {
+        crate::ledger::reset();
+        assert!(!sup("display", "grid"));
+        assert!(!crate::ledger::snapshot().contains(crate::ledger::ApiCategory::Css, "display:grid"), "the probe recorded nothing");
+        let mut s = SpecifiedStyle::default();
+        apply_declaration("display", "grid", &mut s);
+        assert!(crate::ledger::snapshot().contains(crate::ledger::ApiCategory::Css, "display:grid"), "armed: the engine records it");
         crate::ledger::reset();
     }
 }
