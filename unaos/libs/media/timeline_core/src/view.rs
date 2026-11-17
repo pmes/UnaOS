@@ -3583,7 +3583,7 @@ impl Layout {
 // exactly: each dragged side moves by its delta in 1/1000 of `q` (l / t with +x / +y, r / b with -x / -y), clamped 0..=999.
 // While live the face paints [`CropDrag::shown`] (the clip uncropped) and [`paint_crop_drag`] (the dragged rect in
 // [`CROP_BADGE`]); the release commits ONCE through `EditorState::crop_set` (every selected video clip's dragged sides by the
-// same delta: SR900's step words with a free count). The kernel Player never builds one (it refuses a cropped timeline).
+// same delta: SR900's step words with a free count). The kernel Player never builds one; the kernel Player crops it (SR9010).
 
 /// STRIACROPMORE (SR960): how near (px) a press must come to an edge of the preview picture to grab it.
 pub const CROP_GRAB: f64 = 6.0;
@@ -3632,7 +3632,7 @@ impl CropDrag {
         if sides & 10 == 10 {
             sides &= if (y - y0).abs() <= (y1 - y).abs() { !8 } else { !2 };
         }
-        if sides == 0 {
+        let sides = if sides == 0 { crop_move_sides(x, y, q, clip.crop) } else { sides }; if sides == 0 { // STRIACROPTHREE (SR9032): a press inside a cropped rect moves it (file tail)
             return None;
         }
         Some(CropDrag { track, idx, q, sides, origin: (x, y), at: (x, y), crop0: clip.crop })
@@ -3646,7 +3646,7 @@ impl CropDrag {
         let (dx, dy) = (self.at.0 - self.origin.0, self.at.1 - self.origin.1);
         let fx = (dx * 1000.0 / self.q.w.max(1) as f64).round() as i32;
         let fy = (dy * 1000.0 / self.q.h.max(1) as f64).round() as i32;
-        let on = |b: u8| self.sides & b != 0;
+        let (fx, fy) = self.move_clamp(fx, fy); let on = |b: u8| self.sides & b != 0; // STRIACROPTHREE (SR9032): a move keeps the rect's size (file tail)
         [if on(1) { fx } else { 0 }, if on(2) { fy } else { 0 }, if on(4) { -fx } else { 0 }, if on(8) { -fy } else { 0 }]
     }
     /// The drag would change a side.
@@ -4418,5 +4418,82 @@ mod striabinthree_tests {
                 assert_eq!(px(&got, w, x, y), if on { HANDLE } else { px(&base, w, x, y) }, "x {x} y {y}");
             }
         }
+    }
+}
+
+// ---- STRIACROPTHREE (LEDGER SR9032): the crop drag moves the whole rect (named tail block) ----
+// NLE-CROP-DRAG-MOVE: a press inside an already cropped clip's rect over the picture `q` (and away from `q`'s edges, which
+// `CropDrag::begin` grabs first) begins a move: `sides` = 15, a value no edge or corner press yields (begin strips the
+// opposite pairs). `deltas` then moves l / r by +fx / -fx and t / b by +fy / -fy, clamped by [`CropDrag::move_clamp`] so the
+// rect keeps its size inside the frame; the release commits ONCE through `crop_set` as every crop drag does. An uncropped
+// clip has nothing to move (its rect is the whole picture): no drag.
+
+/// STRIACROPTHREE (SR9032): 15 (all four sides: a move) when `c` crops and `(x, y)` lies inside `c`'s rect over `q`
+/// ([`CropDrag::rect`]'s math), else 0.
+fn crop_move_sides(x: f64, y: f64, q: yuv_core::scale::Rect, c: crate::Crop) -> u8 {
+    if c == crate::Crop::NONE {
+        return 0;
+    }
+    let (qx, qy, qw, qh) = (q.x as i64, q.y as i64, q.w as i64, q.h as i64);
+    let (x0, y0) = ((qx + qw * c.l as i64 / 1000) as f64, (qy + qh * c.t as i64 / 1000) as f64);
+    let (x1, y1) = ((qx + qw - qw * c.r as i64 / 1000) as f64, (qy + qh - qh * c.b as i64 / 1000) as f64);
+    if x >= x0 && x < x1 && y >= y0 && y < y1 { 15 } else { 0 }
+}
+
+impl CropDrag {
+    /// STRIACROPTHREE (SR9032): a move's (`sides` 15) deltas clamped so the rect stays in the frame at its size: `fx` in
+    /// `-crop0.l ..= crop0.r`, `fy` in `-crop0.t ..= crop0.b`; any other drag's deltas as they came.
+    fn move_clamp(&self, fx: i32, fy: i32) -> (i32, i32) {
+        if self.sides != 15 {
+            return (fx, fy);
+        }
+        let c = self.crop0;
+        (fx.clamp(-(c.l as i32), c.r as i32), fy.clamp(-(c.t as i32), c.b as i32))
+    }
+}
+
+#[cfg(test)]
+mod striacropthree_tests {
+    use super::*;
+    use crate::{Clip, Crop, Timeline};
+
+    /// V1: A 0..20 at 0, cropped 100 on every side, selected, playhead 5; the preview band 320 x 90 over a 160 x 90 still:
+    /// the picture `q` is 160 x 90 at (80, 0), the crop rect (96, 9)..(224, 81).
+    fn fixture() -> (EditorState, Layout) {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        let tl = tl.set_crop(0, 0, Crop { l: 100, t: 100, r: 100, b: 100 }).unwrap();
+        let mut st = EditorState::new(tl);
+        st.select(0, 0).unwrap();
+        st.playhead = 5;
+        let l = Layout::of_role(Role::Preview, 320, 90, &st);
+        (st, l)
+    }
+
+    #[test]
+    fn striacropthree_move_whole_rect() {
+        let (mut st, l) = fixture();
+        let mut d = CropDrag::begin(&st, l, 160, 90, 160.0, 45.0).expect("inside the crop rect");
+        assert_eq!(d.sides, 15);
+        d.update(176.0, 45.0);
+        assert_eq!(d.crop(), Crop { l: 200, t: 100, r: 0, b: 100 });
+        d.update(200.0, 36.0);
+        assert_eq!(d.crop(), Crop { l: 200, t: 0, r: 0, b: 200 }, "clamped: the rect keeps its size inside the frame");
+        assert_eq!(d.rect(), (112, 0, 240, 72));
+        assert_eq!(d.finish(&mut st), Ok(()));
+        assert_eq!((st.timeline.tracks[0].clips[0].crop, st.undo_depth()), (Crop { l: 200, t: 0, r: 0, b: 200 }, 1));
+        assert!(st.undo());
+        assert_eq!(st.timeline.tracks[0].clips[0].crop, Crop { l: 100, t: 100, r: 100, b: 100 });
+    }
+
+    #[test]
+    fn striacropthree_move_refusals() {
+        let (mut st, l) = fixture();
+        assert!(CropDrag::begin(&st, l, 160, 90, 90.0, 45.0).is_none(), "inside the picture, outside the crop rect");
+        assert_eq!(CropDrag::begin(&st, l, 160, 90, 80.0, 45.0).map(|d| d.sides), Some(1), "the edge still grabs one side");
+        st.timeline = st.timeline.set_crop(0, 0, Crop::NONE).unwrap();
+        assert!(CropDrag::begin(&st, l, 160, 90, 160.0, 45.0).is_none(), "an uncropped clip: nothing to move");
     }
 }
