@@ -6017,3 +6017,47 @@ mod striakmeter_tests {
         assert_eq!(meter_hold_ticks(Some(0)), METER_HOLD_S);
     }
 }
+
+// ---- STRIAKSTEREOWAVE (LEDGER SR9074): the finished table's held size (named tail block) ----
+// A face that caps the memory its peak tables hold (the kernel Player's KPEAK_BYTES, SR9059) must count what a FINISHED
+// table really keeps: the folded `buckets`, plus the L / R tables of a 2-channel source (SR9051 `sides_of`), each with the
+// max pyramid [`Peaks::finish`] builds (ceil-halves down to one byte). [`peaks_bytes`] is that count from the bucket count
+// and channel count alone, so the cap can refuse BEFORE the scan. Owed: NLE-WAVEFORM-KERNEL-STEREO (the Player's scan
+// built by `append` + `finish` and its cap through this fn, applied when SR9059 folds onto SR9051).
+
+/// STRIAKSTEREOWAVE (SR9074): the bytes a table of `buckets` buckets holds once [`Peaks::finish`] ran: (1 table, or 3 for a
+/// 2-channel source) x (`buckets` + its pyramid's level lengths).
+pub fn peaks_bytes(buckets: usize, channels: u16) -> usize {
+    let (mut len, mut one) = (buckets, buckets);
+    while len > 1 {
+        len = len.div_ceil(2);
+        one += len;
+    }
+    one * if channels == 2 { 3 } else { 1 }
+}
+
+#[cfg(test)]
+mod striakstereowave_tests {
+    extern crate std;
+    use super::*;
+
+    /// The bytes a table really holds: buckets, every pyramid level, and each channel table's own.
+    fn held(p: &Peaks) -> usize {
+        p.buckets.len() + p.lod.iter().map(|t| t.len()).sum::<usize>() + p.chans.iter().map(held).sum::<usize>()
+    }
+
+    #[test]
+    fn striakstereowave_peaks_bytes_matches_finish() {
+        for ch in [1u16, 2, 6] {
+            for n in [0usize, 1, 2, 3, 101, 1025] {
+                let pcm = alloc::vec![0.5f32; n * 480 * ch as usize];
+                let mut p = peaks_of(48_000, ch, &pcm, PEAKS_PER_SEC);
+                assert_eq!(p.buckets.len(), n);
+                p.finish();
+                assert_eq!(held(&p), peaks_bytes(n, ch), "ch={ch} n={n}");
+            }
+        }
+        assert_eq!(peaks_bytes(360_000, 2), 3 * peaks_bytes(360_000, 1), "stereo: three tables");
+        assert!(peaks_bytes(360_000, 1) < 2 * 360_000 + 20, "a pyramid adds under the table's own size");
+    }
+}
