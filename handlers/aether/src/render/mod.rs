@@ -1034,6 +1034,9 @@ fn inherit_element(inherited: &mut Inherited, tag: &str, spec: &crate::layout::P
         inherited.text_transform = tt;
     }
 
+    if matches!(tag, "input" | "textarea" | "select" | "button") { // SR1058 fold (trunk red since SR1053): css-text-decor-3 §2.1: an ancestor's decoration is not propagated into an atomic inline (a control); it resets here, and only the control's own rule decorates its text
+        inherited.underline = false; inherited.line_through = false; inherited.deco_color = None;
+    }
     if tag == "a" || tag == "u" {
         inherited.underline = true;
     }
@@ -2978,7 +2981,7 @@ fn frame_walk(
                 // outer edge of the (2px) UA border; checkboxes and radios
                 // are drawn whole below.
                 let mut border = spec.border.map(|b| layout_core::paint::border_ink(b, spec.currentcolor, inherited.color)).or(if is_control && !checkable && !image_input && !file_input {
-                    Some([Some((1.0, layout_core::ua_colours(inherited.scheme).frame)); 4])
+                    Some(layout_core::paint::pending_frame(spec.border_pending, inherited.color, layout_core::ua_colours(inherited.scheme).frame)) // SR1058 fold: SR1031's scheme frame is the default side
                 } else {
                     None
                 });

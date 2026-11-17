@@ -131,17 +131,7 @@ pub fn parse_family_list(value: &str) -> Option<Vec<Family>> {
         }
         let words: Vec<String> = item.split_whitespace().map(unescape_css).collect();
         if words.len() == 1 {
-            let g = match words[0].to_ascii_lowercase().as_str() {
-                "serif" => Some(Generic::Serif),
-                "sans-serif" => Some(Generic::SansSerif),
-                "monospace" => Some(Generic::Monospace),
-                "cursive" => Some(Generic::Cursive),
-                "fantasy" => Some(Generic::Fantasy),
-                "system-ui" => Some(Generic::SystemUi),
-                // CSS-wide keywords cannot be family names
-                "inherit" | "initial" | "unset" | "revert" | "revert-layer" | "default" => return None,
-                _ => None,
-            };
+            let g = if reserved_family_word(&words[0]) { return None } else { generic_of(&words[0]) }; // AETHERCSSOMFONTFAMILYQUOTEDGENERIC (SR1107): ONE table, Generic::keyword(); CSS-wide words and `default` cannot be family names
             if let Some(g) = g {
                 out.push(Family::Generic(g));
                 continue;
@@ -208,7 +198,7 @@ pub fn serialize_family_list(list: &[Family]) -> String {
         .map(|f| match f {
             Family::Generic(g) => g.keyword().to_string(),
             Family::Named(n) => {
-                let ident = !n.is_empty()
+                let ident = !needs_quotes(n) && !n.is_empty() // AETHERCSSOMFONTFAMILYQUOTEDGENERIC (SR1107): a name read as a generic / CSS-wide word unquoted stays quoted
                     && !n.starts_with(|c: char| c.is_ascii_digit())
                     && !n.starts_with("--")
                     && !(n.starts_with('-') && n[1..].starts_with(|c: char| c.is_ascii_digit()))
@@ -683,4 +673,77 @@ pub fn synthesis_gate(face: &'static Face, no_synth: u8) -> &'static Face {
         return face;
     }
     text_host::installed_twin(face, b, o).unwrap_or_else(|| webfont::synth_variant(face, b, o))
+}
+
+// ---- AETHERCSSOMFONTFAMILYQUOTEDGENERIC (LEDGER SR1107): a family name read as a keyword unquoted serializes quoted (named tail block) ----
+
+/// AETHERCSSOMFONTFAMILYQUOTEDGENERIC (SR1107): the six css-fonts-4 §4.2 generics, matched through [`Generic::keyword`]
+/// (the ONE word table the parser and the serializer both read).
+const GENERICS: [Generic; 6] =
+    [Generic::Serif, Generic::SansSerif, Generic::Monospace, Generic::Cursive, Generic::Fantasy, Generic::SystemUi];
+
+/// The generic one unquoted word names (ASCII case-insensitive), if any.
+pub fn generic_of(word: &str) -> Option<Generic> {
+    GENERICS.iter().copied().find(|g| g.keyword().eq_ignore_ascii_case(word))
+}
+
+/// css-fonts-4 §2.1: the CSS-wide keywords and `default` are refused as unquoted family names.
+const RESERVED_FAMILY_WORDS: [&str; 6] = ["inherit", "initial", "unset", "revert", "revert-layer", "default"];
+
+fn reserved_family_word(word: &str) -> bool {
+    RESERVED_FAMILY_WORDS.iter().any(|w| w.eq_ignore_ascii_case(word))
+}
+
+/// A `Family::Named` that would re-parse as a keyword when written bare (Chromium / cssom serialize-a-string): quote it.
+fn needs_quotes(name: &str) -> bool {
+    generic_of(name).is_some() || reserved_family_word(name)
+}
+
+#[cfg(test)]
+mod font_family_quoted_generic_tests {
+    use super::*;
+
+    /// AETHERCSSOMFONTFAMILYQUOTEDGENERIC (SR1107): a quoted generic is a NAME and serializes quoted (it printed bare).
+    #[test]
+    fn font_family_quoted_generic_serializes_quoted() {
+        let l = parse_family_list("'serif'").unwrap();
+        assert_eq!(l, vec![Family::Named("serif".into())]);
+        assert_eq!(serialize_family_list(&l), r#""serif""#);
+        let l = parse_family_list("'serif', serif").unwrap();
+        assert_eq!(serialize_family_list(&l), r#""serif", serif"#);
+        assert_eq!(serialize_family_list(&[Family::Named("Serif".into())]), r#""Serif""#);
+        assert_eq!(serialize_family_list(&[Family::Named("serif foo".into())]), r#""serif foo""#, "a multi-word name stays quoted (unchanged)");
+    }
+
+    /// AETHERCSSOMFONTFAMILYQUOTEDGENERIC (SR1107): parse(serialize(x)) == x.
+    #[test]
+    fn font_family_quoted_generic_round_trip() {
+        for v in ["'serif'", "'sans-serif'", "'inherit'", "'default'", "Arial", r#""Times New Roman""#, "'serif', serif"] {
+            let l = parse_family_list(v).unwrap();
+            assert_eq!(parse_family_list(&serialize_family_list(&l)), Some(l), "{v} round-trips");
+        }
+    }
+
+    /// AETHERCSSOMFONTFAMILYQUOTEDGENERIC (SR1107): every keyword the parser's literal match accepted still parses.
+    #[test]
+    fn font_family_quoted_generic_generic_of_covers_parser() {
+        for (k, g) in [
+            ("serif", Generic::Serif),
+            ("sans-serif", Generic::SansSerif),
+            ("monospace", Generic::Monospace),
+            ("cursive", Generic::Cursive),
+            ("fantasy", Generic::Fantasy),
+            ("system-ui", Generic::SystemUi),
+        ] {
+            assert_eq!(generic_of(k), Some(g));
+            assert_eq!(generic_of(&k.to_ascii_uppercase()), Some(g));
+            assert_eq!(parse_family_list(k), Some(vec![Family::Generic(g)]));
+            assert_eq!(serialize_family_list(&[Family::Generic(g)]), k);
+        }
+        for w in RESERVED_FAMILY_WORDS {
+            assert!(parse_family_list(w).is_none(), "{w} unquoted is refused");
+            assert!(parse_family_list(&w.to_ascii_uppercase()).is_none());
+            assert_eq!(parse_family_list(&format!("'{w}'")), Some(vec![Family::Named(w.into())]));
+        }
+    }
 }
