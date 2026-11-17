@@ -7648,6 +7648,84 @@ mod tests {
         assert_eq!(imgalt_px(&e, 395, 595), (255, 255, 255), "a body meta is not the head's: the white canvas");
     }
 
+    // ---- AETHERCSSOMWHITESPACELONGHANDSWRITE (LEDGER SR1044): white-space-collapse / text-wrap-mode / text-wrap write the one white-space code (named tail block) ----
+
+    /// AETHERCSSOMWHITESPACELONGHANDSWRITE (SR1044): one div per longhand case at 400 px wide: pre + wrap in one block and
+    /// across two rules, a nowrap child of a pre parent, preserve alone, the shorthand after a longhand, a `<pre>` with
+    /// wrap; a 60px four-word pair (plain / `text-wrap-mode: nowrap`) and a two-line text pair (plain / `white-space-collapse:
+    /// preserve`), each beside a one-line reference.
+    fn white_space_longhands_write_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><head><style>
+            .a { white-space: pre }
+            .a.w { text-wrap-mode: wrap }
+            .n { width: 60px }
+            .n.x { text-wrap-mode: nowrap }
+            .c.p { white-space-collapse: preserve }
+            </style></head><body style="margin:0;font:16px serif">
+            <div id="pw" style="white-space:pre; text-wrap-mode:wrap">a</div>
+            <div id="ar" class="a w">a</div>
+            <div id="ap" class="a">a</div>
+            <div style="white-space:pre"><div id="np" style="text-wrap-mode:nowrap">a</div></div>
+            <div style="white-space:pre-wrap"><div id="nr" style="text-wrap:nowrap balance">a</div></div>
+            <div id="pv" style="white-space-collapse:preserve">a</div>
+            <div id="sw" style="text-wrap-mode:nowrap; white-space:normal">a</div>
+            <pre id="pt" style="text-wrap-mode:wrap">a</pre>
+            <div id="ref">a</div>
+            <div id="n0" class="n">aaa bbb ccc ddd</div>
+            <div id="n1" class="n x">aaa bbb ccc ddd</div>
+            <div id="c0" class="c">a
+b</div>
+            <div id="c1" class="c p">a
+b</div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSOMWHITESPACELONGHANDSWRITE (SR1044): getComputedStyle reads the combined code: `pre` + `text-wrap-mode:
+    /// wrap` is pre-wrap (one block and across rules; the plain `.a` twin is pre, armed), nowrap under pre is pre,
+    /// `text-wrap: nowrap balance` under pre-wrap is pre, preserve alone is pre-wrap, the later shorthand wins, a `<pre>`
+    /// with wrap is pre-wrap; SR1036's columns read the same code.
+    #[test]
+    fn white_space_longhands_write_cssom() {
+        let mut e = white_space_longhands_write_engine();
+        for (id, ws, collapse, wrap) in [
+            ("pw", "pre-wrap", "preserve", "wrap"),
+            ("ar", "pre-wrap", "preserve", "wrap"),
+            ("ap", "pre", "preserve", "nowrap"),
+            ("np", "pre", "preserve", "nowrap"),
+            ("nr", "pre", "preserve", "nowrap"),
+            ("pv", "pre-wrap", "preserve", "wrap"),
+            ("sw", "normal", "collapse", "wrap"),
+            ("pt", "pre-wrap", "preserve", "wrap"),
+            ("ref", "normal", "collapse", "wrap"),
+        ] {
+            assert_eq!(font_shorthand_cs(&mut e, id, "getPropertyValue('white-space')"), ws, "#{id}: white-space");
+            assert_eq!(font_shorthand_cs(&mut e, id, "getPropertyValue('white-space-collapse')"), collapse, "#{id}: white-space-collapse");
+            assert_eq!(font_shorthand_cs(&mut e, id, "getPropertyValue('text-wrap-mode')"), wrap, "#{id}: text-wrap-mode");
+        }
+    }
+
+    /// AETHERCSSOMWHITESPACELONGHANDSWRITE (SR1044): layout reads the longhands: the 60px four-word div wraps (armed) and
+    /// its `text-wrap-mode: nowrap` twin is one line; the two-line text collapses to one line (armed) and its
+    /// `white-space-collapse: preserve` twin keeps the break.
+    #[test]
+    fn white_space_longhands_write_layout() {
+        let mut e = white_space_longhands_write_engine();
+        let (.., one) = imgalt_rect(&mut e, "ref");
+        let (.., h0) = imgalt_rect(&mut e, "n0");
+        let (.., h1) = imgalt_rect(&mut e, "n1");
+        assert!(h0 > one + 5.0, "the plain 60px div wraps (armed): {h0} vs {one}");
+        assert!((h1 - one).abs() <= 1.0, "text-wrap-mode: nowrap is one line: {h1} vs {one}");
+        let (.., c0) = imgalt_rect(&mut e, "c0");
+        let (.., c1) = imgalt_rect(&mut e, "c1");
+        assert!((c0 - one).abs() <= 1.0, "the newline collapses (armed): {c0} vs {one}");
+        assert!(c1 > one + 5.0, "white-space-collapse: preserve keeps the newline: {c1} vs {one}");
+    }
+
     // ---- AETHERCSSOMUNICODEBIDI (LEDGER SR1008): unicode-bidi end to end: the override paints, the 22nd column reads (named tail block) ----
 
     /// AETHERCSSOMUNICODEBIDI (SR1008): 20px serif rows 12px apart: a `bdo dir=rtl` (the UA's isolate-override), an author
@@ -8523,4 +8601,5 @@ mod tests {
         assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('wn')).length)"), "25"); // SR1036 fold: 25 columns with unicode-bidi
         assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('wn')).item(24)"), "text-decoration-color");
     }
+
 }
