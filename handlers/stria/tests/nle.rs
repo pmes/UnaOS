@@ -3980,14 +3980,22 @@ fn striaseqinfo_repaint_reads_no_file() {
     let mut first = StriaTitleFrames::default();
     render(&tl, 1..2, &src, &mut first).unwrap();
     assert!(first.0[0].3 == striaimportimagesequence_px(4, 4, cols[1]), "tick 1 is file 8");
-    std::fs::remove_file(pat.replace("%04d", "0008")).unwrap();
-    let mut again = StriaTitleFrames::default();
-    render(&tl, 1..2, &src, &mut again).expect("the kept frame: file 8 is not read again");
-    assert!(again.0 == first.0, "the repaint is the same frame");
+    use std::os::unix::fs::PermissionsExt; // STRIASEQTHREE (SR9022): a kept frame is served while its file's stamp holds,
+    let f8 = pat.replace("%04d", "0008"); // so the no-read leg makes file 8 unreadable (stamp unchanged) rather than removing it
+    std::fs::set_permissions(&f8, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&f8).is_err() {
+        let mut again = StriaTitleFrames::default();
+        render(&tl, 1..2, &src, &mut again).expect("the kept frame: file 8 is not read again");
+        assert!(again.0 == first.0, "the repaint is the same frame");
+    } else {
+        println!("striaseqinfo: SKIP the no-read leg: a 0o000 file reads here (root); the striaseqthree_kept unit tests carry it");
+    }
+    std::fs::set_permissions(&f8, std::fs::Permissions::from_mode(0o644)).unwrap();
     render(&tl, 2..3, &src, &mut StriaTitleFrames::default()).unwrap();
+    std::fs::remove_file(&f8).unwrap();
     let e = render(&tl, 1..2, &src, &mut StriaTitleFrames::default()).unwrap_err().to_string();
-    assert!(e.contains("frame 8 missing"), "one frame kept: file 9 replaced it, so tick 1 reads its file: {e}");
-    println!("striaseqinfo: repaint of tick 1 after removing file 8 -> kept frame; after tick 2 -> {e}");
+    assert!(e.contains("frame 8 missing"), "a kept frame of a file gone from disk is not served: {e}");
+    println!("striaseqinfo: repaint of tick 1 with file 8 unreadable -> kept frame; after removing file 8 -> {e}");
 }
 
 #[test]
@@ -4211,4 +4219,86 @@ fn striaseqmore_title_only_range_takes_sequence_size() {
     assert_eq!((r.width, r.height), (16, 8), "the sequence reel's size, not TITLE_SIZE");
     assert!(sink.0.iter().all(|f| (f.1, f.2) == (16, 8)));
     println!("striaseqmore: a title-only range beside a 16x8 sequence reel renders at 16x8");
+}
+
+// ---- STRIASEQTHREE (LEDGER SR9022): sequence cache span and staleness, upright frames (named tail block) ----
+// A sequence reel keeps up to eight decoded frames (a scrub back and forth reads no file), each served only while its file's
+// `(length, modified)` stamp holds: a rewritten file is read again, a removed one is refused by name. Every decoded frame is
+// turned upright by its EXIF orientation, and a JPEG reel's size is taken upright at the add.
+
+#[test]
+fn striaseqthree_rewritten_file_is_read_again() {
+    let pat = striaimportimagesequence_dir("seqthree-rewrite", 4, 4, &[(7, [10, 10, 10])]);
+    let (tl, s) = striaimportimagesequence_tl(1);
+    let mut src = Sources::new(&tl);
+    src.add_sequence(s, &pat).unwrap();
+    let mut a = StriaTitleFrames::default();
+    render(&tl, 0..1, &src, &mut a).unwrap();
+    assert!(a.0[0].3 == striaimportimagesequence_px(4, 4, [10, 10, 10]));
+    let f = pat.replace("%04d", "0007");
+    let png = gneiss_pal::dsp::image::encode_rgba(4, 4, &striaimportimagesequence_px(4, 4, [90, 90, 90])).unwrap();
+    std::fs::write(&f, png).unwrap();
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(2);
+    std::fs::File::options().write(true).open(&f).unwrap().set_modified(later).unwrap();
+    let mut b = StriaTitleFrames::default();
+    render(&tl, 0..1, &src, &mut b).unwrap();
+    assert!(b.0[0].3 == striaimportimagesequence_px(4, 4, [90, 90, 90]), "the rewritten file is read, not the kept frame");
+    println!("striaseqthree: file 7 rewritten -> the repaint reads the new pixels");
+}
+
+#[test]
+fn striaseqthree_removed_file_is_missing() {
+    let pat = striaimportimagesequence_dir("seqthree-removed", 4, 4, &[(7, [10, 10, 10])]);
+    let (tl, s) = striaimportimagesequence_tl(1);
+    let mut src = Sources::new(&tl);
+    src.add_sequence(s, &pat).unwrap();
+    render(&tl, 0..1, &src, &mut StriaTitleFrames::default()).unwrap();
+    std::fs::remove_file(pat.replace("%04d", "0007")).unwrap();
+    let e = render(&tl, 0..1, &src, &mut StriaTitleFrames::default()).unwrap_err().to_string();
+    assert!(e.contains("frame 7 missing"), "the kept frame of a removed file is not served: {e}");
+    println!("striaseqthree: file 7 removed -> {e}");
+}
+
+#[test]
+fn striaseqthree_scrub_keeps_several_frames() {
+    use std::os::unix::fs::PermissionsExt;
+    let cols = [[200, 10, 10], [10, 200, 10], [10, 10, 200]];
+    let pat = striaimportimagesequence_dir("seqthree-scrub", 4, 4, &[(7, cols[0]), (8, cols[1]), (9, cols[2])]);
+    let (tl, s) = striaimportimagesequence_tl(3);
+    let mut src = Sources::new(&tl);
+    src.add_sequence(s, &pat).unwrap();
+    render(&tl, 0..3, &src, &mut StriaTitleFrames::default()).unwrap();
+    let files: Vec<String> = ["0007", "0008", "0009"].iter().map(|n| pat.replace("%04d", n)).collect();
+    for f in &files {
+        std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    if std::fs::read(&files[0]).is_err() {
+        for (t, c) in [2i64, 0, 1].into_iter().map(|t| (t, cols[t as usize])) {
+            let mut got = StriaTitleFrames::default();
+            render(&tl, t..t + 1, &src, &mut got).expect("every scrubbed tick is a kept frame: no file is read");
+            assert!(got.0[0].3 == striaimportimagesequence_px(4, 4, c), "tick {t} is its own kept file");
+        }
+        println!("striaseqthree: ticks 2, 0, 1 repainted from the kept frames with every file unreadable");
+    } else {
+        println!("striaseqthree: SKIP the no-read leg: a 0o000 file reads here (root); the striaseqthree_kept unit tests carry it");
+    }
+    for f in &files {
+        std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+}
+
+#[test]
+fn striaseqthree_jpeg_exif6_is_upright() {
+    let d = common::fresh_dir("striaseqthree", "exif6");
+    std::fs::write(d.join("f_0001.jpg"), include_bytes!("../../../tools/eyes/suites/facet/fixtures/photo-o6.jpg")).unwrap();
+    let pat = format!("{}/f_%04d.jpg", d.display());
+    let (tl, s) = striaimportimagesequence_tl(1);
+    let mut src = Sources::new(&tl);
+    src.add_sequence(s, &pat).unwrap();
+    assert_eq!(src.summary(s).as_deref(), Some("seq 1..=1 32x48"), "a 48x32 stored card with EXIF 6 is 32x48 upright");
+    let mut sink = StriaTitleFrames::default();
+    let r = render(&tl, 0..1, &src, &mut sink).unwrap();
+    assert_eq!((r.width, r.height), (32, 48), "the reel's size is upright");
+    assert_eq!((sink.0[0].1, sink.0[0].2), (32, 48));
+    println!("striaseqthree: photo-o6.jpg (48x32, EXIF 6) -> reel 32x48, frame 32x48");
 }
