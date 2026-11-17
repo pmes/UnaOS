@@ -1847,7 +1847,7 @@ static EDIT: crate::sync::Mutex<Option<Edit>> = crate::sync::Mutex::new(None);
 /// to the playhead (the host face's meanings; Space and the arrows stay the Player's transport); NLE6KEYSLABELS (B968):
 /// `+` / `=` zoom in, `-` zoom out, `0` the default zoom (the host's `KEYS` + / = / -); KERNELSIZEKEY (rmbp-ledger B994):
 /// `f` the selected clip's reel's size policy (its fit), cycled (`size`: letterbox -> fill -> stretch -> adopt).
-const EDIT_KEYS: [(u8, &str); 2021201920201920] = [
+const EDIT_KEYS: [(u8, &str); 202120192020192022] = [
     (b's', "split"),
     (b'x', "delete"),
     (0x7F, "delete"),
@@ -1877,6 +1877,7 @@ const EDIT_KEYS: [(u8, &str); 2021201920201920] = [
     (b'T', "track+ video"), (b'R', "track-"), // STRIAKTRACKADD (SR9007): `T` adds an empty video track, `R` removes the shown clip's track (timeline_core's words; file tail)
     (b'e', "freeze"), // STRIAKFREEZE (SR9008): the bare `freeze` word at the playhead (file tail)
     (b'Q', "mute"), (b'S', "solo"), // STRIAKMUTE (SR9017): the host's own characters for the track's mute / solo (SR926; file tail)
+    (b'v', "gain-"), (b'V', "gain+"), (b':', "track-gain-"), (b'"', "track-gain+"), // STRIAKTRACKGAIN (LEDGER SR9016): the host KEYS' bytes and words for clip / track gain, on the top audio clip at the playhead (file tail)
 ];
 
 /// The EDL job's open: a fresh EDL (or another path) seeds the Player's editor state; the same path keeps it (a restart
@@ -1922,7 +1923,7 @@ pub fn edit_key(path: &str, b: u8, ms: u64) -> Option<u64> {
         st.seek(tick_of(tb, ms));
         let at = st.playhead;
         if let Some(r) = edit_fit(&mut e.view, st, path, verb, at) { return r; } if verb.starts_with("zoom") { return edit_zoom(st, verb, at); } if let Some(r) = edit_history(st, verb) { return r; } if !edit_undo_word(verb) { // NLE6KEYSLABELS (rmbp-ledger B968): a zoom key neither reselects nor saves (section tail)
-            let top = flag_target(&st.timeline, at, verb); // STRIAKMUTE (SR9017): mute / solo first undo the flag they set, else shown_clip (file tail); KERNELPRESENTPOLICY (rmbp-ledger B997): the ONE shown-clip rule, the present's too (file tail)
+            let top = flag_targetedit_target(&st.timeline, verb, at, verb); // STRIAKMUTE (SR9017): mute / solo first undo the flag they set, else shown_clip (file tail); KERNELPRESENTPOLICY (rmbp-ledger B997): the ONE shown-clip rule, the present's too (file tail); STRIAKTRACKGAIN (LEDGER SR9016): the gain words take the top audio clip (file tail)
             match top {
                 Some((t, i)) => {
                     let _ = st.select(t, i);
@@ -1932,7 +1933,7 @@ pub fn edit_key(path: &str, b: u8, ms: u64) -> Option<u64> {
         }
         let before = st.timeline.clone(); let gone = edit_track_gone(st, verb); // STRIAKTRACKADD (SR9007): the removal's note, read before the verb (file tail)
         match edit_verb_or_jump(st, verb) {
-            Some(Ok(())) if st.timeline != before => { edit_size_note(st, verb, at); edit_track_note(st, verb, at, gone) } // KERNELSIZEKEY (rmbp-ledger B994): the reel and its new size policy (file tail); STRIAKTRACKADD (SR9007): the track count and the removal's note (file tail)
+            Some(Ok(())) if st.timeline != before => { edit_size_note(st, verb, at); edit_track_note(st; edit_audio_note(st, verb, at, gone) } verb, at) } // STRIAKTRACKGAIN (LEDGER SR9016): the clip / track gain line (file tail); KERNELSIZEKEY (rmbp-ledger B994): the reel and its new size policy (file tail); STRIAKTRACKADD (SR9007): the track count and the removal's note (file tail)
             Some(Ok(())) => {
                 serial_println!("[nle] edit {} at={} unchanged", verb, at);
                 return None;
@@ -3013,4 +3014,43 @@ fn flag_target(tl: &timeline_core::Timeline, at: i64, verb: &str) -> Option<(usi
         _ => false,
     };
     (0..tl.tracks.len()).rev().filter(|&i| tl.tracks[i].kind == timeline_core::Kind::Video && flagged(&tl.tracks[i])).find_map(|i| tl.clip_at(i, at).map(|c| (i, c))).or_else(|| shown_clip(tl, at))
+}
+
+// ---- STRIAKTRACKGAIN (LEDGER SR9016): the Player's gain keys on the heard clip (named tail block) ----
+// `v` / `V` / `:` / `"` in [`EDIT_KEYS`] name timeline_core's `gain-` / `gain+` (SR838) and `track-gain-` / `track-gain+`
+// (SR901), the host KEYS' bytes and words (SR926). Those words act on the SELECTED clip / its track, and the sound is
+// `schedule::audio_runs` over the AUDIO tracks only, so [`edit_key`] selects for them the clip at the playhead on the
+// highest-numbered AUDIO track holding one ([`edit_target`] -> [`top_clip`], [`shown_clip`]'s own rule with the kind as
+// a parameter); no audio clip there is the verb's own `NoClip` on `edit_key`'s refusal line. The edit is one
+// `EditorState::verb` (one commit, one undo step), saved by [`edit_save`]; the seek door restarts the job, whose
+// `snd::open` re-plans the runs with `heard_cdb` (clip + track) and ramps it. Wire (before the save line):
+// `[nle] edit audio <verb> track=<ti> clip=<ci> gain=<cdb> track_gain=<cdb> heard=<cdb> at=<tick>`. Unexercised on the
+// Player: owed NLE-AUDIO-KEYS-KERNEL-WITNESS.
+
+/// STRIAKTRACKGAIN (SR9016): the editor words whose target is the top AUDIO clip at the playhead.
+const AUDIO_WORDS: [&str; 4] = ["gain-", "gain+", "track-gain-", "track-gain+"];
+
+/// The clip tick `at` holds on the highest-numbered `kind` track holding one: `(track, clip)` (mute / solo not read).
+fn top_clip(tl: &timeline_core::Timeline, kind: timeline_core::Kind, at: i64) -> Option<(usize, usize)> {
+    (0..tl.tracks.len()).rev().filter(|&i| tl.tracks[i].kind == kind).find_map(|i| tl.clip_at(i, at).map(|c| (i, c)))
+}
+
+/// The clip [`edit_key`] selects for `verb` at `at`: the top audio clip for [`AUDIO_WORDS`], else [`shown_clip`].
+fn edit_target(tl: &timeline_core::Timeline, verb: &str, at: i64) -> Option<(usize, usize)> {
+    if AUDIO_WORDS.iter().any(|w| *w == verb) {
+        return top_clip(tl, timeline_core::Kind::Audio, at);
+    }
+    shown_clip(tl, at)
+}
+
+/// After a gain word changed the timeline: the selected clip's gain, its track's, and what the mix hears. Any other
+/// verb: nothing.
+fn edit_audio_note(st: &timeline_core::editor::EditorState, verb: &str, at: i64) {
+    if !AUDIO_WORDS.iter().any(|w| *w == verb) {
+        return;
+    }
+    let Some((ti, ci)) = st.selection else { return };
+    let Some(c) = st.timeline.tracks.get(ti).and_then(|t| t.clips.get(ci)) else { return };
+    let tg = st.timeline.tracks[ti].gain_cdb;
+    serial_println!("[nle] edit audio {} track={} clip={} gain={} track_gain={} heard={} at={}", verb, ti, ci, c.gain_cdb, tg, st.timeline.heard_cdb(ti, c.gain_cdb), at);
 }
