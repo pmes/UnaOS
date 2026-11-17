@@ -543,6 +543,7 @@ fn expand(prop: &str, v: &[CV]) -> Result<Vec<(String, String)>, ()> {
             let kw = |b: bool| (if b { "auto" } else { "none" }).to_string();
             Ok([("font-synthesis-weight", w), ("font-synthesis-style", s), ("font-synthesis-small-caps", c)].into_iter().filter_map(|(p, b)| Some((p.to_string(), kw(b?)))).collect())
         }
+        "border-image" => expand_border_image(v).map(Vec::from),
         "word-wrap" => normalize_value("overflow-wrap", v).map(|x| vec![("overflow-wrap".into(), x)]).ok_or(()),
         _ => normalize_value(prop, v).map(|x| vec![(prop.to_string(), x)]).ok_or(()),
     }
@@ -651,6 +652,7 @@ fn serialize_shorthand(block: &Block, sh: &str) -> Option<(String, bool)> {
             }
             if color == "transparent" { "none".to_string() } else { color.to_string() }
         }
+        "border-image" => border_image_serialize(&vals)?,
         _ => return None,
     };
     Some((s, important))
@@ -2129,8 +2131,7 @@ top>inset";
     }
 
     /// expand knows every table shorthand and no other: (a) each row's shorthand expands to exactly its longhands
-    /// under some probe value (`border-image` has no expand arm: its value falls through to opaque storage, owed
-    /// AETHER-CSSOM-BORDER-IMAGE-EXPAND); (b) a PROPERTIES name whose expansion names any other property is a row
+    /// under some probe value; (b) a PROPERTIES name whose expansion names any other property is a row
     /// or `word-wrap` (expand's overflow-wrap alias).
     #[test]
     fn shorthand_table_matches_expand() {
@@ -2139,14 +2140,7 @@ top>inset";
             let hit = PROBES.iter().any(|v| {
                 expand_str(sh, v).is_ok_and(|pairs| pairs.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>() == want)
             });
-            if *sh == "border-image" {
-                assert!(!hit, "border-image gained an expand arm: retire AETHER-CSSOM-BORDER-IMAGE-EXPAND");
-                let pairs = expand_str(sh, "none").unwrap();
-                assert_eq!(pairs.len(), 1);
-                assert_eq!(pairs[0].0, "border-image", "the fallthrough stores the shorthand opaquely");
-            } else {
-                assert!(hit, "{sh} expands to its table longhands");
-            }
+            assert!(hit, "{sh} expands to its table longhands");
         }
         for p in PROPERTIES {
             for v in PROBES {
@@ -2197,5 +2191,266 @@ fn font_variant_caps_computed(el: usize) -> String {
     match used {
         Some(c) => c.word().to_string(),
         None => cascaded_value(el, "font-variant-caps").unwrap_or_else(|| "normal".to_string()),
+    }
+}
+
+// ---- AETHERCSSOMBORDERIMAGEEXPAND (LEDGER SR1030): border-image shorthand expand + serialize (named tail block) ----
+
+/// AETHERCSSOMBORDERIMAGEEXPAND (SR1030): css-backgrounds-3 §6.6 `border-image: <source> || <slice> [ / <width> |
+/// / <width>? / <outset> ]? || <repeat>` into its five longhands in [`BORDER_IMAGE`] order; an omitted part takes its
+/// initial value (`none`, `100%`, `1`, `0`, `stretch`). `Err` drops the declaration. The CSS-wide keywords and `var()`
+/// never reach here ([`expand`]'s guards). layout_core reads no border-image (owed AETHER-BORDER-IMAGE-PAINT).
+fn expand_border_image(v: &[CV]) -> Result<[(String, String); 5], ()> {
+    const REPEATS: [&str; 4] = ["stretch", "repeat", "round", "space"];
+    let parts = split_values(v);
+    if parts.is_empty() {
+        return Err(());
+    }
+    let num = |c: &CV| match c {
+        CV::Token(Token::Number(n)) if n.value >= 0.0 => {
+            let mut s = String::new();
+            css_core::serialize::number(n, &mut s);
+            Some(s)
+        }
+        _ => None,
+    };
+    let num_or_pct = |c: &CV| match c {
+        CV::Token(Token::Percentage(n)) if n.value >= 0.0 => {
+            let mut s = String::new();
+            css_core::serialize::number(n, &mut s);
+            s.push('%');
+            Some(s)
+        }
+        _ => num(c),
+    };
+    let negative = |c: &CV| matches!(c, CV::Token(Token::Dimension(n, _)) | CV::Token(Token::Percentage(n)) if n.value < 0.0);
+    let width_tok = |c: &CV| -> Option<String> {
+        if let Some(s) = num(c) {
+            return Some(s);
+        }
+        if ident_of(c).is_some_and(|i| i.eq_ignore_ascii_case("auto")) {
+            return Some("auto".into());
+        }
+        if negative(c) {
+            return None;
+        }
+        normalize_length_token("border-image-width", c)
+    };
+    let outset_tok = |c: &CV| -> Option<String> {
+        if let Some(s) = num(c) {
+            return Some(s);
+        }
+        if negative(c) || matches!(c, CV::Token(Token::Percentage(_))) {
+            return None;
+        }
+        normalize_length_token("border-image-outset", c)
+    };
+    let is_slash = |c: &CV| matches!(c, CV::Token(Token::Delim('/')));
+    let is_image = |c: &CV| match c {
+        CV::Token(Token::Url(_)) => true,
+        CV::Function(name, _) => {
+            let l = name.to_ascii_lowercase();
+            matches!(l.as_str(), "url" | "image" | "image-set" | "cross-fade" | "element") || l.ends_with("gradient")
+        }
+        _ => false,
+    };
+    let quad = |xs: &[String]| four(xs).map(|q| four_serialize([q[0].as_str(), q[1].as_str(), q[2].as_str(), q[3].as_str()]));
+    let (mut source, mut slice, mut width, mut outset, mut repeat): (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = (None, None, None, None, None);
+    let mut i = 0;
+    while i < parts.len() {
+        let c = &parts[i];
+        let id = ident_of(c).map(|s| s.to_ascii_lowercase());
+        if source.is_none() && (is_image(c) || id.as_deref() == Some("none")) {
+            source = Some(if is_image(c) { serialize_generic("border-image-source", std::slice::from_ref(c)) } else { "none".into() });
+            i += 1;
+        } else if repeat.is_none() && id.as_deref().is_some_and(|k| REPEATS.contains(&k)) {
+            let mut ks: Vec<String> = Vec::new();
+            while i < parts.len() && ks.len() < 2 {
+                match ident_of(&parts[i]).map(|s| s.to_ascii_lowercase()) {
+                    Some(k) if REPEATS.contains(&k.as_str()) => {
+                        ks.push(k);
+                        i += 1;
+                    }
+                    _ => break,
+                }
+            }
+            if ks.len() == 2 && ks[0] == ks[1] {
+                ks.pop();
+            }
+            repeat = Some(ks.join(" "));
+        } else if slice.is_none() && (num_or_pct(c).is_some() || id.as_deref() == Some("fill")) {
+            // `[<number> | <percentage>]{1,4} && fill?`: `fill` once, before or after the numbers.
+            let mut fill = false;
+            let mut vals: Vec<String> = Vec::new();
+            while i < parts.len() {
+                let t = &parts[i];
+                if !fill && ident_of(t).is_some_and(|k| k.eq_ignore_ascii_case("fill")) {
+                    fill = true;
+                    i += 1;
+                    if !vals.is_empty() {
+                        break;
+                    }
+                } else if vals.len() < 4 && num_or_pct(t).is_some() {
+                    vals.push(num_or_pct(t).unwrap());
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            if vals.is_empty() {
+                return Err(());
+            }
+            slice = Some(format!("{}{}", quad(&vals[..]).ok_or(())?, if fill { " fill" } else { "" }));
+            // `[ / <width> | / <width>? / <outset> ]?`
+            if i < parts.len() && is_slash(&parts[i]) {
+                i += 1;
+                let mut ws: Vec<String> = Vec::new();
+                while i < parts.len() && ws.len() < 4 {
+                    match width_tok(&parts[i]) {
+                        Some(s) => {
+                            ws.push(s);
+                            i += 1;
+                        }
+                        None => break,
+                    }
+                }
+                if i < parts.len() && is_slash(&parts[i]) {
+                    i += 1;
+                    let mut os: Vec<String> = Vec::new();
+                    while i < parts.len() && os.len() < 4 {
+                        match outset_tok(&parts[i]) {
+                            Some(s) => {
+                                os.push(s);
+                                i += 1;
+                            }
+                            None => break,
+                        }
+                    }
+                    if os.is_empty() {
+                        return Err(());
+                    }
+                    outset = Some(quad(&os[..]).ok_or(())?);
+                } else if ws.is_empty() {
+                    return Err(());
+                }
+                if !ws.is_empty() {
+                    width = Some(quad(&ws[..]).ok_or(())?);
+                }
+            }
+        } else {
+            return Err(());
+        }
+    }
+    let vals = [
+        source.unwrap_or_else(|| "none".into()),
+        slice.unwrap_or_else(|| "100%".into()),
+        width.unwrap_or_else(|| "1".into()),
+        outset.unwrap_or_else(|| "0".into()),
+        repeat.unwrap_or_else(|| "stretch".into()),
+    ];
+    let mut it = vals.into_iter();
+    Ok(BORDER_IMAGE.map(|p| (p.to_string(), it.next().unwrap())))
+}
+
+/// SR1030: Blink's `border-image` serialization from the five stored longhands, initial parts omitted: the slice is
+/// written while any of slice / width / outset is non-initial, an omitted width keeps its `/` slot before an outset
+/// (`30 / / 5px`); every part initial reads `none`.
+fn border_image_serialize(vals: &[&str]) -> Option<String> {
+    let [src, slice, width, outset, repeat] = vals else { return None };
+    let (w0, o0) = (*width == "1", *outset == "0");
+    let mut out: Vec<String> = Vec::new();
+    if *src != "none" {
+        out.push(src.to_string());
+    }
+    if *slice != "100%" || !w0 || !o0 {
+        out.push(slice.to_string());
+    }
+    if !w0 || !o0 {
+        out.push(if w0 { "/".to_string() } else { format!("/ {width}") });
+    }
+    if !o0 {
+        out.push(format!("/ {outset}"));
+    }
+    if *repeat != "stretch" {
+        out.push(repeat.to_string());
+    }
+    Some(if out.is_empty() { "none".to_string() } else { out.join(" ") })
+}
+
+#[cfg(test)]
+mod border_image_tests {
+    use super::*;
+
+    /// The five longhands `css` leaves in a parsed block, in [`BORDER_IMAGE`] order.
+    fn five(css: &str) -> Vec<String> {
+        let b = Block::parse(css);
+        BORDER_IMAGE.iter().map(|p| b.get(p)).collect()
+    }
+
+    #[test]
+    fn border_image_chromium_case() {
+        let css = "border-image: url(a.png) 30 / 10px round";
+        assert_eq!(five(css), ["url(\"a.png\")", "30", "10px", "0", "round"]);
+        assert_eq!(Block::parse(css).get("border-image"), "url(\"a.png\") 30 / 10px round");
+    }
+
+    #[test]
+    fn border_image_none_takes_the_initials() {
+        assert_eq!(five("border-image: none"), ["none", "100%", "1", "0", "stretch"]);
+        assert_eq!(Block::parse("border-image: none").get("border-image"), "none");
+    }
+
+    #[test]
+    fn border_image_source_alone() {
+        assert_eq!(five("border-image: url(a.png)"), ["url(\"a.png\")", "100%", "1", "0", "stretch"]);
+        assert_eq!(Block::parse("border-image: url(a.png)").get("border-image"), "url(\"a.png\")");
+    }
+
+    #[test]
+    fn border_image_every_part() {
+        let css = "border-image: 30 fill / 10px 20px / 5px space";
+        assert_eq!(five(css), ["none", "30 fill", "10px 20px", "5px", "space"]);
+        assert_eq!(Block::parse(css).get("border-image"), "30 fill / 10px 20px / 5px space");
+    }
+
+    #[test]
+    fn border_image_omitted_width_keeps_its_slot() {
+        let css = "border-image: 30 / / 5px";
+        assert_eq!(five(css), ["none", "30", "1", "5px", "stretch"]);
+        assert_eq!(Block::parse(css).get("border-image"), "30 / / 5px");
+    }
+
+    #[test]
+    fn border_image_css_wide_reaches_the_five() {
+        assert_eq!(five("border-image: inherit"), ["inherit"; 5]);
+        assert_eq!(Block::parse("border-image: inherit").get("border-image"), "inherit");
+    }
+
+    #[test]
+    fn border_image_invalid_is_dropped() {
+        for bad in ["10px 10px 10px 10px 10px 10px", "30 /", "round round round", "fill", "30 / 10px /"] {
+            assert!(Block::parse(&format!("border-image: {bad}")).decls.is_empty(), "{bad} is dropped");
+        }
+    }
+
+    #[test]
+    fn border_image_longhands_round_trip() {
+        let b = Block::parse(
+            "border-image-source: url(a.png); border-image-slice: 30; border-image-width: 10px; border-image-outset: 0; border-image-repeat: round",
+        );
+        assert_eq!(b.serialize(), "border-image: url(\"a.png\") 30 / 10px round;");
+    }
+
+    #[test]
+    fn border_image_keeps_the_border_reset_guard() {
+        let b = Block::parse("border: 1px solid red; border-image: url(a.png) 30");
+        assert_eq!(b.get("border"), "");
+        assert_eq!(b.serialize(), "border-width: 1px; border-style: solid; border-color: red; border-image: url(\"a.png\") 30;");
     }
 }
