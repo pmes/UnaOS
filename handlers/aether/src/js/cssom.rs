@@ -61,10 +61,10 @@ pub const PROPERTIES: &[&str] = &[
     "resize", "right", "rotate", "row-gap", "scale", "scroll-behavior", "stroke", "stroke-width", "tab-size",
     "table-layout", "text-align", "text-align-last", "text-decoration", "text-decoration-color",
     "text-decoration-line", "text-decoration-style", "text-decoration-thickness", "text-indent",
-    "text-overflow", "text-rendering", "text-shadow", "text-transform", "text-underline-offset", "top",
+    "text-overflow", "text-rendering", "text-shadow", "text-transform", "text-underline-offset", "text-wrap", "text-wrap-mode", "top",
     "touch-action", "transform", "transform-origin", "transform-style", "transition", "transition-delay",
     "transition-duration", "transition-property", "transition-timing-function", "translate", "unicode-bidi",
-    "user-select", "vertical-align", "visibility", "white-space", "widows", "width", "will-change",
+    "user-select", "vertical-align", "visibility", "white-space", "white-space-collapse", "widows", "width", "will-change",
     "word-break", "word-spacing", "word-wrap", "writing-mode", "z-index", "zoom",
 ];
 
@@ -2104,7 +2104,7 @@ top>inset";
         }
         assert_eq!(keys, SHORTHANDS.len(), "every old shorthand is a table row and no more");
         let names = universe();
-        assert_eq!(names.len(), 243) /* SR800 fold: + font-variant-caps */;
+        assert_eq!(names.len(), 246) /* SR800 fold: + font-variant-caps; SR1109: + text-wrap, text-wrap-mode, white-space-collapse */;
         for p in &names {
             let want = if FIXED.contains(&p.as_str()) { Vec::new() } else { old_of.get(p.as_str()).cloned().unwrap_or_default() };
             assert_eq!(shorthands_of(p), want, "shorthands_of({p})");
@@ -2452,5 +2452,51 @@ mod border_image_tests {
         let b = Block::parse("border: 1px solid red; border-image: url(a.png) 30");
         assert_eq!(b.get("border"), "");
         assert_eq!(b.serialize(), "border-width: 1px; border-style: solid; border-color: red; border-image: url(\"a.png\") 30;");
+    }
+}
+
+// ---- AETHERCSSOMWHITESPACELONGHANDSACCESSOR (LEDGER SR1109): css-text-4's white-space longhands as CSSStyleDeclaration accessors (named tail block) ----
+
+/// AETHERCSSOMWHITESPACELONGHANDSACCESSOR (SR1109): `white-space-collapse`, `text-wrap-mode` and `text-wrap` are PROPERTIES
+/// names, so `install`'s table loop gives them camelCase and dashed accessors through `prop_from_attr` (no accessor code).
+#[cfg(test)]
+mod white_space_longhands_accessor_tests {
+    use super::*;
+
+    const NAMES: [(&str, &str); 3] =
+        [("white-space-collapse", "whiteSpaceCollapse"), ("text-wrap-mode", "textWrapMode"), ("text-wrap", "textWrap")];
+
+    /// PROPERTIES stays strictly sorted (and so free of duplicates): every insert lands in place.
+    #[test]
+    fn cssom_white_space_longhands_accessor_properties_sorted() {
+        assert!(PROPERTIES.windows(2).all(|w| w[0] < w[1]), "PROPERTIES is strictly sorted");
+    }
+
+    /// Each name is a PROPERTIES entry whose camelCase accessor maps back to it.
+    #[test]
+    fn cssom_white_space_longhands_accessor_names_round_trip() {
+        for (dashed, cc) in NAMES {
+            assert!(PROPERTIES.contains(&dashed), "{dashed} in PROPERTIES");
+            assert_eq!(camel(dashed), cc, "camel({dashed})");
+            assert_eq!(prop_from_attr(cc), dashed, "prop_from_attr({cc})");
+        }
+    }
+
+    /// None is a SHORTHANDS row or a longhand of one (the white-space / text-wrap rows are owed).
+    #[test]
+    fn cssom_white_space_longhands_accessor_no_shorthand() {
+        for (dashed, _) in NAMES {
+            assert!(shorthands_of(dashed).is_empty(), "shorthands_of({dashed})");
+            assert!(longhands(dashed).is_none(), "longhands({dashed})");
+        }
+    }
+
+    /// The declaration block stores and serializes the longhand as written.
+    #[test]
+    fn cssom_white_space_longhands_accessor_block_serializes() {
+        let mut b = Block::parse("");
+        assert!(b.set("white-space-collapse", &css_core::parser::parse_component_values("preserve"), false));
+        assert_eq!(b.get("white-space-collapse"), "preserve");
+        assert_eq!(b.serialize(), "white-space-collapse: preserve;");
     }
 }
