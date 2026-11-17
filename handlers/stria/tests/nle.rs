@@ -3905,3 +3905,60 @@ fn strianormalize_peak_of_reads_the_audio_road() {
     assert_eq!(&stria::nle_face::VERBS[n - 2..], &["normalize", "help"]);
     println!("strianormalize: peak_of whole={got} part={part} table max={top}");
 }
+
+// ---- STRIANORMALIZEMORE (LEDGER SR963): `normalize ... tp` against the true (oversampled) peak (named tail block) ----
+
+/// Rule: `up_peak` through the mix's one Sinc at 4x reads the inter-sample peak a sample peak misses: a 48 kHz sine at
+/// fs / 4 and 45 degrees has every sample at +-0.7071 while the band-limited wave reaches 1.0.
+#[test]
+fn strianormalizemore_up_peak_reads_the_inter_sample_peak() {
+    let pcm: Vec<f32> = (0..4800).map(|n| (std::f64::consts::FRAC_PI_2 * n as f64 + std::f64::consts::FRAC_PI_4).sin() as f32).collect();
+    let sample = pcm.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+    assert!((sample - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-3, "{sample}");
+    let os = stria::nle::TRUE_PEAK_OS;
+    let mut s = gneiss_pal::dsp::audio::resample::Sinc::new(48_000, 48_000 * os, 1);
+    let tp = stria::nle::up_peak(&mut s, 1, &pcm, false).max(stria::nle::up_peak(&mut s, 1, &[], true));
+    assert!(tp > 0.95 && tp < 1.2, "true peak {tp} vs sample peak {sample}");
+    println!("strianormalizemore: fs/4 at 45 deg sample={sample} true={tp}");
+}
+
+/// Rule: `peak_over(.., 1)` is SR878's `peak_of` exactly; at `TRUE_PEAK_OS` it is never below it and within 3 dB of it on
+/// synth source A (whole and the 13..33 part).
+#[test]
+fn strianormalizemore_peak_over_extends_peak_of() {
+    let (tl, src) = stria::nle_face::synth_fixture();
+    let a = tl.source_by_reel("A").unwrap().id;
+    for (t0, t1) in [(0i64, 50i64), (13, 33)] {
+        let ns = tl.tb.to_ns(t0)..tl.tb.to_ns(t1);
+        let p = stria::nle::peak_of(&src, a, ns.clone()).unwrap().unwrap();
+        assert_eq!(stria::nle::peak_over(&src, a, ns.clone(), 1).unwrap().unwrap(), p);
+        let tp = stria::nle::peak_over(&src, a, ns, stria::nle::TRUE_PEAK_OS).unwrap().unwrap();
+        assert!(tp >= p && tp <= p * 1.4126, "{t0}..{t1}: true {tp} vs sample {p}");
+        println!("strianormalizemore: {t0}..{t1} sample={p} true={tp}");
+    }
+}
+
+/// Rule: `normalize tp` / `normalize -3 tp` / `normalize tp -3` set `normalize_gain_cdb(true peak, target)` in ONE undo
+/// step with a `true peak` line; the token is filtered before the level, so `normalize tp x` refuses `x` by name.
+#[test]
+fn strianormalizemore_normalize_tp_sets_gain_from_the_true_peak() {
+    for (w, target) in [("normalize tp", -100), ("normalize -3 tp", -300), ("normalize tp -3", -300)] {
+        let (mut face, a) = strianormalize_face();
+        let c = face.state.selected().unwrap();
+        let tb = face.state.timeline.tb;
+        let (_, src) = stria::nle_face::synth_fixture();
+        let tp = stria::nle::peak_over(&src, a, tb.to_ns(c.src_in)..tb.to_ns(c.src_out), stria::nle::TRUE_PEAK_OS).unwrap().unwrap();
+        let want = stria::nle_face::normalize_gain_cdb(tp, target).unwrap();
+        let depth = face.state.undo_depth();
+        assert!(face.verb(w), "{w}");
+        assert_eq!(face.state.selected().unwrap().gain_cdb, want, "{w}");
+        assert_eq!(face.state.undo_depth(), depth + 1, "{w}: one undo step");
+        let peak_cdb = (2000.0 * (tp as f64).log10()).round() as i32;
+        let line = format!("normalize: true peak {} -> gain {}", stria::nle_face::db_words(peak_cdb), stria::nle_face::db_words(want));
+        assert_eq!(face.last_error.take(), Some(line), "{w}");
+    }
+    let (mut face, _) = strianormalize_face();
+    assert!(face.verb("normalize tp x"));
+    assert_eq!(face.last_error.take(), Some("normalize: x is not a dBFS level".to_string()));
+    assert_eq!(face.state.selected().unwrap().gain_cdb, 0, "a refusal leaves the timeline");
+}

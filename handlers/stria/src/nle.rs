@@ -1024,12 +1024,27 @@ pub fn scan_peaks(sources: &Sources, id: SourceId, per_sec: u32) -> Result<Optio
 /// hole is silence). `Ok(None)`: the source has no audio stream. The face's `normalize` word reads it (SR827's u8 table
 /// clamps at 1.0, rounds to nearest and straddles the clip's edges, so it cannot set a peak target).
 pub fn peak_of(sources: &Sources, id: SourceId, ns: std::ops::Range<i64>) -> Result<Option<f32>, RenderError> {
+    peak_over(sources, id, ns, 1) // STRIANORMALIZEMORE (SR963): the body moved to `peak_over` (file tail); os 1 is the sample peak
+}
+
+// ---- STRIANORMALIZEMORE (LEDGER SR963): the true (inter-sample) peak through the mix's one resampler (named tail block) ----
+
+/// STRIANORMALIZEMORE (SR963): the oversampling factor of `normalize ... tp` (ITU-R BS.1770 Annex 2's 4x at 48 kHz).
+pub const TRUE_PEAK_OS: u32 = 4;
+
+/// STRIANORMALIZEMORE (SR963): SR878's [`peak_of`] loop (moved here, not copied), with `os` > 1 also streaming the same
+/// chunks through ONE `resample::Sinc` (NLE4B's windowed sinc, the mix's own resampler) at `rate * os` and taking the
+/// larger of the sample peak and the oversampled peak, so the true peak is never below the sample peak. `os` 1 is
+/// exactly SR878's sample peak. The converter's history pre-rolls silence at the range start, so an edge can only
+/// over-read (a normalize lands lower, never above its target).
+pub fn peak_over(sources: &Sources, id: SourceId, ns: std::ops::Range<i64>, os: u32) -> Result<Option<f32>, RenderError> {
     let m = sources.get(id)?;
     let Some(i) = m.audio else { return Ok(None) };
     let ch = m.demux.tracks()[i].channels.max(1);
     let key = sources.keyframe_ns(id, Kind::Audio, ns.start.max(0)).ok_or(RenderError::NoStream(id, Kind::Audio))?;
     let mut a = Aud::open(m, id, key, ch)?;
     let rate = a.rate.max(1);
+    let mut up = (os > 1).then(|| resample::Sinc::new(rate, rate.saturating_mul(os), ch as usize));
     let (s0, s1) = (samples(ns.start.max(0), rate), samples(ns.end.max(0), rate));
     let mut peak = 0.0f32;
     let mut at = s0;
@@ -1044,7 +1059,37 @@ pub fn peak_of(sources: &Sources, id: SourceId, ns: std::ops::Range<i64>) -> Res
             let v = if x < 0.0 { -x } else { x };
             if v > m { v } else { m }
         });
+        if let Some(s) = up.as_mut() {
+            peak = peak.max(up_peak(s, ch as usize, &pcm, false));
+        }
         at += n;
     }
+    if let Some(s) = up.as_mut() {
+        peak = peak.max(up_peak(s, ch as usize, &[], true));
+    }
     Ok(Some(peak))
+}
+
+/// STRIANORMALIZEMORE (SR963): the largest |sample| `s` yields for `pcm` (whole interleaved frames of `ch` channels, the
+/// converter's own count), every output that did not fit one buffer drained by calling again; `end` flushes the stream
+/// instead (`pcm` unused; the window's lookahead is silence). NaN ignored.
+pub fn up_peak(s: &mut resample::Sinc, ch: usize, pcm: &[f32], end: bool) -> f32 {
+    let ch = ch.max(1);
+    let (from, to) = s.rates();
+    let room = (pcm.len() / ch) * (to as usize).div_ceil(from.max(1) as usize) + 64;
+    let mut buf = vec![0.0f32; room * ch];
+    let mut peak = 0.0f32;
+    let mut input = pcm;
+    loop {
+        let made = if end { s.flush(&mut buf) } else { s.process(input, &mut buf).1 };
+        input = &[];
+        peak = buf[..made * ch].iter().fold(peak, |m, &x| {
+            let v = if x < 0.0 { -x } else { x };
+            if v > m { v } else { m }
+        });
+        if made < room {
+            break;
+        }
+    }
+    peak
 }

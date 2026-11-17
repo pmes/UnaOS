@@ -3204,14 +3204,14 @@ impl Face {
     fn normalize_verb(&mut self, v: &str) -> Option<bool> {
         let mut w = v.split_ascii_whitespace();
         w.next().filter(|w| *w == "normalize")?;
-        let (arg, extra) = (w.next(), w.next());
-        self.last_error = Some(match self.normalize(arg, extra) {
+        let toks: Vec<&str> = w.collect(); let os = if toks.contains(&"tp") { crate::nle::TRUE_PEAK_OS } else { 1 }; let mut rest = toks.into_iter().filter(|t| *t != "tp"); let (arg, extra) = (rest.next(), rest.next()); // STRIANORMALIZEMORE (SR963): a `tp` token measures the true (oversampled) peak (file tail)
+        self.last_error = Some(match self.normalize(arg, extra, os) {
             Ok(line) | Err(line) => format!("normalize: {line}"),
         });
         Some(true)
     }
     /// The rule behind [`Face::normalize_verb`]: `Ok` the success line, `Err` the refusal (the timeline unmoved).
-    fn normalize(&mut self, arg: Option<&str>, extra: Option<&str>) -> Result<String, String> {
+    fn normalize(&mut self, arg: Option<&str>, extra: Option<&str>, os: u32) -> Result<String, String> {
         if let Some(x) = extra {
             return Err(format!("{x} is not a dBFS level"));
         }
@@ -3228,13 +3228,13 @@ impl Face {
             return Err("not an audio clip".to_string());
         }
         let tb = self.state.timeline.tb;
-        let peak = crate::nle::peak_of(&self.sources, c.src, tb.to_ns(c.src_in)..tb.to_ns(c.src_out))
+        let peak = crate::nle::peak_over(&self.sources, c.src, tb.to_ns(c.src_in)..tb.to_ns(c.src_out), os)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "no audio".to_string())?;
         let cdb = normalize_gain_cdb(peak, target).ok_or_else(|| "silent clip".to_string())?;
         self.state.set_selected_gain(cdb).map_err(|e| e.to_string())?;
         let peak_cdb = (2000.0 * (peak as f64).log10()).round() as i32;
-        Ok(format!("peak {} -> gain {}", db_words(peak_cdb), db_words(cdb)))
+        Ok(format!("{} {} -> gain {}", if os > 1 { "true peak" } else { "peak" }, db_words(peak_cdb), db_words(cdb)))
     }
 }
 
