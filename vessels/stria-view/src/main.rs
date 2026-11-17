@@ -114,7 +114,7 @@ fn load(c: &Cli) -> (Timeline, Sources) {
     let Some(path) = c.edl.as_deref() else { return nle_face::synth_fixture() };
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| die(format!("{path}: {e}")));
     let tl = edl::parse(&text, c.fps).unwrap_or_else(|e| die(format!("{path}: {e}")));
-    let mut sources = Sources::new(&tl);
+    let mut sources = Sources::new(&tl); if c.peak_cache { if let Some(d) = stria::nle::peak_user_dir(std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME")) { stria::nle::prune_peak_dir(&d, stria::nle::PEAK_DIR_BUDGET); } } // STRIAWAVECACHEPRUNE (SR9123): the per-user peak dir pruned once at start (nle.rs file tail)
     for s in &tl.sources {
         let Some((_, p)) = c.srcs.iter().find(|(r, _)| *r == s.reel) else { die(format!("no --src for reel {}", s.reel)) };
         let bytes = std::fs::read(p).unwrap_or_else(|e| die(format!("{p}: {e}")));

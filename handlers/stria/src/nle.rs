@@ -1056,7 +1056,7 @@ impl Sources {
         let (file, size, mtime) = self.peak_stamp(id)?;
         let dir_file = self.peak_dir_file(&file); // STRIAWAVECACHEPREF (SR9098): beside the media first, then the per-user dir; the first that PARSES wins
         let (file, p) = core::iter::once(file).chain(dir_file).find_map(|f| std::fs::read(&f).ok().and_then(|b| peak_file_parse(&b, size, mtime, per_sec)).map(|p| (f, p)))?;
-        log::debug!("[nle] peak cache hit {}", file.display());
+        self.peak_dir_touch(&file); log::debug!("[nle] peak cache hit {}", file.display()); // STRIAWAVECACHEPRUNE (SR9123): a dir-file hit is a use (LRU clock = mtime) (file tail)
         Some(p)
     }
     /// STRIAWAVEMULTI (SR9071): write source `id`'s table beside its media (no path noted: nothing).
@@ -1164,4 +1164,78 @@ pub fn peak_user_dir(xdg_cache: Option<std::ffi::OsString>, home: Option<std::ff
 /// STRIAWAVECACHEPREF (SR9098): FNV-1a 64 over `bytes` (the cache file's name for a media path).
 pub fn peak_path_hash(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x0000_0100_0000_01b3))
+}
+
+// ---- STRIAWAVECACHEPRUNE (LEDGER SR9123): the per-user peak dir pruned least-recently-used to a byte budget (named tail block) ----
+// SR9098's per-user dir was written by `peak_file_write`'s fallback and never pruned. A face that turns the cache on calls
+// [`prune_peak_dir`] ONCE at start (stria-view `load`, with [`peak_user_dir`] and [`PEAK_DIR_BUDGET`]): it lists ONLY the
+// regular `*.una-peaks` files directly in that dir (no symlink followed, no recursion, nothing beside the media), and the
+// pure [`peak_prune_pick`] chooses the least recently used to delete until the rest fit the budget. The LRU clock is the
+// dir file's mtime: `peak_file_write` sets it, and a dir-file hit sets it to now ([`Sources::peak_dir_touch`]); the
+// cache stamp is the MEDIA's size / mtime inside the file, so a touch never invalidates it. No lock: the prune runs before
+// the face wraps `Sources`; a file pruned under a racing reader is a miss (rescan). gneiss_pal api/http.rs `DiskCache` is
+// the shape (mtime = last use, touch on hit). Owed: NLE-WAVEFORM-CACHE-BUDGET-PREF (the budget is this constant).
+
+/// STRIAWAVECACHEPRUNE (SR9123): the per-user peak dir's byte budget (64 MiB).
+pub const PEAK_DIR_BUDGET: u64 = 64 << 20;
+
+/// STRIAWAVECACHEPRUNE (SR9123): the files to delete from a listing `files[i] = (bytes, last_use)` so the kept total is
+/// at most `budget`: least recently used first (ties: the lower index first). Within budget: none.
+pub fn peak_prune_pick(files: &[(u64, u64)], budget: u64) -> Vec<usize> {
+    let mut total: u64 = files.iter().map(|f| f.0).sum();
+    let mut order: Vec<usize> = (0..files.len()).collect();
+    order.sort_by_key(|&i| (files[i].1, i));
+    let mut out = Vec::new();
+    for i in order {
+        if total <= budget {
+            break;
+        }
+        total -= files[i].0;
+        out.push(i);
+    }
+    out
+}
+
+/// STRIAWAVECACHEPRUNE (SR9123): prune `dir` to `budget` bytes, least recently used first; returns the files removed. Only
+/// regular files named `*.una-peaks` directly in `dir` are listed (a symlink, a subdirectory or any other name is left
+/// alone; nothing is recursed into). A missing or unreadable dir: 0.
+pub fn prune_peak_dir(dir: &std::path::Path, budget: u64) -> usize {
+    let Ok(rd) = std::fs::read_dir(dir) else { return 0 };
+    let mut list: Vec<(std::path::PathBuf, u64, u64)> = Vec::new();
+    for ent in rd.flatten() {
+        // `DirEntry::file_type` does not follow a symlink: a link (to a file or not) is not a regular file here.
+        if !ent.file_type().is_ok_and(|t| t.is_file()) || !ent.file_name().as_encoded_bytes().ends_with(b".una-peaks") {
+            continue;
+        }
+        let Ok(md) = ent.metadata() else { continue };
+        let used = md.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos() as u64);
+        list.push((ent.path(), md.len(), used));
+    }
+    list.sort_by(|a, b| a.0.cmp(&b.0));
+    let sizes: Vec<(u64, u64)> = list.iter().map(|f| (f.1, f.2)).collect();
+    let (mut removed, mut kept) = (0, sizes.iter().map(|f| f.0).sum::<u64>());
+    for i in peak_prune_pick(&sizes, budget) {
+        match std::fs::remove_file(&list[i].0) {
+            Ok(()) => {
+                removed += 1;
+                kept -= sizes[i].0;
+            }
+            Err(e) => log::debug!("[nle] peak dir prune {}: {e}", list[i].0.display()),
+        }
+    }
+    log::debug!("[nle] peak dir pruned {removed} files {kept} bytes kept");
+    removed
+}
+
+impl Sources {
+    /// STRIAWAVECACHEPRUNE (SR9123): a hit on `file` in the per-user dir is a use: its mtime becomes now (errors ignored).
+    /// A file anywhere else (the beside-the-media file) is never touched.
+    fn peak_dir_touch(&self, file: &std::path::Path) {
+        if self.peak_dir.is_none() || file.parent() != self.peak_dir.as_deref() {
+            return;
+        }
+        if let Ok(f) = std::fs::File::options().write(true).open(file) {
+            let _ = f.set_modified(std::time::SystemTime::now());
+        }
+    }
 }

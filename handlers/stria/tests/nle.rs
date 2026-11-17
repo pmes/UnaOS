@@ -4162,3 +4162,93 @@ fn striawavecachepref_readonly_dir_falls_back() {
     std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
     println!("striawavecachepref: read-only dir root={root} alt={} buckets={}", alt.display(), first.buckets.len());
 }
+
+// ---- STRIAWAVECACHEPRUNE (LEDGER SR9123): the per-user peak dir pruned least-recently-used to a byte budget (named tail block) ----
+
+/// STRIAWAVECACHEPRUNE (SR9123): the pure pick: within budget nothing; over it the least recently used go first until the
+/// rest fit; a tie goes by index; budget 0 takes every file.
+#[test]
+fn striawavecacheprune_pick_oldest_first() {
+    use stria::nle::peak_prune_pick;
+    let files = [(100, 30), (100, 10), (100, 20)];
+    assert_eq!(peak_prune_pick(&files, 300), Vec::<usize>::new());
+    assert_eq!(peak_prune_pick(&files, 250), vec![1]);
+    assert_eq!(peak_prune_pick(&files, 100), vec![1, 2]);
+    assert_eq!(peak_prune_pick(&files, 0), vec![1, 2, 0]);
+    assert_eq!(peak_prune_pick(&[(50, 5), (50, 5), (50, 5)], 100), vec![0]);
+    assert_eq!(peak_prune_pick(&[], 0), Vec::<usize>::new());
+    println!("striawavecacheprune: pick oldest first, ties by index");
+}
+
+/// STRIAWAVECACHEPRUNE (SR9123): `prune_peak_dir` removes the oldest `.una-peaks` file to fit 250 bytes and leaves a foreign
+/// name, a subdirectory (and the `.una-peaks` file inside it), and a symlink named `.una-peaks` (and its old target
+/// outside the dir) alone; a missing dir prunes nothing.
+#[test]
+fn striawavecacheprune_dir_keeps_the_budget() {
+    use stria::nle::prune_peak_dir;
+    use std::time::{Duration, SystemTime};
+    let root = fresh_dir("striawavecacheprune", "budget");
+    let dir = root.join("peaks");
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    let t0 = SystemTime::now() - Duration::from_secs(3600);
+    let put = |p: &std::path::Path, age: u64| {
+        std::fs::write(p, [7u8; 100]).unwrap();
+        std::fs::File::options().write(true).open(p).unwrap().set_modified(t0 + Duration::from_secs(age)).unwrap();
+    };
+    let (a, b, c) = (dir.join("a.una-peaks"), dir.join("b.una-peaks"), dir.join("c.una-peaks"));
+    put(&b, 0);
+    put(&a, 1);
+    put(&c, 2);
+    let notes = dir.join("notes.txt");
+    put(&notes, 0);
+    let nested = dir.join("sub").join("old.una-peaks");
+    put(&nested, 0);
+    let target = root.join("outside.una-peaks");
+    put(&target, 0);
+    let link = dir.join("link.una-peaks");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    assert_eq!(prune_peak_dir(&dir, 250), 1);
+    assert!(!b.exists(), "the least recently used goes");
+    assert!(a.exists() && c.exists(), "the newer two fit the budget");
+    assert!(notes.exists(), "a foreign name stays");
+    assert!(nested.exists() && dir.join("sub").is_dir(), "no recursion: the subdirectory and its file stay");
+    assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "the symlink stays");
+    assert!(target.exists(), "the link is not followed");
+    assert_eq!(prune_peak_dir(&root.join("missing"), 0), 0);
+    println!("striawavecacheprune: budget 250 of 300 -> 1 removed; link, subdir, foreign name kept");
+}
+
+/// STRIAWAVECACHEPRUNE (SR9123): no beside file, a marker table in the per-user dir under the media's stamp, its mtime an
+/// hour back: the scan answers the marker and the dir file's mtime moves to now; the media's mtime is unchanged.
+#[test]
+fn striawavecacheprune_hit_touches_the_dir_file() {
+    use std::time::{Duration, SystemTime};
+    use stria::nle::{peak_file_bytes, peak_path_hash, scan_peaks};
+    use timeline_core::view::{PEAKS_PER_SEC, Peaks};
+    let dir = fresh_dir("striawavecacheprune", "touch");
+    let peaks = dir.join("peaks");
+    std::fs::create_dir_all(&peaks).unwrap();
+    let media = dir.join("st.mp4");
+    let bytes = striawavemulti_stereo(2);
+    std::fs::write(&media, &bytes).unwrap();
+    let (size, mtime) = striawavemulti_stamp(&media);
+    let alt = peaks.join(format!("{:016x}.una-peaks", peak_path_hash(media.as_os_str().as_encoded_bytes())));
+    let marker = Peaks { per_sec: PEAKS_PER_SEC, buckets: vec![42; 7], chans: Vec::new(), lod: Vec::new() };
+    std::fs::write(&alt, peak_file_bytes(&marker, size, mtime)).unwrap();
+    let old = SystemTime::now() - Duration::from_secs(3600);
+    std::fs::File::options().write(true).open(&alt).unwrap().set_modified(old).unwrap();
+    let mut tl = Timeline::new(25);
+    let st = tl.add_source("ST", 50);
+    let ti = tl.add_track(Kind::Audio);
+    tl.tracks[ti].clips = vec![Clip::new(st, 0, 50, 0)];
+    let mut src = Sources::new(&tl);
+    src.add(st, bytes).unwrap();
+    src.note_path(st, &media);
+    src.note_peak_dir(Some(peaks.clone()));
+    let p = scan_peaks(&src, st, PEAKS_PER_SEC).unwrap().expect("audio");
+    assert_eq!(p.buckets, vec![42; 7], "the per-user file answers");
+    assert!(std::fs::metadata(&alt).unwrap().modified().unwrap() > old + Duration::from_secs(60), "the hit touched the dir file");
+    assert_eq!(striawavemulti_stamp(&media), (size, mtime), "the media is not touched");
+    assert!(!dir.join("st.mp4.una-peaks").exists(), "a hit writes no beside file");
+    println!("striawavecacheprune: dir hit touched {}", alt.display());
+}
