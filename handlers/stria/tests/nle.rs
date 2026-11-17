@@ -4811,3 +4811,38 @@ fn striatransitionlength_face_dur_input() {
     assert!(face.verb("["));
     assert_eq!(face.state.selected_transition().map(|x| x.dur), Some(5));
 }
+
+// ---- STRIAAUDIOCROSSFADE (LEDGER SR860): the face's `xfade` word (named tail block) ----
+
+/// `xfade` is a transport word just before `help`; on the selected audio clip it puts THE equal-power record through ONE
+/// commit (the fixture's cut at 10: half a second clamped to the incoming's 10 ticks); undo takes it back.
+#[test]
+fn striaaudiocrossfade_face_word_is_one_undo_step() {
+    use timeline_core::Curve;
+    assert_eq!(VERBS[VERBS.len() - 2], "xfade");
+    assert_eq!(VERBS.last(), Some(&"help"));
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    face.state.select(1, 1).unwrap();
+    assert!(face.verb("xfade"));
+    assert_eq!(face.last_error, None);
+    assert_eq!(face.state.timeline, tl.add_audio_xfade(1, 10, 10, Curve::EqualPower).unwrap());
+    assert_eq!(face.state.undo_depth(), 1);
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.timeline, tl);
+    println!("striaaudiocrossfade: VERBS[{}] = xfade; (1,1) -> 10 ticks EqualPower at 10; undo", VERBS.len() - 2);
+}
+
+/// A refused `xfade` reads the editor's name on the message line (`{v}: {e}`) and moves nothing.
+#[test]
+fn striaaudiocrossfade_face_refusal_on_the_message_line() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    assert!(face.verb("xfade"));
+    assert_eq!(face.last_error.take(), Some(format!("xfade: {}", EditError::NoClip)));
+    face.state.select(0, 1).unwrap();
+    assert!(face.verb("xfade"));
+    assert_eq!(face.last_error.take(), Some(format!("xfade: {}", EditError::Transition)));
+    assert_eq!((&face.state.timeline, face.state.undo_depth()), (&tl, 0));
+    println!("striaaudiocrossfade: no selection -> xfade: {}; video clip -> xfade: {}", EditError::NoClip, EditError::Transition);
+}

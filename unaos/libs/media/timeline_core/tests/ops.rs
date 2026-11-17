@@ -375,3 +375,133 @@ fn striazoomtofit_fit_rule() {
     assert_eq!(empty.fit(320, false), Err(EditError::NoClip), "an empty timeline");
     assert_eq!(empty.zoom, timeline_core::editor::ZOOM_DEFAULT);
 }
+
+// ---- STRIAAUDIOCROSSFADE (LEDGER SR860): the audio crossfade word, its curve's runs and its bracket (named tail block) ----
+
+use timeline_core::editor::EditorState;
+
+/// V1: A[0,20)@0. A1: A[10,30)@0 (handle 20), B[0,20)@20 (the cut at 20), A[40,45)@50 (after a gap).
+fn striaaudiocrossfade_state() -> EditorState {
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 50);
+    let b = tl.add_source("B", 50);
+    tl.add_track(Kind::Video);
+    tl.add_track(Kind::Audio);
+    tl.tracks[0].clips = vec![Clip::new(a, 0, 20, 0)];
+    tl.tracks[1].clips = vec![Clip::new(a, 10, 30, 0), Clip::new(b, 0, 20, 20), Clip::new(a, 40, 45, 50)];
+    EditorState::new(tl)
+}
+
+struct StriaAudioCrossfadeGop;
+impl timeline_core::SourceIndex for StriaAudioCrossfadeGop {
+    fn duration(&self, _: SourceId) -> Option<i64> {
+        Some(50)
+    }
+    fn keyframe_ns(&self, _: SourceId, _: Kind, t_ns: i64) -> Option<i64> {
+        Some(t_ns / 40_000_000 * 40_000_000)
+    }
+}
+
+/// Bare `xfade` on the incoming clip puts ONE equal-power record (half a second, 12 ticks, inside both handles), a second
+/// bare `xfade` takes it off; `xfade 4` puts, `xfade 6` replaces; each change is one undo step; the EDL carries it.
+#[test]
+fn striaaudiocrossfade_word_puts_and_takes_one_record() {
+    use timeline_core::{AudioXfade, Curve, edl};
+    let mut st = striaaudiocrossfade_state();
+    let tl0 = st.timeline.clone();
+    st.select(1, 1).unwrap();
+    assert_eq!(st.verb("xfade"), Some(Ok(())));
+    assert_eq!(st.timeline.audio_xfades, vec![AudioXfade { track: 1, at: 20, dur: 12, curve: Curve::EqualPower }]);
+    assert_eq!(st.timeline, tl0.add_audio_xfade(1, 20, 12, Curve::EqualPower).unwrap());
+    assert_eq!(st.undo_depth(), 1);
+    let text = edl::write(&st.timeline, "XF").unwrap();
+    assert!(text.contains("* UNA XFADE EQUAL"), "{text}");
+    assert_eq!(edl::parse(&text, 25).unwrap().audio_xfades, st.timeline.audio_xfades);
+    assert_eq!(st.verb("xfade"), Some(Ok(())));
+    assert_eq!((st.timeline.audio_xfades.len(), st.undo_depth()), (0, 2));
+    assert!(st.undo());
+    assert_eq!(st.timeline.audio_xfades[0].dur, 12);
+    assert!(st.redo());
+    assert!(st.timeline.audio_xfades.is_empty());
+    assert_eq!(st.verb("xfade 4"), Some(Ok(())));
+    assert_eq!(st.verb("xfade 6"), Some(Ok(())));
+    assert_eq!(st.timeline.audio_xfades, vec![AudioXfade { track: 1, at: 20, dur: 6, curve: Curve::EqualPower }]);
+    assert_eq!(st.undo_depth(), 4);
+    assert!(st.undo());
+    assert_eq!(st.timeline.audio_xfades[0].dur, 4);
+    println!("striaaudiocrossfade: xfade -> 12 ticks EqualPower; xfade -> off; xfade 4 / 6 -> 6; undo -> 4");
+}
+
+/// Each refusal by name; a refused word changes neither the timeline nor the undo stack.
+#[test]
+fn striaaudiocrossfade_refusals_by_name() {
+    let mut st = striaaudiocrossfade_state();
+    let tl0 = st.timeline.clone();
+    let check = |st: &mut EditorState, sel: Option<(usize, usize)>, v: &str, want: EditError| {
+        match sel {
+            Some((t, i)) => st.select(t, i).unwrap(),
+            None => st.deselect(),
+        }
+        assert_eq!(st.verb(v), Some(Err(want)), "{v} on {sel:?}");
+        assert_eq!((&st.timeline, st.undo_depth()), (&tl0, 0), "{v} on {sel:?}");
+    };
+    check(&mut st, None, "xfade", EditError::NoClip);
+    check(&mut st, Some((0, 0)), "xfade", EditError::Transition);
+    check(&mut st, Some((1, 0)), "xfade", EditError::Transition);
+    check(&mut st, Some((1, 2)), "xfade", EditError::Transition);
+    check(&mut st, Some((1, 1)), "xfade 0", EditError::Transition);
+    check(&mut st, Some((1, 1)), "xfade 99", EditError::Handle);
+    check(&mut st, Some((1, 1)), "xfade x", EditError::Transition);
+    check(&mut st, Some((1, 1)), "xfade 3 4", EditError::Transition);
+    println!("striaaudiocrossfade: refused NoClip / Transition / Handle by name, nothing committed");
+}
+
+/// After the word, the schedule's runs over the cut are one per tick with the equal-power weights at each edge: the runs
+/// the host mix and the kernel Player both play (the curve is the schedule's, not a mixer's).
+#[test]
+fn striaaudiocrossfade_runs_follow_the_curve() {
+    use timeline_core::Curve;
+    use timeline_core::schedule::{ENV_ONE, audio_runs, xfade_weight};
+    let mut st = striaaudiocrossfade_state();
+    st.select(1, 1).unwrap();
+    assert_eq!(st.verb("xfade 8"), Some(Ok(())));
+    let runs = audio_runs(&st.timeline, 0..60, &StriaAudioCrossfadeGop).unwrap();
+    assert_eq!((runs[0].out_t, runs[0].len, runs[0].layers.len()), (0, 20, 1));
+    for k in 0..8i64 {
+        let r = &runs[1 + k as usize];
+        assert_eq!((r.out_t, r.len, r.layers.len()), (20 + k, 1, 2), "tick {k}");
+        let p = |k: i64| (k * ENV_ONE as i64 / 8) as u32;
+        assert_eq!(r.layers[1].env, [xfade_weight(Curve::EqualPower, p(k)), xfade_weight(Curve::EqualPower, p(k + 1))]);
+        assert_eq!(r.layers[0].env, [xfade_weight(Curve::EqualPower, ENV_ONE - p(k)), xfade_weight(Curve::EqualPower, ENV_ONE - p(k + 1))]);
+    }
+    println!("striaaudiocrossfade: 8 one-tick runs, sin / cos edges");
+}
+
+/// The explicit record paints its bracket on the audio row's foot band (THE transition widget's rect) and nothing else
+/// moves; without a record the paint is what it was.
+#[test]
+fn striaaudiocrossfade_paint_shows_the_bracket() {
+    use timeline_core::view::{Layout, Order, TRANS, paint_in};
+    let mut st = striaaudiocrossfade_state();
+    st.select(1, 1).unwrap();
+    let l = Layout::of(320, 160, &st);
+    let before = paint_in(&st, l, Order::Rgba, None, None);
+    assert_eq!(st.verb("xfade 8"), Some(Ok(())));
+    let after = paint_in(&st, l, Order::Rgba, None, None);
+    let (x0, x1, y1) = (l.x_of(20), l.x_of(28), l.row_y(1) + 40 - 2);
+    let y0 = y1 - 10;
+    let mut moved = 0;
+    for (i, (a, b)) in before.chunks(4).zip(after.chunks(4)).enumerate() {
+        if a != b {
+            let (x, y) = ((i % 320) as i64, (i / 320) as i64);
+            assert!(x >= x0 && x < x1 && y >= y0 && y < y1, "pixel ({x},{y}) moved outside the bracket");
+            moved += 1;
+        }
+    }
+    assert!(moved > 0);
+    let at = |x: i64, y: i64| { let i = ((y * 320 + x) * 4) as usize; [after[i], after[i + 1], after[i + 2], after[i + 3]] };
+    assert_eq!(at(x0, y0), TRANS);
+    assert!(st.undo());
+    assert_eq!(paint_in(&st, l, Order::Rgba, None, None), before);
+    println!("striaaudiocrossfade: bracket {x0}..{x1} x {y0}..{y1}, {moved} px moved");
+}

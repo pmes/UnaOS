@@ -354,7 +354,7 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
         c.rect(x0, y0 + 2, x0 + HANDLE_W, y1 - 2, HANDLE);
         c.rect(x1 - HANDLE_W, y0 + 2, x1, y1 - 2, HANDLE);
     }
-    paint_transitions(&mut c, l, st);
+    paint_transitions(&mut c, l, st); paint_audio_xfades(&mut c, l, st); // STRIAAUDIOCROSSFADE (SR860): the explicit audio crossfades' brackets (file tail)
     // The playhead, through the ruler and the tracks.
     let px = l.x_of(st.playhead);
     c.rect(px, ry, px + 1, h as i64, PLAYHEAD);
@@ -2171,5 +2171,34 @@ mod ripple_drag_tests {
         let x = l.x_of(10) as f64 - 2.0;
         let d = Drag::begin_with(&mut st, l, x, y, true, false, true).unwrap();
         assert_eq!((d.kind, d.ripple, d.additive), (DragKind::Slip, false, true));
+    }
+}
+
+// ---- STRIAAUDIOCROSSFADE (LEDGER SR860): the explicit audio crossfade's bracket (named tail block) ----
+// Every explicit audio crossfade (`Timeline::audio_xfades`, NLEXFADEPOWER's record) paints as a bracket in its audio row's
+// foot band, on THE transition widget's geometry (`Layout::transition_rect`), with the two weights of THE curve
+// (`schedule::xfade_weight`: rising and falling) plotted inside it, so equal-power and linear read apart. Only explicit
+// records paint: a crossfade a video transition implies is already the video widget, and every existing golden holds no
+// explicit record (byte-identical).
+
+/// The brackets of every explicit audio crossfade on a visible row.
+fn paint_audio_xfades(c: &mut Canvas, l: Layout, st: &EditorState) {
+    use crate::schedule::{ENV_ONE, xfade_weight};
+    for x in st.timeline.audio_xfades.iter().filter(|x| x.track < l.rows) {
+        let bracket = Transition { at: x.at, kind: TransitionKind::Dissolve, dur: x.dur, from_black: false, to_black: false, ease: crate::Ease::Linear, want: None };
+        let (x0, y0, x1, y1) = l.transition_rect(x.track, &bracket);
+        if x1 <= 0 || x0 >= l.w as i64 {
+            continue;
+        }
+        c.rect(x0, y0, x1, y1, TRANS_FILL);
+        c.frame(x0, y0, x1, y1, TRANS);
+        let (span, h) = ((x1 - x0 - 2).max(1), y1 - y0 - 3);
+        for px in x0 + 1..x1 - 1 {
+            let p = ((px - x0 - 1) * ENV_ONE as i64 / span) as u32;
+            for w in [xfade_weight(x.curve, p), xfade_weight(x.curve, ENV_ONE - p)] {
+                let py = y1 - 2 - w as i64 * h / ENV_ONE as i64;
+                c.rect(px, py, px + 1, py + 1, TRANS);
+            }
+        }
     }
 }

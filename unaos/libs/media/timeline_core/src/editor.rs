@@ -305,7 +305,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } if let Some(r) = self.roll_verb(v) { return Some(r); } if let Some(r) = self.insert_verb(v) { return Some(r); } if let Some(r) = self.transition_dur_verb(v) { return Some(r); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRANSITIONLENGTH (SR870): `dur <n>` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIAROLLEDIT (SR851): the `roll` words (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite (file tail)
+        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } if let Some(r) = self.roll_verb(v) { return Some(r); } if let Some(r) = self.insert_verb(v) { return Some(r); } if let Some(r) = self.transition_dur_verb(v) { return Some(r); } if let Some(r) = self.xfade_verb(v) { return Some(r); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRANSITIONLENGTH (SR870): `dur <n>` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIAROLLEDIT (SR851): the `roll` words (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -1258,6 +1258,58 @@ impl EditorState {
         Some(match (self.selected_transition(), w.next().map(str::parse::<i64>), w.next()) {
             (Some(x), Some(Ok(n)), None) if n == x.dur => Ok(()),
             (Some(_), Some(Ok(n)), None) => self.set_transition_dur(n),
+            _ => Err(EditError::Transition),
+        })
+    }
+}
+
+// ---- STRIAAUDIOCROSSFADE (LEDGER SR860): the audio crossfade word (named tail block) ----
+// NLEXFADEPOWER (SR678) built the explicit audio crossfade in the model (`Timeline::audio_xfades`, put / taken by
+// `Timeline::add_audio_xfade` / `remove_audio_xfade`), the EDL (`* UNA XFADE EQUAL`) and the schedule (THE curve,
+// `schedule::xfade_weight`, read into the runs both mixes play); no face reached it. `xfade [<ticks>]` rides THE verb
+// dispatch both faces call: the cut is the HEAD of the selected clip on its track. Bare `xfade` takes the explicit record
+// off that cut when one is there, else puts an equal-power one: the derived crossfade's length when a video transition
+// implies one there, else half a second clamped to the incoming clip and the outgoing source's handle (at least 1).
+// `xfade <n>` puts (replaces) an equal-power one of `n` ticks. Each change is ONE `commit`; refused by name: no selection
+// (`NoClip`), the clip not on an audio track or no clip of its track ending at its start (`Transition`), a non-number or
+// a third word (`Transition`), and the op's own `validate` (`n < 1`: `Transition`, past a handle: `Handle`).
+/// The bare word's default length: one second over this (half a second), clamped to the cut's handles.
+pub const XFADE_DEFAULT_S_DIV: u32 = 2;
+
+impl EditorState {
+    /// Put (`dur`: `Some(n)`) or toggle (`None`) the explicit equal-power audio crossfade on the selected clip's head cut.
+    pub fn toggle_audio_xfade(&mut self, dur: Option<i64>) -> Result<(), EditError> {
+        let (track, ci) = self.selection.ok_or(EditError::NoClip)?;
+        let tl = &self.timeline;
+        let t = tl.tracks.get(track).ok_or(EditError::NoTrack)?;
+        let i = *t.clips.get(ci).ok_or(EditError::NoClip)?;
+        if t.kind != crate::Kind::Audio {
+            return Err(EditError::Transition);
+        }
+        let o = *t.clips.iter().find(|c| c.end() == i.at).ok_or(EditError::Transition)?;
+        let next = match dur {
+            Some(n) => tl.add_audio_xfade(track, i.at, n, crate::Curve::EqualPower)?,
+            None if tl.audio_xfades.iter().any(|x| x.track == track && x.at == i.at) => tl.remove_audio_xfade(track, i.at)?,
+            None => {
+                let handle = tl.source(o.src).ok_or(EditError::NoSource)?.duration - o.src_out;
+                let half = (tl.fps().unwrap_or(25) / XFADE_DEFAULT_S_DIV) as i64;
+                let n = tl.crossfade_at(track, ci).map_or(half.min(i.len()).min(handle), |x| x.dur).max(1);
+                tl.add_audio_xfade(track, i.at, n, crate::Curve::EqualPower)?
+            }
+        };
+        self.commit(next);
+        Ok(())
+    }
+    /// The `xfade` words of [`EditorState::verb`]; `None` when `v` is not one.
+    fn xfade_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let mut w = v.split_ascii_whitespace();
+        w.next().filter(|&w| w == "xfade")?;
+        Some(match (w.next(), w.next()) {
+            (None, _) => self.toggle_audio_xfade(None),
+            (Some(n), None) => match n.parse::<i64>() {
+                Ok(n) => self.toggle_audio_xfade(Some(n)),
+                Err(_) => Err(EditError::Transition),
+            },
             _ => Err(EditError::Transition),
         })
     }
