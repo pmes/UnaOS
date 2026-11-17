@@ -251,7 +251,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     fn verb_unnamed(&mut self, v: &str) -> bool {
-        if let Some(r) = self.proxy_words(v) { return r; } if let Some(r) = self.opacity_word(v) { return r; } if let Some(r) = self.meter_reset_verb(v) { return r; } if let Some(r) = self.normalize_verb(v) { return r; } if let Some(r) = self.proxy_verb(v) { return r; } if let Some(r) = self.gaps_note_verb(v) { return r; } if let Some(r) = self.track_order_word(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.info_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.snap_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.frame_verb(v) { return r; } if let Some(r) = self.clip_audio_verb(v) { return r; } if let Some(r) = self.marker_verb(v) { return r; } if let Some(r) = self.fit_verb(v) { return r; } if let Some(r) = self.tc_verb(v) { return r; } if let Some(r) = self.nudge_verb(v) { return r; } if let Some(r) = self.track_remove_verb(v) { return r; } if let Some(r) = self.loudness_verb(v) { return r; } if let Some(r) = self.help_search_verb(v) { return r; } if let Some(r) = self.autosave_verb(v) { return r; } if let Some(r) = self.pan_face_verb(v) { return r; } if let Some(r) = self.track_gain_face_verb(v) { return r; } if let Some(r) = self.export_queue_verb(v) { return r; } // STRIANORMALIZE (SR878): the normalize word (file tail); STRIACLIPGAINFACE (SR838): the gain / fade words and their message (file tail); STRIATRACKGAINSTEP (SR901): the track gain words and their message (file tail); STRIAOPACITYFACE (SR898): the opacity step words name the percent (file tail); STRIAPANFACE (SR897): the pan words and their readout (file tail); STRIATRACKORDERKEYS (SR922): the track words name the move (file tail); NLEHOSTSAVE (SR677): the save verb (file tail); STRIATRACKADDREMOVE (SR856): `track-` names what went (file tail); STRIAGAPSBLACK (SR909): the close-gaps note of removed black fades (file tail)
+        if let Some(r) = self.proxy_words(v) { return r; } if let Some(r) = self.opacity_word(v) { return r; } if let Some(r) = self.meter_reset_verb(v) { return r; } if let Some(r) = self.normalize_verb(v) { return r; } if let Some(r) = self.proxy_verb(v) { return r; } if let Some(r) = self.gaps_note_verb(v) { return r; } if let Some(r) = self.track_order_word(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.info_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.snap_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.frame_verb(v) { return r; } if let Some(r) = self.clip_audio_verb(v) { return r; } if let Some(r) = self.marker_verb(v) { return r; } if let Some(r) = self.fit_verb(v) { return r; } if let Some(r) = self.tc_verb(v) { return r; } if let Some(r) = self.nudge_verb(v) { return r; } if let Some(r) = self.track_remove_verb(v) { return r; } if let Some(r) = self.loudness_verb(v) { return r; } if let Some(r) = self.help_search_verb(v) { return r; } if let Some(r) = self.autosave_verb(v) { return r; } if let Some(r) = self.pan_face_verb(v) { return r; } if let Some(r) = self.track_gain_face_verb(v) { return r; } if let Some(r) = self.export_queue_verb(v) { return r; } if let Some(r) = self.jump_verb(v) { return r; } // STRIANORMALIZE (SR878): the normalize word (file tail); STRIACLIPGAINFACE (SR838): the gain / fade words and their message (file tail); STRIATRACKGAINSTEP (SR901): the track gain words and their message (file tail); STRIAOPACITYFACE (SR898): the opacity step words name the percent (file tail); STRIAPANFACE (SR897): the pan words and their readout (file tail); STRIATRACKORDERKEYS (SR922): the track words name the move (file tail); NLEHOSTSAVE (SR677): the save verb (file tail); STRIATRACKADDREMOVE (SR856): `track-` names what went (file tail); STRIAGAPSBLACK (SR909): the close-gaps note of removed black fades (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -412,6 +412,12 @@ pub const KEYS: &[(&str, &str)] = &[
     ("\\", "zoom-fit"), ("|", "zoom-sel"), // STRIAZOOMFITKEYS (SR907): `\` / `|` (Shift+\, text) fit the timeline / the selection (Shift+Z is redo)
     ("Ctrl+c", "copy"), ("Meta+c", "copy"), ("Ctrl+x", "cut"), ("Meta+x", "cut"), ("Ctrl+v", "paste"), ("Meta+v", "paste"), ("Ctrl+Shift+V", "paste-insert"), ("Meta+Shift+V", "paste-insert"), // STRIAPASTEKEYS (SR921): the clipboard words as chords (GTK / AppKit send Ctrl / Cmd+c as BrowserCopy and Ctrl / Cmd+v as BrowserPaste: Face::on routes them here, file tail)
     ("Alt+Up", "track-up"), ("Alt+Down", "track-down"), // STRIATRACKORDERKEYS (SR922): Alt with Up / Down (GTK's names) move the selected clip's track within its kind
+    ("Up", "cut-"), // STRIAMARKERJUMPKEYS (SR923): Up / Down jump to the previous / next clip edge, ; / ' to the previous / next marker (text keys)
+    ("Down", "cut+"),
+    ("\u{f700}", "cut-"),
+    ("\u{f701}", "cut+"),
+    (";", "marker-"),
+    ("'", "marker+"),
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
@@ -2635,6 +2641,10 @@ pub const HELP: &[(&str, &str)] = &[
     ("zoom-fit", "fit the whole timeline in the window"), ("zoom-sel", "fit the selection in the window"), // STRIAZOOMFITKEYS (SR907)
     ("copy", "copy the selection"), ("cut", "cut the selection (the gap stays)"), ("paste", "paste at the playhead"), ("paste-insert", "paste at the playhead, pushing later clips on"), // STRIAPASTEKEYS (SR921): the clipboard chords' phrases
     ("track-up", "move the clip's track up (same kind)"), ("track-down", "move the clip's track down (same kind)"), // STRIATRACKORDERKEYS (SR922)
+    ("marker-", "go to the previous marker"), // STRIAMARKERJUMPKEYS (SR923)
+    ("marker+", "go to the next marker"),
+    ("cut-", "go to the previous clip edge"),
+    ("cut+", "go to the next clip edge"),
     ("help", "show / hide this help"),
 ];
 /// NLE5DKEYSHELP (SR744): the help's inset from the band's top and left (px).
@@ -6291,5 +6301,36 @@ impl Face {
             line.push_str(&r);
         }
         self.last_error = Some(line);
+    }
+}
+
+// ---- STRIAMARKERJUMPKEYS (LEDGER SR923): the jump words' message line (named tail block) ----
+// `marker-` / `marker+` / `cut-` / `cut+` (the buttons, Up / Down, `;` / `'`) stay SR894's view words through THE dispatch
+// (`EditorState::verb`); the face only words THE message (`last_error`) when the playhead moved: `marker+: <name> at <tc>`,
+// `cut+: <tc>` (tc the new playhead's `HH:MM:SS:FF`, its tick when the rate is not an integer fps). A jump with nowhere to go
+// leaves the message untouched.
+
+impl Face {
+    /// The jump words (`timeline_core::editor::jump_word`) through the one dispatch, with their message; `None` for any other
+    /// word.
+    fn jump_verb(&mut self, v: &str) -> Option<bool> {
+        let (j, _) = timeline_core::editor::jump_word(v)?;
+        let ph = self.state.playhead;
+        if let Err(e) = self.state.verb(v).unwrap_or(Ok(())) {
+            self.last_error = Some(format!("{}: {e}", v.trim()));
+            return Some(true);
+        }
+        let now = self.state.playhead;
+        if now != ph {
+            let tc = self.state.timeline.fps().map_or_else(|| now.to_string(), |f| timeline_core::edl::timecode(now, f));
+            self.last_error = Some(match j {
+                timeline_core::editor::Jump::Marker => {
+                    let name = self.state.timeline.marker_at(now).map(|m| m.name.clone()).unwrap_or_default();
+                    format!("{}: {name} at {tc}", v.trim())
+                }
+                timeline_core::editor::Jump::Cut => format!("{}: {tc}", v.trim()),
+            });
+        }
+        Some(true)
     }
 }
