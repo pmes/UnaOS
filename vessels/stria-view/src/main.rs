@@ -264,7 +264,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let sel = st.selection.map(|(t, i)| format!("\"{t}:{i}\"")).unwrap_or_else(|| "null".into());
     let clip = st.selected().map(|c| format!("\"{}:{}:{}{}\"", c.at, c.src_in, c.src_out, if c.rate_q16 == 0x1_0000 { String::new() } else { format!(":{}", c.rate_q16) })).unwrap_or_else(|| "null".into()); // STRIACLIPSPEED (SR829): `:<rate_q16>` only at a rate other than 1x
     let err = errors.join("; ").replace('"', "'");
-    let meters = meters_json(c, &face) + &help_json(&face) + &tc_json(&face) + &help_search_json(&face) + &info_json(&face) + &clipped_json(&face); // NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail)
+    let meters = meters_json(c, &face) + &help_json(&face) + &tc_json(&face) + &help_search_json(&face) + &info_json(&face) + &clipped_json(&face) + &autosaved_json(&face); // STRIAAUTOSAVECAP (SR913): `"autosaved":true` while this session's autosave stands (file tail); NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail)
     let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face) + &bin_json(c, &face) + &recent_json(c) + &frame_json(&face) + &markers_json(&face) + &color_json(&face) + &paint; // STRIACOLORLIFT (SR869): the selected clip's grade (file tail); NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail); STRIAEXPORTFRAME (SR830): the saved frame (file tail); STRIAMARKERS (SR835): the markers (file tail); STRIAPROJECTBIN (SR885): the bin's rows with --bin (file tail)
     println!(
         "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}{export}{}}}",
@@ -841,7 +841,7 @@ mod exportaudio_tests {
 fn tick_token(face: &mut Face, tok: &str) -> Option<Vec<SMessage>> {
     let n = tok.strip_prefix("tick:")?.parse::<u32>().ok()?;
     for _ in 0..n {
-        face.tick();
+        face.tick(); face.autosave_tick(); // STRIAAUTOSAVECAP (SR913): serve's clock arm also ticks the autosave (file tail)
     }
     Some(Vec::new())
 }
@@ -2145,5 +2145,44 @@ mod striaundohistorydrag_tests {
         let errors = drive(&mut f, "history:0");
         assert_eq!(errors, vec!["history: \"0\" is not a count 1..=256".to_string()]);
         assert_eq!(f.state.undo_depth(), 1);
+    }
+}
+
+// ---- STRIAAUTOSAVECAP (LEDGER SR913): the witness's autosave reading (named tail block) ----
+/// The witness's `"autosaved"` field, only while an autosave this session wrote (or recovered) stands
+/// (`Face::autosaved`); the default line is unchanged.
+fn autosaved_json(face: &Face) -> String {
+    if face.autosaved().is_some() { ",\"autosaved\":true".into() } else { String::new() }
+}
+
+#[cfg(test)]
+mod striaautosavecap_tests {
+    use super::*;
+
+    /// STRIAAUTOSAVECAP M3: a face opened from a document carries no field; one split then `tick:<60 s at 25 fps>` (the
+    /// clock arm's autosave tick) writes `<stem>.autosave.edl` and the field reads true; `save` removes it and the field.
+    #[test]
+    fn striaautosavecap_witness_autosaved_field() {
+        let exe = std::env::current_exe().expect("the test binary");
+        let dir = exe.parent().expect("its directory").join("striaautosavecap-witness");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let doc = dir.join("cut.edl");
+        let (tl, src) = nle_face::synth_fixture();
+        std::fs::write(&doc, edl::write(&tl, "cut").unwrap()).unwrap();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false).with_doc(Some(doc.as_path()));
+        assert_eq!(autosaved_json(&face), "");
+        assert!(drive(&mut face, "at:12:0,split").is_empty());
+        assert!(face.dirty());
+        assert_eq!(autosaved_json(&face), "", "nothing written before the clock");
+        let ticks = format!("tick:{}", nle_face::AUTOSAVE_SECS * 25);
+        let errors = drive(&mut face, &ticks);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(nle_face::autosave_path(&doc).is_file());
+        assert_eq!(autosaved_json(&face), r#","autosaved":true"#);
+        assert!(drive(&mut face, "save").is_empty());
+        assert!(!nle_face::autosave_path(&doc).exists());
+        assert_eq!(autosaved_json(&face), "");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

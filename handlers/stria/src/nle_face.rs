@@ -5096,10 +5096,10 @@ pub fn normalize_gain_cdb(peak: f32, target_cdb: i32) -> Option<i32> {
 // face's thread (a 60-clip EDL is ~6 KB: the cost `save` already pays inline). `save` and a return to the clean timeline
 // remove it. At open (`with_doc`) an autosave newer than the document is OFFERED on the message row; only the word
 // `recover` reads it, and applies it as ONE commit (`EditorState::restore`). Owed: NLE-HOST-AUTOSAVE-KERNEL (the kernel
-// Player's face), NLE-HOST-AUTOSAVE-WITNESS (stria-view's JSON line), NLE-HOST-AUTOSAVE-CAP (the edit count is blind at
-// `UNDO_MAX`; the clock still writes), NLE-HOST-AUTOSAVE-KEEP (a declined older autosave is replaced by the first write).
+// Player's face). STRIAAUTOSAVECAP (SR913) built NLE-HOST-AUTOSAVE-WITNESS (stria-view's `"autosaved"`), NLE-HOST-AUTOSAVE-CAP
+// (the edits are `EditorState::commits`, monotonic past `UNDO_MAX`), NLE-HOST-AUTOSAVE-KEEP (a declined autosave is kept as `.autosave.1.edl`).
 
-/// STRIAAUTOSAVE (SR883): the edits (undo-depth distance) after which a dirty face writes its autosave.
+/// STRIAAUTOSAVE (SR883): the edits (`EditorState::commits` distance, SR913) after which a dirty face writes its autosave.
 pub const AUTOSAVE_EDITS: usize = 8;
 /// STRIAAUTOSAVE (SR883): the seconds of `serve` clock ticks (at the timeline's frame rate) after which it writes anyway.
 pub const AUTOSAVE_SECS: u32 = 60;
@@ -5109,7 +5109,7 @@ pub fn autosave_path(doc: &std::path::Path) -> std::path::PathBuf {
     doc.with_extension("autosave.edl")
 }
 
-/// STRIAAUTOSAVE (SR883): the timeline the autosave file holds (`None`: no file this face wrote), the undo depth at the last
+/// STRIAAUTOSAVE (SR883): the timeline the autosave file holds (`None`: no file this face wrote), the commit count (`EditorState::commits`, SR913) at the last
 /// write (or open / save) and the clock ticks counted since the timeline last differed from it.
 #[derive(Default)]
 struct Autosave {
@@ -5136,7 +5136,7 @@ impl Face {
             if self.autosave.written.is_some() {
                 self.drop_autosave();
             } else {
-                self.autosave.depth = self.state.undo_depth();
+                self.autosave.depth = self.state.commits();
                 self.autosave.ticks = 0;
             }
             return false;
@@ -5146,12 +5146,12 @@ impl Face {
         }
         self.autosave.ticks = self.autosave.ticks.saturating_add(1);
         let fps = self.state.timeline.fps().unwrap_or(25).max(1);
-        let edits = self.state.undo_depth().abs_diff(self.autosave.depth);
+        let edits = self.state.commits().wrapping_sub(self.autosave.depth);
         if edits < AUTOSAVE_EDITS && self.autosave.ticks < AUTOSAVE_SECS.saturating_mul(fps) {
             return false;
         }
         self.autosave.ticks = 0;
-        self.autosave.depth = self.state.undo_depth();
+        self.autosave.depth = self.state.commits();
         match self.write_autosave(&doc) {
             Ok(()) => false,
             Err(e) => {
@@ -5171,7 +5171,7 @@ impl Face {
     }
     /// STRIAAUTOSAVE (SR883): write the autosave atomically (the `.tmp` sibling, then rename over the autosave).
     fn write_autosave(&mut self, doc: &std::path::Path) -> Result<(), String> {
-        let path = autosave_path(doc);
+        let path = autosave_path(doc); self.keep_foreign_autosave(doc)?;
         let text = self.doc_text(doc)?;
         let mut tmp = path.clone().into_os_string();
         tmp.push(".tmp");
@@ -5187,9 +5187,9 @@ impl Face {
     /// STRIAAUTOSAVE (SR883): remove the autosave (a saved document) and restart the counts from the current undo depth.
     fn drop_autosave(&mut self) {
         if let Some(doc) = self.doc_path.clone() {
-            let _ = std::fs::remove_file(autosave_path(&doc));
+            if self.keep_foreign_autosave(&doc).is_ok() { let _ = std::fs::remove_file(autosave_path(&doc)); }
         }
-        self.autosave = Autosave { written: None, depth: self.state.undo_depth(), ticks: 0 };
+        self.autosave = Autosave { written: None, depth: self.state.commits(), ticks: 0 };
     }
     /// STRIAAUTOSAVE (SR883): at open, an autosave strictly newer than the document is offered on the message row. Nothing
     /// is read or applied here.
@@ -5229,7 +5229,7 @@ impl Face {
         if !self.state.restore(tl) {
             return Err("the autosave matches the timeline".into());
         }
-        self.autosave = Autosave { written: Some(self.state.timeline.clone()), depth: self.state.undo_depth(), ticks: 0 };
+        self.autosave = Autosave { written: Some(self.state.timeline.clone()), depth: self.state.commits(), ticks: 0 };
         Ok(())
     }
 }
@@ -6111,5 +6111,32 @@ impl Face {
             _ => format!("history: {arg:?} is not a count 1..={max}"),
         });
         Some(true)
+    }
+}
+
+// ---- STRIAAUTOSAVECAP (LEDGER SR913): the count past UNDO_MAX, the witness field, a declined autosave kept (named tail block) ----
+// An autosave this face neither wrote nor recovered (`Autosave.written == None`: one left by an older session, offered at
+// open and declined, or a stale one) is renamed aside to `<stem>.autosave.1.edl` (one generation) before the first write
+// would replace it and before `save` would remove it. A failed rename aborts that write / skips that remove, so the old
+// file is never lost. Quiet: no message row line. Owed: NLE-HOST-AUTOSAVE-KEEP-READ (no word reads the kept file).
+
+/// STRIAAUTOSAVECAP (SR913): where a declined autosave beside `doc` is kept (`cut.edl` -> `cut.autosave.1.edl`).
+pub fn autosave_keep_path(doc: &std::path::Path) -> std::path::PathBuf {
+    doc.with_extension("autosave.1.edl")
+}
+
+impl Face {
+    /// STRIAAUTOSAVECAP (SR913): when this face holds no autosave of its own and `<stem>.autosave.edl` stands, rename it to
+    /// [`autosave_keep_path`]; Err (`<path>: <why>`) when that rename fails.
+    fn keep_foreign_autosave(&self, doc: &std::path::Path) -> Result<(), String> {
+        if self.autosave.written.is_some() {
+            return Ok(());
+        }
+        let path = autosave_path(doc);
+        if !path.is_file() {
+            return Ok(());
+        }
+        let keep = autosave_keep_path(doc);
+        std::fs::rename(&path, &keep).map_err(|e| format!("{} -> {}: {e}", path.display(), keep.display()))
     }
 }

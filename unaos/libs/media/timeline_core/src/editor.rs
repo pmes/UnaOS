@@ -46,11 +46,12 @@ pub struct EditorState {
     /// NLE3d (SR302): the selected transition, `(track, index into tracks[track].transitions)`; the face's widget.
     pub transition: Option<(usize, usize)>,
     pub clipboard: Vec<(usize, crate::Kind, Clip)>, // STRIACOPYPASTE (SR854): the copied clips as (track, its kind, clip), replaced whole by `copy` / `cut` (file tail)
+    commits: usize, // STRIAAUTOSAVECAP (SR913): every timeline change (commit, undo, redo), monotonic past UNDO_MAX; read by `commits()` (file tail)
 }
 
 impl EditorState {
     pub fn new(timeline: Timeline) -> EditorState {
-        EditorState { timeline, selection: None, set: Vec::new(), playhead: 0, zoom: ZOOM_DEFAULT, undo: Vec::new(), redo: Vec::new(), transition: None, clipboard: Vec::new(), hist: UndoNames::default() }
+        EditorState { timeline, selection: None, set: Vec::new(), playhead: 0, zoom: ZOOM_DEFAULT, undo: Vec::new(), redo: Vec::new(), transition: None, clipboard: Vec::new(), hist: UndoNames::default(), commits: 0 }
     }
     /// Open a CMX 3600 EDL (`fps` when it carries no `* UNA FPS` line).
     pub fn open(text: &str, fps: u32) -> Result<EditorState, edl::EdlError> {
@@ -137,7 +138,7 @@ impl EditorState {
     pub fn undo(&mut self) -> bool {
         let Some(prev) = self.undo.pop() else { return false };
         let cur = core::mem::replace(&mut self.timeline, prev);
-        self.redo.push(cur); self.hist.undone();
+        self.redo.push(cur); self.hist.undone(); self.commits = self.commits.wrapping_add(1);
         self.settle();
         true
     }
@@ -145,7 +146,7 @@ impl EditorState {
     pub fn redo(&mut self) -> bool {
         let Some(next) = self.redo.pop() else { return false };
         let cur = core::mem::replace(&mut self.timeline, next);
-        self.undo.push(cur); self.hist.redone();
+        self.undo.push(cur); self.hist.redone(); self.commits = self.commits.wrapping_add(1);
         self.settle();
         true
     }
@@ -164,7 +165,7 @@ impl EditorState {
         if self.undo.len() > UNDO_MAX {
             self.undo.remove(0);
         }
-        self.redo.clear();
+        self.redo.clear(); self.commits = self.commits.wrapping_add(1);
         self.settle();
     }
     /// Keep the selection and the playhead valid for the current timeline.
@@ -2876,5 +2877,17 @@ impl EditorState {
         let tl = self.timeline.set_group(&linked, 0)?;
         self.commit(tl);
         Ok(())
+    }
+}
+
+// ---- STRIAAUTOSAVECAP (LEDGER SR913): a monotonic count of timeline changes (named tail block) ----
+// `undo_depth()` stops moving at UNDO_MAX (each commit pushes one and drops the oldest), so a reader counting edits by it
+// goes blind there. `commits` moves by one at every `commit`, `undo` and `redo` (the three roads that change the timeline)
+// and never falls back; a reader keeps a mark and takes `commits().wrapping_sub(mark)`.
+
+impl EditorState {
+    /// Timeline changes since this state was built (`commit`, `undo`, `redo`; refused edits count nothing).
+    pub fn commits(&self) -> usize {
+        self.commits
     }
 }
