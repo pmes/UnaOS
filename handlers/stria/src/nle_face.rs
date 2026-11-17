@@ -2087,10 +2087,10 @@ pub struct ExportJob {
     total: Arc<AtomicU64>,
     cancel: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<Result<ExportReport, ExportError>>>,
-    /// The `done` the last [`Face::export_tick`] reported (a repaint only when it moved).
+    /// The fnv1a of the export line ([`job_line`]) the last [`Face::export_tick`] saw (a repaint only when it moved: done or the eta word, NLE5DEXPORTMESSAGEETABAND SR803).
     shown: u64,
     /// NLE5DEXPORTRANGE (SR717): the marked range exported (`None`: the whole timeline), named in the result line.
-    range: Option<std::ops::Range<i64>>, video: String, audio: AudioOut, started: std::time::Instant, // NLE5DEXPORTMESSAGEAUDIO (SR756): the video word and the audio the result line and the witness name
+    range: Option<std::ops::Range<i64>>, video: String, audio: AudioOut, started: std::time::Instant, rate_ema: f64, rate_at: (std::time::Instant, u64), // NLE5DEXPORTMESSAGEAUDIO (SR756): the video word and the audio the result line and the witness name
 }
 
 impl Face {
@@ -2165,7 +2165,7 @@ impl Face {
                 export_as_with(&tl, span.unwrap_or(0..tl.end()), &sources, &path, video, audio, Container::Mp4, &mut progress)
             })
             .map_err(|e| format!("{}: {e}", dir.display()))?;
-        self.export = Some(ExportJob { dir: dir.to_path_buf(), done, total, cancel, handle: Some(handle), shown: 0, range, video, audio, started: std::time::Instant::now() });
+        let started = std::time::Instant::now(); self.export = Some(ExportJob { dir: dir.to_path_buf(), done, total, cancel, handle: Some(handle), shown: 0, range, video, audio, started, rate_ema: 0.0, rate_at: (started, 0) });
         Ok(())
     }
     /// The deterministic seam: start an export of `fmt` into `dir` that holds after frame `k` until it is cancelled (Esc,
@@ -2185,6 +2185,13 @@ impl Face {
     fn export_frac(&self) -> Option<f64> {
         self.export_progress().map(|(d, t)| if t == 0 { 0.0 } else { (d as f64 / t as f64).min(1.0) })
     }
+    /// NLE5DEXPORTMESSAGEETA (SR796): the running export's remaining time from its rate so far ([`eta_of`] over the
+    /// [`Face::export_progress`] pair and the job's `started`, SR756); `None` with no export, before the first frame, or under 1 ms.
+    pub fn export_eta(&self) -> Option<Duration> {
+        let j = self.export.as_ref()?;
+        let (d, t) = self.export_progress()?;
+        job_eta(j, d, t)
+    }
     /// One clock tick for the export: a finished job's result goes to the message line and the job is cleared; true when
     /// that happened or the reading moved (the band repaints).
     pub fn export_tick(&mut self) -> bool {
@@ -2193,7 +2200,7 @@ impl Face {
             self.finish_export();
             return true;
         }
-        let d = j.done.load(Relaxed);
+        eta_sample(j, std::time::Instant::now()); let d = fnv1a(job_line(j).as_bytes());
         let moved = d != j.shown;
         j.shown = d;
         moved
@@ -2353,7 +2360,7 @@ impl Face {
     }
     /// The face's message line: the last error while one stands, else [`Face::reel_line`].
     pub fn message_text(&self) -> Option<String> {
-        self.last_error.clone().or_else(|| self.reel_line())
+        self.last_error.clone().or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.reel_line())
     }
     /// The message over a painted canvas: one line at x 4, baseline the message row's foot - 4, clipped to the canvas width, through
     /// [`Labels`]; unchanged with labels off, on the tracks Surface, or a band under [`MESSAGE_H`].
@@ -2892,4 +2899,165 @@ pub fn realtime_words(frames: u64, wall: Duration, fps: (u64, u64)) -> Option<St
         let h = q(100)?;
         format!("{}.{:02}x", h / 100, h % 100)
     })
+}
+
+// ---- NLE5DEXPORTMESSAGEETA (LEDGER SR796): a running export's remaining time from the rate so far (named tail block) ----
+// `Face::export_eta` reads the job's `started` (SR756, face thread only) and the `export_progress` pair through ONE formula
+// (`eta_of`); the words and stria-view's `"eta_secs"` read ONE rounding (`eta_secs`). The band stays a bar. Owed:
+// NLE5D-EXPORT-MESSAGE-ETA-BAND (a painted `~12 s` on the band or the message line), NLE5D-EXPORT-MESSAGE-ETA-SMOOTH (an EMA
+// of the rate so a slow start does not pin a long eta), NLE5D-EXPORT-MESSAGE-DURATION-WITNESS (carried).
+
+/// The remaining time of an export `done` of `total` frames in after `elapsed`: `(total - done) x elapsed / done` in integer
+/// microseconds. `None` while `done` is 0 or `elapsed` is under 1 ms (no estimate yet), or on an overflow.
+fn eta_of(done: u64, total: u64, elapsed: Duration) -> Option<Duration> {
+    if done == 0 || elapsed < Duration::from_millis(1) {
+        return None;
+    }
+    let us = (total.saturating_sub(done) as u128).checked_mul(elapsed.as_micros())? / done as u128;
+    Some(Duration::from_micros(u64::try_from(us).ok()?))
+}
+
+/// A remaining time in whole seconds, rounded half up: THE rounding the words ([`eta_words`]) and the witness's
+/// `"eta_secs"` both read, so they never disagree.
+pub fn eta_secs(d: Duration) -> u64 {
+    ((d.as_micros() + 500_000) / 1_000_000) as u64
+}
+
+/// A running export's remaining time as a person reads it, the tilde saying estimate: under a minute whole seconds
+/// (`~12 s`, `~0 s` under half a second), under an hour minutes and seconds (`~1:05`), else hours (`~1:02:03`); the grade is
+/// chosen after the rounding ([`eta_secs`]), so 59.6 s reads `~1:00`. `None` while there is no estimate ([`eta_of`]).
+pub fn eta_words(done: u64, total: u64, elapsed: Duration) -> Option<String> {
+    eta_of(done, total, elapsed).map(eta_words_of)
+}
+
+// ---- NLE5DEXPORTMESSAGEETABAND (LEDGER SR803): the running export's line on the message line (named tail block) ----
+// While an export runs, `Face::message_text` reads `job_line` after `last_error` and before the hovered / selected reel line,
+// so the one line under the preview says `export: 3 / 35 ~12 s` (labels on only: `paint_message`'s gate, so every labels-off
+// paint is byte-identical); the 2 px band stays the glance. `export_tick` keeps the fnv1a of this line in `ExportJob.shown`, so
+// the face repaints when the eta word moves with done fixed (labels off: frames re-fired ~1/s, pixels unchanged). Owed:
+// NLE5D-EXPORT-MESSAGE-ETA-TOTAL (the real count before frame 1: total is 0 until the export thread's first reading),
+// NLE5D-EXPORT-MESSAGE-ETA-KERNEL (the kernel Player paints the same line), NLE5D-EXPORT-MESSAGE-ETA-SMOOTH (carried),
+// NLE5D-EXPORT-MESSAGE-DURATION-WITNESS (carried).
+
+/// A running export as a person reads it: `export: <done> / <total>`, then ` <eta>` when there is one ([`eta_words`]:
+/// `export: 3 / 35 ~12 s`); `export: starting` while `total` is 0 (before the export thread's first reading).
+pub fn export_line(done: u64, total: u64, eta: Option<String>) -> String {
+    if total == 0 {
+        return "export: starting".to_string();
+    }
+    match eta {
+        Some(e) => format!("export: {done} / {total} {e}"),
+        None => format!("export: {done} / {total}"),
+    }
+}
+
+/// The running job's [`export_line`]: its `done` / `total` reading (as [`Face::export_progress`] reads it) and SR796's
+/// [`eta_words`] over its `started`. A free fn over the job, so [`Face::export_tick`] calls it under its live `&mut` borrow.
+/// A stall past [`STALL_AFTER`] trades the eta word for [`stall_words`] (`export: 3 / 35 stalled 7 s`, NLE5DEXPORTMESSAGEETASTALLWORD SR817).
+fn job_line(j: &ExportJob) -> String {
+    let (d, t) = (j.done.load(Relaxed), j.total.load(Relaxed));
+    export_line(d, t, stall_words(j.rate_at.0.elapsed(), j.rate_ema).or_else(|| job_eta(j, d, t).map(eta_words_of)))
+}
+
+// ---- NLE5DEXPORTMESSAGEETASMOOTH (LEDGER SR808): a time-based EMA of the export rate for the eta (named tail block) ----
+// SR796's eta divided the remaining frames by the MEAN rate since the start, so a slow first frame (the encoder warming, a
+// cold cache, the first keyframe) pinned a long eta that collapsed as the export ran. `ExportJob` now carries `rate_ema`
+// (frames per second, 0.0 = no estimate yet) and `rate_at` (the last sample: its instant and `done`; built `(started, 0)`),
+// written only by `eta_sample` from `Face::export_tick` on the face's thread (no lock: `done` stays the export thread's
+// atomic). THE TIME RULE: `ema_step` weighs a sample by `1 - exp(-dt / ETA_TAU)`, so N steps of dt are one step of N x dt and
+// the smoothing is the same at the serve clock's 25 or 60 Hz. THE HAND-OFF: the first sampled move (the warm-up span from
+// `started`) only records `rate_at`; the second seeds `rate_ema` with its span's rate; later moves step the EMA; a tick where
+// `done` did not move changes nothing (a paused job keeps its rate). `job_eta` is the ONE eta both the message line
+// (`job_line`) and `Face::export_eta` (stria-view's `"eta_secs"`) read: SR796's `eta_of` while `rate_ema` is 0, else
+// `eta_of_rate(total - done, rate_ema)`; the words are SR796's one grammar (`eta_words_of`). Owed:
+// NLE5D-EXPORT-MESSAGE-ETA-STALL (a stalled export's eta freezes; it should grow by the overdue time), NLE5D-EXPORT-MESSAGE-ETA-KERNEL,
+// NLE5D-EXPORT-MESSAGE-ETA-TOTAL, NLE5D-EXPORT-MESSAGE-DURATION-WITNESS (carried).
+
+/// The EMA's time constant (seconds): a sample `ETA_TAU` old weighs 1/e of a fresh one.
+pub const ETA_TAU: f64 = 2.0;
+
+/// One time-based EMA step: `prev + (1 - exp(-dt / tau)) x (sample - prev)` (`dt`, `tau` in seconds). `dt` 0 keeps `prev`;
+/// `dt == tau` moves 1 - 1/e of the way; N steps of `dt` equal one step of N x `dt` (the tick-rate independence).
+pub fn ema_step(prev: f64, sample: f64, dt: f64, tau: f64) -> f64 {
+    prev + (1.0 - (-dt / tau).exp()) * (sample - prev)
+}
+
+/// One sample of a running export's rate, pure: `(ema, at)` is the job's `(rate_ema, rate_at)`, `done` the reading at `now`.
+/// No move (or no time) since `at`: unchanged. The first move (from 0, the warm-up span) records `(now, done)` with the EMA
+/// still 0; the second seeds the EMA with its span's frames per second; later moves [`ema_step`] it over [`ETA_TAU`].
+pub fn ema_sample(ema: f64, at: (std::time::Instant, u64), done: u64, now: std::time::Instant) -> (f64, (std::time::Instant, u64)) {
+    let dt = now.saturating_duration_since(at.0).as_secs_f64();
+    if done <= at.1 || dt <= 0.0 {
+        return (ema, at);
+    }
+    if at.1 == 0 {
+        return (0.0, (now, done));
+    }
+    let rate = (done - at.1) as f64 / dt;
+    (if ema > 0.0 { ema_step(ema, rate, dt, ETA_TAU) } else { rate }, (now, done))
+}
+
+/// [`ema_sample`] over the job's two fields (face thread only), from [`Face::export_tick`].
+fn eta_sample(j: &mut ExportJob, now: std::time::Instant) {
+    let (ema, at) = ema_sample(j.rate_ema, j.rate_at, j.done.load(Relaxed), now);
+    j.rate_ema = ema;
+    j.rate_at = at;
+}
+
+/// The remaining time of `remaining` frames at `rate` frames per second. `None` for a rate that is not positive and finite,
+/// or a time a `Duration` cannot hold; plus `since_last` (the time since the last sampled move) beyond one frame interval `1 / rate`, never negative, so a stalled export's eta grows (NLE5DEXPORTMESSAGEETASTALL SR811).
+pub fn eta_of_rate(remaining: u64, rate: f64, since_last: Duration) -> Option<Duration> {
+    if !(rate > 0.0 && rate.is_finite()) {
+        return None;
+    }
+    Duration::try_from_secs_f64(remaining as f64 / rate + (since_last.as_secs_f64() - 1.0 / rate).max(0.0)).ok()
+}
+
+/// THE eta of a running job at the reading `(d, t)`: [`eta_of_rate`] over the EMA once it has a rate, else SR796's mean
+/// ([`eta_of`] over `started`), so a job sampled fewer than two moves (every paused fixture) reads the mean unchanged.
+fn job_eta(j: &ExportJob, d: u64, t: u64) -> Option<Duration> {
+    if j.rate_ema > 0.0 {
+        eta_of_rate(t.saturating_sub(d), j.rate_ema, j.rate_at.0.elapsed())
+    } else {
+        eta_of(d, t, j.started.elapsed())
+    }
+}
+
+/// A remaining time as a person reads it (SR796's grammar, moved here so the EMA's eta and [`eta_words`] share it): under a
+/// minute whole seconds (`~12 s`), under an hour `~1:05`, else `~1:02:03`, graded after the rounding ([`eta_secs`]).
+pub fn eta_words_of(d: Duration) -> String {
+    let s = eta_secs(d);
+    if s < 60 {
+        format!("~{s} s")
+    } else if s < 3600 {
+        format!("~{}:{:02}", s / 60, s % 60)
+    } else {
+        format!("~{}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+    }
+}
+
+// ---- NLE5DEXPORTMESSAGEETASTALLWORD (LEDGER SR817): a stalled export's line names the stall (named tail block) ----
+// SR811 grows a stalled export's eta, but the line still read like progress (`export: 3 / 35 ~19 s` climbing). THE STALL
+// RULE: `job_line` passes `stall_words(rate_at.0.elapsed(), rate_ema)` in place of the eta word when the time since the last
+// sampled move exceeds max(STALL_AFTER, STALL_FRAMES / rate) for a positive finite EMA rate (a slow-but-moving export is not
+// called stalled), else a flat STALL_AFTER (the mean road, before the EMA has a rate: `rate_at.0` is `started` until the first
+// sampled move, so a first frame that never comes still names its stall). The seconds read SR796's one grammar
+// (`eta_words_of`, half up through `eta_secs`) without the tilde. `export_line`, `job_eta`, `Face::export_eta` and stria-view's
+// `"eta_secs"` are unchanged; the word returns to the eta at the next move. Owed: NLE5D-EXPORT-MESSAGE-ETA-STALL-WITNESS (the
+// stall seconds on stria-view's export JSON), NLE5D-EXPORT-MESSAGE-ETA-STALL-FINALIZE (done == total: name the finalise, not a
+// stall), NLE5D-EXPORT-MESSAGE-ETA-KERNEL, NLE5D-EXPORT-MESSAGE-ETA-TOTAL, NLE5D-EXPORT-MESSAGE-DURATION-WITNESS (carried).
+
+/// The least time since the last sampled move that reads as a stall.
+pub const STALL_AFTER: Duration = Duration::from_secs(5);
+
+/// The frame intervals at the EMA rate that must also pass before a moving-but-slow export reads as stalled.
+pub const STALL_FRAMES: f64 = 10.0;
+
+/// A running export's stall as a person reads it: `stalled 7 s` (`stalled 4:10` past a minute, [`eta_words_of`]'s grammar
+/// without the tilde) when `since_last` (the time since the last sampled move) is strictly over max([`STALL_AFTER`],
+/// [`STALL_FRAMES`] / `rate`), or over a flat [`STALL_AFTER`] while `rate` is not positive and finite; else `None`.
+pub fn stall_words(since_last: Duration, rate: f64) -> Option<String> {
+    let after = STALL_AFTER.as_secs_f64();
+    let limit = if rate > 0.0 && rate.is_finite() { after.max(STALL_FRAMES / rate) } else { after };
+    (since_last.as_secs_f64() > limit).then(|| format!("stalled {}", eta_words_of(since_last).trim_start_matches('~')))
 }
