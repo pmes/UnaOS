@@ -1842,3 +1842,5 @@ exec-rmbp-hevcrextipredangle|ca96ede25|cut119h
 exec-rmbp-hevcseiallcidx|ca96ede25|cut119h
 exec-rmbp-nlefaceexportqpwords|ca96ede25|cut119h
 exec-rmbp-aethercssomshorthandcomputed|ca96ede25|cut119h
+exec-rmbp-h264enctwopassfaceprogress|78c9a31ec|cut120h
+exec-rmbp-hevcrextloopallrows|78c9a31ec|cut120h
