@@ -2186,8 +2186,8 @@ mod striatrackgain_tests {
 // rect back into the frame by the clip reel's size policy (`SizePolicy::place`, THE geometry), sampled by yuv_core::scale's
 // ONE `nearest_rows` (generic over the sample: RGBA quads on the host, packed pixels elsewhere): the crop comes BEFORE the
 // size policy. `Crop::NONE` is no crop (the render skips the pass: byte-identical frames). Stored in the EDL as
-// `* UNA CROP <l> <t> <r> <b>` under its event (edl.rs). The kernel Player refuses a cropped timeline by name
-// (`crop-unsupported`, NLE-CROP-KERNEL owed).
+// `* UNA CROP <l> <t> <r> <b>` under its event (edl.rs). The kernel Player crops in its frame road
+// (vplay.rs, NLE-CROP-KERNEL SR9010).
 
 /// A clip's crop: the left / top / right / bottom bands cut away, each in 1/1000 of the frame's width or height.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -3803,5 +3803,20 @@ impl Timeline {
         }
         let fit = self.source(src).map_or(SizePolicy::Letterbox, |r| r.size_policy);
         Some(xform_frame(top, under, w, h, self.crop_at(ti, s.out_t, false), fit, xf, m.t))
+    }
+}
+
+// ---- STRIAKCROP (LEDGER SR9010): a step's reel fit, lifted from stria nle.rs (named tail block) ----
+// The size policy a video step places (and crops) its frame by: both faces call it (stria nle.rs `reel_fit`, the kernel
+// Player's crop in vplay.rs), so the Adopt-in-a-mix rule lives once.
+
+impl Timeline {
+    /// Source `src`'s size policy as a step places its frame (absent: Letterbox). `alone` is false inside a transition:
+    /// the mix is one size, so Adopt mixes as Letterbox there.
+    pub fn reel_fit(&self, src: SourceId, alone: bool) -> SizePolicy {
+        match self.source(src).map_or(SizePolicy::Letterbox, |s| s.size_policy) {
+            SizePolicy::Adopt if !alone => SizePolicy::Letterbox,
+            p => p,
+        }
     }
 }

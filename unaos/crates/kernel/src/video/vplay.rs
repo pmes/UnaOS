@@ -1054,8 +1054,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
         );
         reels.reels.push(Reel { id: s.id, d, v, a });
     }
-    if let Some(t) = tl.sources.iter().find(|s| s.title.is_some()) { return Err(("title-unsupported", Some(alloc::format!("title reel {} (the Player's EDL mode draws no title card)", t.reel)))); } if tl.tracks.iter().any(|t| t.clips.iter().any(|c| c.crop != timeline_core::Crop::NONE)) { return Err(("crop-unsupported", Some(String::from("the EDL crops a clip (* UNA CROP): the Player's frame road has no crop pass")))); } // NLE-CROP-KERNEL (SR867): a cropped clip refused by name, not shown uncropped (STRIACROP, LEDGER SR867)
-    // NLE-GRADE-KERNEL BUILT by STRIAGRADENEXT (SR992): each step graded below, the outgoing side of a mix in edl_mix (edl_grade / edl_graded, file tail)
+    if let Some(t) = tl.sources.iter().find(|s| s.title.is_some()) { return Err(("title-unsupported", Some(alloc::format!("title reel {} (the Player's EDL mode draws no title card)", t.reel)))); } // NLE-GRADE-KERNEL BUILT by STRIAGRADENEXT (SR992): each step graded below, the outgoing side of a mix in edl_mix (edl_grade / edl_graded, file tail)
     let steps = timeline_core::schedule::schedule(tl, 0..tl.end(), &reels).map_err(|e| ("schedule-refused", Some(alloc::format!("schedule: {}", e))))?; // NLE-TITLE-KERNEL (SR828): a titled source is refused by name, never scheduled onto a frame road with no title arm
     rep.reels = reels.reels.len(); super::export::set_reels(jid, tl.reels_colour(|id| reels.get(id).and_then(|r| r.v.as_ref()).and_then(|v| v.1.colour))); // EXPORTCOLOURPRIM (rmbp-ledger B979): the reels' one primaries / transfer pair, the export file's (video/export.rs)
     rep.clips = tl.tracks.iter().map(|t| t.clips.len()).sum();
@@ -1078,7 +1077,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
         None => return Err(("superseded", None)),
     }
     let mut run: Option<EdlRun> = None;
-    let mut mix: Option<EdlRun> = None; // NLE6MIX (B899): a transition's outgoing run, the second decoder slot
+    let mut mix: Option<EdlRun> = None; let mut seen = timeline_core::Crop::NONE; // STRIAKCROP (SR9010): the crop last named on the wire. NLE6MIX (B899): a transition's outgoing run, the second decoder slot
     for s in steps.iter().filter(|s| s.kind == Kind::Video) {
         let pts_ms = out_ms(s.out_t);
         if rep.plan.len() < SHOWN_CAP {
@@ -1097,9 +1096,9 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
                 coded(rep, s.out_t, ord, &px); let px = edl_grade(tl.grade_at(s.track, s.out_t, false), px); Frame { pts_ms, w, h, px, ord: ord.map(|n| (s.out_t, n)) } // STRIAGRADENEXT (SR992): the clip's grade after the coded witness (file tail)
             }
         };
-        match (s.vmix, refused) {
+        crop_own(&reels, tl, s, &mut frame, &mut seen); match (s.vmix, refused) {
             (Some(_), Some(why)) => edl_refuse(rep, &why),
-            (Some(m), None) => edl_mix(&reels, tl.tb, s.out_t, m, tl.grade_at(s.track, s.out_t, true), &mut frame, &mut mix, rep, (tl, s))?, // STRIAGRADENEXT (SR992): the outgoing clip's grade (file tail) // STRIAKXFORM (LEDGER SR9011): the step, for its placement
+            (Some(m), None) => edl_mix(&reels, tl.tb, s.out_t, m, tl.grade_at(s.track, s.out_t, true), &mut frame, &mut mix, rep, (tl, s), out_crop(tl, s, &m))?, // STRIAGRADENEXT (SR992): the outgoing clip's grade (file tail) // STRIAKXFORM (LEDGER SR9011): the step, for its placement
             (None, _) => {}
         }
         if pts_ms < seek_ms {
@@ -1203,6 +1202,7 @@ fn edl_mix(
     frame: &mut Frame,
     mix: &mut Option<EdlRun>,
     rep: &mut EdlReport, at: (&timeline_core::Timeline, &timeline_core::schedule::Step), // STRIAKXFORM (LEDGER SR9011): the step, for its placement (timeline_core `Timeline::place_step`)
+    oc: (timeline_core::Crop, timeline_core::SizePolicy),
 ) -> Result<(), (&'static str, Option<String>)> {
     let t0 = crate::hidstall::now_us();
     let (w, h) = (frame.w, frame.h);
@@ -1216,7 +1216,7 @@ fn edl_mix(
                 }
             }
             match edl_frame(reels, tb, mix, o, m.src_t, m.seek.is_some(), rep, true) {
-                Ok((ow, oh, px, _)) if (ow, oh) == (w, h) => edl_graded(og, unpack(px.rgb())), // STRIAGRADENEXT (SR992): the outgoing frame graded, from-black stays black (file tail)
+                Ok((ow, oh, px, _)) if (ow, oh) == (w, h) => edl_graded(og, unpack(crop_rgb(px.rgb(), w, h, oc.0, oc.1).as_deref().unwrap_or(px.rgb())), // STRIAGRADENEXT (SR992): the outgoing frame graded, from-black stays black (file tail) // STRIAKCROP (SR9010): the outgoing through its clip's crop (file tail)
                 Ok((ow, oh, _, _)) => {
                     *mix = None;
                     edl_refuse(rep, &alloc::format!("size {}x{} != {}x{}", ow, oh, w, h));
@@ -2854,4 +2854,59 @@ fn edit_verb_or_jump(st: &mut timeline_core::editor::EditorState, verb: &str) ->
         }
         None => st.verb(verb),
     }
+}
+
+// ---- STRIAKCROP (LEDGER SR9010): the Player's frame road through the clip's crop (named tail block) ----
+// handlers.md §5 NLE5b's NLE-CROP-KERNEL. The EDL job crops as Stria's render does (nle.rs `reel_rgba` then `cropped`): a
+// step's own frame is placed at its reel's track size by the reel's fit (`Timeline::reel_fit`, lifted from the host) through
+// the Player's ONE size door [`fit_rgba`] when a mid-stream switch changed its size (an Adopt frame stays at its own size),
+// then cropped by timeline_core's ONE crop pass `crop_frame` (`Timeline::crop_at` picks the clip's crop) on the 0RGB pixels
+// with black bars (the host's `FIELD`), BEFORE the mix; a transition's outgoing frame is cropped the same way
+// (`crop_at(.., true)`, the mix's fit). No crop: the frame untouched (its planes kept), byte for byte. Wire: `[nle] crop
+// reel=<id> l= t= r= b= frame=<W>x<H> fit=<name>` once per change of crop in a job; `[nle] crop refused reel=<id>
+// frame=<W>x<H>` when the size door cannot place the frame (it shows uncropped).
+
+/// The `w x h` 0RGB `px` through `crop` placed back by `fit` over black; None when `crop` is no crop.
+fn crop_rgb(px: &[u32], w: usize, h: usize, crop: timeline_core::Crop, fit: timeline_core::SizePolicy) -> Option<Vec<u32>> {
+    if crop == timeline_core::Crop::NONE {
+        return None;
+    }
+    Some(timeline_core::crop_frame(px, w, h, crop, fit, 0u32))
+}
+
+/// Step `s`'s own frame through its clip's crop, the host's order: placed at its reel's size first, then cropped.
+/// `seen` is the crop the wire last named in this job.
+fn crop_own(reels: &Reels, tl: &timeline_core::Timeline, s: &timeline_core::schedule::Step, frame: &mut Frame, seen: &mut timeline_core::Crop) {
+    let Some(id) = s.src else { return };
+    let crop = s.track.map_or(timeline_core::Crop::NONE, |ti| tl.crop_at(ti, s.out_t, false));
+    if crop == timeline_core::Crop::NONE {
+        return;
+    }
+    let fit = tl.reel_fit(id, s.vmix.is_none());
+    let reel = reels.get(id).and_then(|r| r.v.as_ref()).map(|v| (v.1.width as usize, v.1.height as usize)).filter(|&(w, h)| w > 0 && h > 0).unwrap_or((frame.w, frame.h));
+    let (w, h, placed) = if (frame.w, frame.h) == reel || fit == timeline_core::SizePolicy::Adopt {
+        (frame.w, frame.h, None)
+    } else {
+        match fit_rgba(unpack(frame.px.rgb()), frame.w, frame.h, reel.0, reel.1, fit) {
+            Some(rgba) => (reel.0, reel.1, Some(pack(&rgba))),
+            None => {
+                serial_println!("[nle] crop refused reel={} frame={}x{}", id.0, frame.w, frame.h);
+                return;
+            }
+        }
+    };
+    let Some(out) = crop_rgb(placed.as_deref().unwrap_or(frame.px.rgb()), w, h, crop, fit) else { return };
+    if crop != *seen {
+        serial_println!("[nle] crop reel={} l={} t={} r={} b={} frame={}x{} fit={}", id.0, crop.l, crop.t, crop.r, crop.b, w, h, fit.name());
+        *seen = crop;
+    }
+    frame.px = Px::from(out);
+    (frame.w, frame.h) = (w, h);
+}
+
+/// A transition step's outgoing crop and fit: the clip ending at the transition's cut (`crop_at(.., true)`), placed as the
+/// mix places it (`reel_fit(.., false)`; from black: no clip, no crop).
+fn out_crop(tl: &timeline_core::Timeline, s: &timeline_core::schedule::Step, m: &timeline_core::schedule::VideoMix) -> (timeline_core::Crop, timeline_core::SizePolicy) {
+    let crop = s.track.map_or(timeline_core::Crop::NONE, |ti| tl.crop_at(ti, s.out_t, true));
+    (crop, m.src.map_or(timeline_core::SizePolicy::Letterbox, |o| tl.reel_fit(o, false)))
 }
