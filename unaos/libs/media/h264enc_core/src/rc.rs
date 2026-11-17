@@ -25,9 +25,9 @@
 //! - the picture QP (`Rc::picture`): a coded type the smallest q in [refq - [`PIC_STEP`], refq + [`PIC_STEP`]] and in [floor, 51] whose predicted bits meet the
 //!   target, an uncoded type refq; refq = the type's last QP, the first P after an IDR the I QP + [`IP_QP_OFFSET`] (SR844, pinned by `firstp_ipoffset_steady_scene_idr`),
 //!   an uncoded type the last picture's (+ [`B_QP_OFFSET`] for a B); a two-pass plan replaces it (`pass2_pick`, [`qpstep_clamp`] SR769), written as slice_qp_delta; within the picture
-//!   each macroblock row's QP moves by up to +-3 from it by the running bits against the row's share
-//!   of the target (the rows' SAD), written as mb_qp_delta (lib.rs `write_mb`, QPY,pred tracked as
-//!   h264_core's `mb.rs` does).
+//!   each macroblock row's QP moves by up to +-[`ROW_STEP`] 3 from it by the running bits against the row's share of the target (the rows' SAD);
+//!   under VBR `Rc::room_step` (H264ENCHRDVBRUNDERFLOW SR1050) raises the rows by up to [`VBV_ROW_STEP`] 6 more while the projected picture would underflow the max bucket, never falling within the picture (pinned by tests/hrd.rs `i_vbr_knife_edge_does_not_underflow`);
+//!   written as mb_qp_delta (lib.rs `write_mb`, QPY,pred tracked as h264_core's `mb.rs` does).
 //!
 //! - B pictures (H264ENCBFRAMES SR333): a third model; the GOP's budget is shared I : P : B = r : 1 : 1/2
 //!   (a B gets half a P's share: nB = (gop - 1) x b / (b + 1) B pictures per GOP at b B frames); a B
@@ -41,7 +41,14 @@
 //!   bit budget, no row modulation); the floor of every rate-controlled QP is [`crate::Config::qp_min`] (None = [`QP_MIN`]),
 //!   read through [`crate::Config::qp_floor`].
 //!
-//! Owed (handlers.md §5 H264ENC-RC): none of its own (scene-cut IDRs: lib.rs, SR680; per-MB activity masking: lib.rs H264ENCAQ, SR693; two-pass: [`RcMode::TwoPass`], this file's H264ENCTWOPASS tail block, SR698; HRD signalling of the bucket: this file's H264ENCHRD tail block, SR699).
+//! - two-pass (H264ENCTWOPASS SR698, x264's `init_pass2`): pass 1 records a [`PicStat`] per coded picture (`Encoder::note_stat`: bits, SliceQPY, complexity = bits x [`step16`]`(qp)`);
+//!   [`crate::Encoder::planned`] / [`crate::Encoder::planned_with`] plan pass 2 by [`pass2_qps`]: an anchor's qscale ~ its [`blur_complexity`]-blurred complexity^(1 - qcomp), an I the mean planned QP of its GOP's Ps less [`IP_QP_OFFSET`], the curve held by [`qpstep_limit`] (SR763) and blurred by [`blur_qscale`] (linear qscale, SR1042), a B its anchor's + [`B_QP_OFFSET`], the scale by ONE bisection to the target (`k_raw_reproduces_sr698`, `l_default_blur_lands_within_two_percent`);
+//!   [`Pass2Opts`]' Default is x264's (qcomp 0.6, cplxblur 20, qblur 0.5, the GOP-mean I rule, qpstep [`QP_STEP`] 4; H264ENCTWOPASSBLUR SR736).
+//!   Pass 2: [`RcMode::TwoPass`] keeps the CBR bucket and target; `pass2_pick` replaces the picture-QP window: the planned QP + round(6 log2(remaining plan / remaining budget)) clamped +-[`PIC_STEP`] and to [floor, 51], then [`qpstep_clamp`] against the type's last pass-2 QP or, for the first P, [`qpstep_seed`] (SR769 / SR804, the one bound [`qpstep_bound`] SR1026),
+//!   then raised while the type's model predicts more than the bucket's room (`b_two_pass_lands_within_two_percent`, `z_first_p_held_against_the_seed`, `x_the_bucket_raise_wins_over_the_clamp`; all tests/twopass.rs).
+//!   The records as text: [`write_stats`] / [`read_stats`] (H264ENCTWOPASSFILE SR719, `d_stats_text_round_trips`); a pass 1 over another frame count: [`rescale_stats`] (H264ENCTWOPASSRESCALE SR727, `g_rescale_30_to_15_means_pairs`).
+//!
+//! Owed (handlers.md §5 H264ENC-RC): none of its own (scene-cut IDRs: lib.rs, SR680; per-MB activity masking: lib.rs H264ENCAQ, SR693; HRD signalling of the bucket: this file's H264ENCHRD tail block, SR699).
 
 use alloc::vec::Vec;
 
