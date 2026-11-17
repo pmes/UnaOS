@@ -305,7 +305,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.transition_dur_verb(v) { return Some(r); } // STRIATRANSITIONLENGTH (SR870): `dur <n>` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail)
+        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.transition_dur_verb(v) { return Some(r); } if let Some(r) = self.transition_step_verb(v) { return Some(r); } // STRIATRANSITIONLENGTH (SR870): `dur <n>` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -702,4 +702,37 @@ fn dur_tc_full(s: &str) -> String {
         return format!("{}{s}", "00:".repeat(4 - p.len()));
     }
     s.to_string()
+}
+
+// ---- STRIATRANSITIONKERNEL (LEDGER SR9057): `dur-` / `dur+` the head cut's transition one tick (named tail block) ----
+// The kernel Player selects a clip (the shown one), never a transition; `dur-` / `dur+` give it a transition target: the
+// transition on the SELECTED CLIP's head cut (its track, `at == clip.at`, not `to_black`), else the selected transition,
+// selected by `select_transition` and given `dur - 1` / `dur + 1` through THE length op `set_transition_dur` (one commit).
+// Refused as `EditError::Transition` (no target, a length below 1) or `Handle`; a refusal leaves the state exactly as it was.
+impl EditorState {
+    /// The transition on the selected clip's head cut, `(track, index)`; else the selected transition; `None` without one.
+    pub fn head_transition(&self) -> Option<(usize, usize)> {
+        let Some((t, i)) = self.selection else { return self.transition };
+        let c = self.timeline.tracks.get(t)?.clips.get(i)?;
+        let x = self.timeline.tracks[t].transitions.iter().position(|x| x.at == c.at && !x.to_black)?;
+        Some((t, x))
+    }
+    /// The `dur-` / `dur+` words of [`EditorState::verb`]; `None` for any other word.
+    fn transition_step_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let d = match v {
+            "dur-" => -1,
+            "dur+" => 1,
+            _ => return None,
+        };
+        let Some((t, i)) = self.head_transition() else { return Some(Err(EditError::Transition)) };
+        let keep = (self.selection, self.set.clone(), self.transition);
+        let r = self.select_transition(t, i).and_then(|()| {
+            let x = self.selected_transition().ok_or(EditError::Transition)?;
+            self.set_transition_dur(x.dur + d)
+        });
+        if r.is_err() {
+            (self.selection, self.set, self.transition) = keep;
+        }
+        Some(r)
+    }
 }

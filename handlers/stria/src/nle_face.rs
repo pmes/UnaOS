@@ -445,7 +445,7 @@ impl Face {
             self.state.seek(d.origin_tick + d.delta);
             return true;
         }
-        if let Err(e) = d.finish(&mut self.state) {
+        if let Err(e) = self.finish_drag(d) { // STRIATRANSITIONKERNEL (SR9057): an edge drag's commit sets the length note (file tail)
             self.last_error = Some(format!("drag: {e}"));
         }
         true
@@ -3152,5 +3152,21 @@ impl Face {
             Some(f) => format!("transition: {} ({n} ticks)", timeline_core::edl::timecode(n, f)),
             None => format!("transition: {n} ticks"),
         })
+    }
+}
+
+// ---- STRIATRANSITIONKERNEL (LEDGER SR9057): a released transition edge drag names its new length (named tail block) ----
+// `release`'s commit goes through [`Face::finish_drag`]: `Drag::finish` as before, then for a `TransitionIn` /
+// `TransitionOut` drag that committed, the SR991 note from [`Face::transition_note`] (`transition: HH:MM:SS:FF (<n> ticks)`).
+// A refused drag sets none (the error stays `drag: <e>`); the next press drops the note (`clear_note`).
+
+impl Face {
+    /// The drag's ONE commit (`Drag::finish`); a committed transition edge drag sets the length note.
+    fn finish_drag(&mut self, d: Drag) -> Result<(), EditError> {
+        d.finish(&mut self.state)?;
+        if matches!(d.kind, DragKind::TransitionIn | DragKind::TransitionOut) {
+            self.note = self.transition_note();
+        }
+        Ok(())
     }
 }

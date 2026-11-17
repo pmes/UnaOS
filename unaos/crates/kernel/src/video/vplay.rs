@@ -1842,7 +1842,7 @@ static EDIT: crate::sync::Mutex<Option<Edit>> = crate::sync::Mutex::new(None);
 /// to the playhead (the host face's meanings; Space and the arrows stay the Player's transport); NLE6KEYSLABELS (B968):
 /// `+` / `=` zoom in, `-` zoom out, `0` the default zoom (the host's `KEYS` + / = / -); KERNELSIZEKEY (rmbp-ledger B994):
 /// `f` the selected clip's reel's size policy (its fit), cycled (`size`: letterbox -> fill -> stretch -> adopt).
-const EDIT_KEYS: [(u8, &str); 18] = [
+const EDIT_KEYS: [(u8, &str); 20] = [
     (b's', "split"),
     (b'x', "delete"),
     (0x7F, "delete"),
@@ -1861,6 +1861,8 @@ const EDIT_KEYS: [(u8, &str); 18] = [
     (b'-', "zoom-"),
     (b'0', "zoom0"),
     (b'f', "size"),
+    (b'_', "dur-"),
+    (b'*', "dur+"),
 ];
 
 /// The EDL job's open: a fresh EDL (or another path) seeds the Player's editor state; the same path keeps it (a restart
@@ -1916,7 +1918,7 @@ pub fn edit_key(path: &str, b: u8, ms: u64) -> Option<u64> {
         }
         let before = st.timeline.clone();
         match st.verb(verb) {
-            Some(Ok(())) if st.timeline != before => edit_size_note(st, verb, at), // KERNELSIZEKEY (rmbp-ledger B994): the reel and its new size policy (file tail)
+            Some(Ok(())) if st.timeline != before => { edit_dur_note(st, verb, at); edit_size_note(st, verb, at) } // KERNELSIZEKEY (rmbp-ledger B994): the reel and its new size policy (file tail)
             Some(Ok(())) => {
                 serial_println!("[nle] edit {} at={} unchanged", verb, at);
                 return None;
@@ -2664,4 +2666,20 @@ fn adopt_rows(dst: &mut [u32], w: usize, vh: usize, f: &Frame) -> Option<(usize,
         dst[d..d + dw].copy_from_slice(&px[s..s + dw]);
     }
     Some((dw, dh))
+}
+
+// ---- STRIATRANSITIONKERNEL (LEDGER SR9057): `_` / `*` a transition's length (named tail block) ----
+// [`EDIT_KEYS`] `_` / `*` name timeline_core's `dur-` / `dur+` (`EditorState::verb`): [`edit_key`] has selected the shown
+// clip, so the key gives the transition on that clip's head cut one tick less / more through THE length op
+// (`set_transition_dur`, one commit); the save, the seek door and the `[nle] edit` line are the other keys'. Wire:
+// `[nle] edit <dur-|dur+> at=<tick> transition at=<cut> dur=<n>` before it. No head transition: the keys' `refused (<why>)` line.
+
+/// After `dur-` / `dur+` changed the timeline: the selected transition's cut and its new length.
+fn edit_dur_note(st: &timeline_core::editor::EditorState, verb: &str, at: i64) {
+    if verb != "dur-" && verb != "dur+" {
+        return;
+    }
+    if let Some(x) = st.selected_transition() {
+        serial_println!("[nle] edit {} at={} transition at={} dur={}", verb, at, x.at, x.dur);
+    }
 }
