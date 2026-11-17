@@ -6870,3 +6870,190 @@ fn strianormalize_peak_of_reads_the_audio_road() {
     assert_eq!(&stria::nle_face::VERBS[n - 2..], &["normalize", "help"]);
     println!("strianormalize: peak_of whole={got} part={part} table max={top}");
 }
+
+// ---- STRIAAUTOSAVE (LEDGER SR883): <doc>.autosave.edl beside the document; recover at open (named tail block) ----
+// The autosave is `save`'s text written to `<stem>.autosave.edl` (tmp + rename) on the face's clock after
+// `AUTOSAVE_EDITS` edits or `AUTOSAVE_SECS` of ticks; `save` and a return to clean remove it; a newer one is offered at
+// open and applied only by the word `recover`, as one undo step.
+
+use stria::nle_face::{AUTOSAVE_EDITS, AUTOSAVE_SECS, autosave_path};
+
+/// The synth fixture saved as `<dir>/cut.edl` and opened from it: the face, the document path, the opened timeline.
+fn striaautosave_face(name: &str) -> (Face, std::path::PathBuf, Timeline) {
+    let (tl0, src) = synth_fixture();
+    let doc = common::fresh_dir("striaautosave", name).join("cut.edl");
+    std::fs::write(&doc, edl::write(&tl0, "cut").unwrap()).unwrap();
+    let face = Face::new(EditorState::new(tl0.clone()), src, (320, 160), PixelOrder::Rgba, false).with_doc(Some(doc.as_path()));
+    (face, doc, tl0)
+}
+
+/// One split of track 0 at tick `t` through the face's `split` word (one commit).
+fn striaautosave_split(face: &mut Face, t: i64) {
+    face.state.select_at(0, t).unwrap();
+    face.state.seek(t);
+    assert!(face.verb("split"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+}
+
+/// The `.tmp` sibling the atomic write goes through.
+fn striaautosave_tmp(doc: &std::path::Path) -> std::path::PathBuf {
+    let mut t = autosave_path(doc).into_os_string();
+    t.push(".tmp");
+    std::path::PathBuf::from(t)
+}
+
+#[test]
+fn striaautosave_every_n_edits_writes_the_sibling() {
+    let (mut face, doc, _) = striaautosave_face("edits");
+    let auto = autosave_path(&doc);
+    assert_eq!(auto, doc.with_file_name("cut.autosave.edl"));
+    let doc_bytes = std::fs::read(&doc).unwrap();
+    assert!(face.last_error.is_none(), "no autosave: no offer");
+    assert!(!face.autosave_pending(), "clean at open");
+    for t in 1..AUTOSAVE_EDITS as i64 {
+        striaautosave_split(&mut face, t);
+        assert!(face.autosave_pending(), "dirty and unwritten");
+        assert!(!face.autosave_tick());
+        assert!(!auto.exists(), "{t} edits: not yet");
+    }
+    striaautosave_split(&mut face, AUTOSAVE_EDITS as i64);
+    assert_eq!(face.state.undo_depth(), AUTOSAVE_EDITS);
+    assert!(!face.autosave_tick(), "a written autosave paints nothing");
+    let text = std::fs::read_to_string(&auto).unwrap();
+    assert_eq!(text, edl::write(&face.state.timeline, "cut").unwrap(), "save's text, titled by the document's stem");
+    assert_eq!(edl::parse(&text, 25).unwrap(), face.state.timeline);
+    assert_eq!(std::fs::read(&doc).unwrap(), doc_bytes, "the document is never written");
+    assert!(!striaautosave_tmp(&doc).exists(), "the tmp was renamed");
+    assert_eq!(face.autosaved(), Some(&face.state.timeline));
+    assert!(!face.autosave_pending(), "written: the clock may rest");
+    assert!(face.dirty(), "an autosave does not clean the document");
+    println!("striaautosave: {} edits wrote {} bytes to {}", AUTOSAVE_EDITS, text.len(), auto.display());
+}
+
+#[test]
+fn striaautosave_sixty_seconds_of_ticks_writes() {
+    let (mut face, doc, _) = striaautosave_face("clock");
+    let auto = autosave_path(&doc);
+    striaautosave_split(&mut face, 15);
+    let due = AUTOSAVE_SECS * 25;
+    for _ in 1..due {
+        assert!(!face.autosave_tick());
+    }
+    assert!(!auto.exists(), "{} ticks: not yet", due - 1);
+    assert!(face.autosave_pending());
+    assert!(!face.autosave_tick());
+    assert!(auto.exists(), "tick {due} (60 s at 25 fps) writes");
+    assert_eq!(edl::parse(&std::fs::read_to_string(&auto).unwrap(), 25).unwrap(), face.state.timeline);
+    println!("striaautosave: one edit written after {due} ticks");
+}
+
+#[test]
+fn striaautosave_save_and_clean_remove_it() {
+    let (mut face, doc, tl0) = striaautosave_face("remove");
+    let auto = autosave_path(&doc);
+    for t in 1..=AUTOSAVE_EDITS as i64 {
+        striaautosave_split(&mut face, t);
+    }
+    face.autosave_tick();
+    assert!(auto.exists());
+    assert!(face.verb("save"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(!auto.exists(), "a saved document removes its autosave");
+    assert_eq!(face.autosaved(), None);
+    assert!(!face.autosave_pending());
+
+    let (mut face, doc, _) = striaautosave_face("undo-clean");
+    let auto = autosave_path(&doc);
+    for t in 1..=AUTOSAVE_EDITS as i64 {
+        striaautosave_split(&mut face, t);
+    }
+    face.autosave_tick();
+    assert!(auto.exists());
+    for _ in 0..AUTOSAVE_EDITS {
+        assert!(face.verb("undo"));
+    }
+    assert_eq!(face.state.timeline, tl0);
+    assert!(!face.dirty());
+    assert!(face.autosave_pending(), "clean with an autosave written: owed its removal");
+    assert!(!face.autosave_tick());
+    assert!(!auto.exists(), "back at the document: the autosave is removed");
+    assert!(!face.autosave_pending());
+    println!("striaautosave: save and undo-to-clean remove {}", auto.display());
+}
+
+#[test]
+fn striaautosave_no_document_never_autosaves() {
+    let (tl0, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl0), src, (320, 160), PixelOrder::Rgba, false);
+    for t in 1..=AUTOSAVE_EDITS as i64 {
+        striaautosave_split(&mut face, t);
+    }
+    assert!(face.dirty());
+    assert!(!face.autosave_pending(), "no path: no autosave");
+    assert!(!face.autosave_tick());
+    assert!(VERBS.contains(&"recover"));
+    let before = face.state.timeline.clone();
+    assert!(face.verb("recover"), "a verb the face takes");
+    assert_eq!(face.last_error.take().as_deref(), Some("recover: no document path"));
+    assert_eq!(face.state.timeline, before);
+}
+
+#[test]
+fn striaautosave_reopen_offers_and_recover_applies_one_step() {
+    let (tl0, src) = synth_fixture();
+    let doc = common::fresh_dir("striaautosave", "reopen").join("cut.edl");
+    let auto = autosave_path(&doc);
+    std::fs::write(&doc, edl::write(&tl0, "cut").unwrap()).unwrap();
+    let tl1 = tl0.split(0, 15).unwrap();
+    std::fs::write(&auto, edl::write(&tl1, "cut").unwrap()).unwrap();
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+    std::fs::File::options().write(true).open(&doc).unwrap().set_modified(past).unwrap();
+    let mut face = Face::new(EditorState::new(tl0.clone()), src, (320, 160), PixelOrder::Rgba, false).with_doc(Some(doc.as_path()));
+    let offer = "autosave: cut.autosave.edl is newer than cut.edl; the word recover loads it";
+    assert_eq!(face.last_error.as_deref(), Some(offer), "one message-row line at open");
+    assert_eq!(face.message_text().as_deref(), Some(offer));
+    face.last_error = None;
+    assert_eq!(face.state.timeline, tl0, "nothing is applied without the word");
+    assert!(!face.dirty());
+    assert_eq!(face.state.undo_depth(), 0);
+
+    assert!(face.verb("recover"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!(face.state.timeline, tl1);
+    assert_eq!(face.state.undo_depth(), 1, "one undo step");
+    assert!(face.dirty(), "dirty against the document");
+    assert_eq!(face.autosaved(), Some(&tl1));
+    assert!(auto.exists(), "the file stays until save");
+    assert!(!face.autosave_pending(), "the file already holds the timeline");
+
+    assert!(face.verb("recover"));
+    assert_eq!(face.last_error.take().as_deref(), Some("recover: the autosave matches the timeline"));
+    assert_eq!(face.state.undo_depth(), 1, "a refused recover pushes nothing");
+
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.timeline, tl0, "undo returns to the document as opened");
+    assert!(face.verb("redo"));
+    assert_eq!(face.state.timeline, tl1);
+
+    assert!(face.verb("save"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!(edl::parse(&std::fs::read_to_string(&doc).unwrap(), 25).unwrap(), tl1, "the EDL round trip");
+    assert!(!auto.exists(), "saved: the autosave is removed");
+    assert!(face.verb("recover"));
+    assert_eq!(face.last_error.take(), Some(format!("recover: no autosave ({})", auto.display())));
+    println!("striaautosave: offered \"{offer}\", recovered in one step, saved");
+}
+
+#[test]
+fn striaautosave_older_autosave_is_not_offered() {
+    let (tl0, src) = synth_fixture();
+    let doc = common::fresh_dir("striaautosave", "older").join("cut.edl");
+    let auto = autosave_path(&doc);
+    std::fs::write(&auto, edl::write(&tl0.split(0, 15).unwrap(), "cut").unwrap()).unwrap();
+    std::fs::write(&doc, edl::write(&tl0, "cut").unwrap()).unwrap();
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+    std::fs::File::options().write(true).open(&auto).unwrap().set_modified(past).unwrap();
+    let face = Face::new(EditorState::new(tl0.clone()), src, (320, 160), PixelOrder::Rgba, false).with_doc(Some(doc.as_path()));
+    assert!(face.last_error.is_none(), "an autosave older than the document is not offered: {:?}", face.last_error);
+    assert_eq!(face.state.timeline, tl0);
+}

@@ -155,7 +155,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 73] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "frame", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "snap", "meters-reset", "track-up", "track-down", "info", "loudness", "link", "unlink", "track+ video", "track+ audio", "track-", "close-gaps", "copy", "cut", "paste", "paste-insert", "paste-over", "tc", "xfade", "zoom-fit", "zoom-sel", "insert", "overwrite", "roll-", "roll+", "mark", "unmark", "speed", "mute", "solo", "title", "gain-", "gain+", "gain", "fade-in", "fade-out", "track-gain", "opacity-", "opacity+", "bright-", "bright+", "contrast-", "contrast+", "sat-", "sat+", "normalize", "help"]; // STRIATRACKGAIN (SR864): `track-gain [<dB>]` the selected clip's track (timeline_core's `EditorState::verb`; bare = unity); STRIANORMALIZE (SR878): the selected clip's gain to its exact peak (file tail); STRIACLIPGAINFACE (SR838): the selected clip's gain / fades (timeline_core's `EditorState::verb`; file tail); STRIAOPACITYFACE (SR898): `opacity-` / `opacity+` step the selection's opacity 10 % (file tail); STRIAGRADEFACE (SR899): the six grade step words (timeline_core editor.rs tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAEXPORTFRAME (SR830): `frame [<path>]` the playhead frame as a PNG (file tail); STRIATITLECLIP (SR828): title (file tail); STRIATRACKMUTESOLO (SR837): mute / solo the selected clip's track (timeline_core's verb), before help; STRIACLIPSPEED (SR829): speed (file tail); STRIAMARKERS (SR835): `mark [<name>]` / `unmark` at the playhead (file tail); STRIAROLLEDIT (SR851): one-frame roll of the cut at the selected clip's out edge (timeline_core editor tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite at the playhead (timeline_core); STRIAZOOMTOFIT (SR859): zoom-fit / zoom-sel (file tail); STRIAAUDIOCROSSFADE (SR860): xfade puts / takes the selected audio clip's head crossfade (timeline_core editor.rs tail); STRIATIMECODEDISPLAY (SR872): `tc` cycles the playhead readout (file tail); STRIACOPYPASTE (SR854): copy / cut / paste of the selection at the playhead (timeline_core editor.rs); STRIAGAPCLOSE (SR857): `close-gaps` closes every gap on the selected track (timeline_core `EditorState::verb`; `gap <n>` an argument word, no button); STRIATRACKADDREMOVE (SR856): track add / remove (timeline_core's verb; file tail); STRIACLIPLINK (SR863): `link` / `unlink` the selection's clip group (timeline_core editor.rs tail); STRIATRACKREORDER (SR877): `track-up` / `track-down` swap the selected clip's track with its same-kind neighbour (timeline_core editor.rs file tail); STRIAMETERCLIPVERB (SR902): meters-reset clears every clip latch and peak hold (file tail); STRIAPASTEINSERT (SR896): paste-insert / paste-over (timeline_core editor.rs); STRIASNAPTOGGLE (SR892): snap flips the drag snap default (file tail)
+pub const VERBS: [&str; 74] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "frame", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "recover", "snap", "meters-reset", "track-up", "track-down", "info", "loudness", "link", "unlink", "track+ video", "track+ audio", "track-", "close-gaps", "copy", "cut", "paste", "paste-insert", "paste-over", "tc", "xfade", "zoom-fit", "zoom-sel", "insert", "overwrite", "roll-", "roll+", "mark", "unmark", "speed", "mute", "solo", "title", "gain-", "gain+", "gain", "fade-in", "fade-out", "track-gain", "opacity-", "opacity+", "bright-", "bright+", "contrast-", "contrast+", "sat-", "sat+", "normalize", "help"]; // STRIATRACKGAIN (SR864): `track-gain [<dB>]` the selected clip's track (timeline_core's `EditorState::verb`; bare = unity); STRIANORMALIZE (SR878): the selected clip's gain to its exact peak (file tail); STRIACLIPGAINFACE (SR838): the selected clip's gain / fades (timeline_core's `EditorState::verb`; file tail); STRIAOPACITYFACE (SR898): `opacity-` / `opacity+` step the selection's opacity 10 % (file tail); STRIAGRADEFACE (SR899): the six grade step words (timeline_core editor.rs tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAEXPORTFRAME (SR830): `frame [<path>]` the playhead frame as a PNG (file tail); STRIATITLECLIP (SR828): title (file tail); STRIATRACKMUTESOLO (SR837): mute / solo the selected clip's track (timeline_core's verb), before help; STRIACLIPSPEED (SR829): speed (file tail); STRIAMARKERS (SR835): `mark [<name>]` / `unmark` at the playhead (file tail); STRIAROLLEDIT (SR851): one-frame roll of the cut at the selected clip's out edge (timeline_core editor tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite at the playhead (timeline_core); STRIAZOOMTOFIT (SR859): zoom-fit / zoom-sel (file tail); STRIAAUDIOCROSSFADE (SR860): xfade puts / takes the selected audio clip's head crossfade (timeline_core editor.rs tail); STRIATIMECODEDISPLAY (SR872): `tc` cycles the playhead readout (file tail); STRIACOPYPASTE (SR854): copy / cut / paste of the selection at the playhead (timeline_core editor.rs); STRIAGAPCLOSE (SR857): `close-gaps` closes every gap on the selected track (timeline_core `EditorState::verb`; `gap <n>` an argument word, no button); STRIATRACKADDREMOVE (SR856): track add / remove (timeline_core's verb; file tail); STRIACLIPLINK (SR863): `link` / `unlink` the selection's clip group (timeline_core editor.rs tail); STRIATRACKREORDER (SR877): `track-up` / `track-down` swap the selected clip's track with its same-kind neighbour (timeline_core editor.rs file tail); STRIAMETERCLIPVERB (SR902): meters-reset clears every clip latch and peak hold (file tail); STRIAPASTEINSERT (SR896): paste-insert / paste-over (timeline_core editor.rs); STRIASNAPTOGGLE (SR892): snap flips the drag snap default (file tail); STRIAAUTOSAVE (SR883): `recover` loads the autosave (file tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -204,13 +204,14 @@ pub struct Face {
     info: Option<SourceInfo>, // STRIASOURCEINFO (SR875): the `info` word's standing line and its face ticks left (file tail)
     export_queue: std::collections::VecDeque<ExportRequest>, // STRIAEXPORTQUEUE (SR881): export requests waiting behind the running job, started in order from export_tick (file tail)
     snap_off: bool, // STRIASNAPTOGGLE (SR892): the drag snap default is off (the `snap` word flips it; Alt at the press inverts it) (file tail)
+    autosave: Autosave, // STRIAAUTOSAVE (SR883): what `<stem>.autosave.edl` holds and the edits / ticks since it was written (file tail)
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, frame_saved: None, peaks: WavePeaks::default(), tc: None, slip_view: None, loudness: None, meter_hold: MeterHold::default(), help_query: None, info: None, export_queue: std::collections::VecDeque::new(), snap_off: false }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, frame_saved: None, peaks: WavePeaks::default(), tc: None, slip_view: None, loudness: None, meter_hold: MeterHold::default(), help_query: None, info: None, export_queue: std::collections::VecDeque::new(), snap_off: false, autosave: Autosave::default() }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -245,7 +246,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.opacity_word(v) { return r; } if let Some(r) = self.meter_reset_verb(v) { return r; } if let Some(r) = self.normalize_verb(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.info_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.snap_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.frame_verb(v) { return r; } if let Some(r) = self.clip_audio_verb(v) { return r; } if let Some(r) = self.marker_verb(v) { return r; } if let Some(r) = self.fit_verb(v) { return r; } if let Some(r) = self.tc_verb(v) { return r; } if let Some(r) = self.nudge_verb(v) { return r; } if let Some(r) = self.track_remove_verb(v) { return r; } if let Some(r) = self.loudness_verb(v) { return r; } if let Some(r) = self.help_search_verb(v) { return r; } // STRIANORMALIZE (SR878): the normalize word (file tail); STRIACLIPGAINFACE (SR838): the gain / fade words and their message (file tail); STRIAOPACITYFACE (SR898): the opacity step words name the percent (file tail); NLEHOSTSAVE (SR677): the save verb (file tail); STRIATRACKADDREMOVE (SR856): `track-` names what went (file tail)
+        if let Some(r) = self.opacity_word(v) { return r; } if let Some(r) = self.meter_reset_verb(v) { return r; } if let Some(r) = self.normalize_verb(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.info_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.snap_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.frame_verb(v) { return r; } if let Some(r) = self.clip_audio_verb(v) { return r; } if let Some(r) = self.marker_verb(v) { return r; } if let Some(r) = self.fit_verb(v) { return r; } if let Some(r) = self.tc_verb(v) { return r; } if let Some(r) = self.nudge_verb(v) { return r; } if let Some(r) = self.track_remove_verb(v) { return r; } if let Some(r) = self.loudness_verb(v) { return r; } if let Some(r) = self.help_search_verb(v) { return r; } if let Some(r) = self.autosave_verb(v) { return r; } // STRIANORMALIZE (SR878): the normalize word (file tail); STRIACLIPGAINFACE (SR838): the gain / fade words and their message (file tail); STRIAOPACITYFACE (SR898): the opacity step words name the percent (file tail); NLEHOSTSAVE (SR677): the save verb (file tail); STRIATRACKADDREMOVE (SR856): `track-` names what went (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -334,8 +335,8 @@ pub async fn serve(bus: Synapse, mut rx: tokio::sync::broadcast::Receiver<SMessa
                 Err(RecvError::Lagged(_)) => continue,
                 Err(RecvError::Closed) => break,
             },
-            _ = clock.tick(), if face.playing || face.exporting() || face.hover_pending() || face.info_pending() || face.meter_hold_pending() || face.loudness_pending() || face.slip_due() || face.thumbs_pending() => { // STRIATHUMBNAILS (SR839): and heads left undecoded; STRIAINFOREELHOVERDELAY (SR789): and a counting hover dwell; NLEFACEEXPORT (SR694): the clock also paints a running export's band
-                if face.tick() | face.export_tick() | face.thumbs_pending() | face.slip_tick() | face.loudness_tick() { // STRIATHUMBNAILS (SR839): an idle face paints its remaining heads on the clock
+            _ = clock.tick(), if face.playing || face.exporting() || face.hover_pending() || face.autosave_pending() || face.info_pending() || face.meter_hold_pending() || face.loudness_pending() || face.slip_due() || face.thumbs_pending() => { // STRIATHUMBNAILS (SR839): and heads left undecoded; STRIAINFOREELHOVERDELAY (SR789): and a counting hover dwell; NLEFACEEXPORT (SR694): the clock also paints a running export's band
+                if face.tick() | face.export_tick() | face.thumbs_pending() | face.slip_tick() | face.loudness_tick() | face.autosave_tick() { // STRIATHUMBNAILS (SR839): an idle face paints its remaining heads on the clock
                     for m in face.frames() { bus.fire(m); }
                 }
             }
@@ -1731,7 +1732,7 @@ mod split_tests {
 impl Face {
     /// The face opened from `path` (`None`: no document, `save` refuses).
     pub fn with_doc(mut self, path: Option<&std::path::Path>) -> Face {
-        self.doc_path = path.map(std::path::Path::to_path_buf);
+        self.doc_path = path.map(std::path::Path::to_path_buf); self.offer_autosave();
         self
     }
     /// The path the document was opened from.
@@ -1758,7 +1759,7 @@ impl Face {
         let title = path.file_stem().and_then(|s| s.to_str()).unwrap_or("untitled");
         let text = timeline_core::edl::write(&self.state.timeline, title).map_err(|e| format!("{}: {e}", path.display()))?;
         std::fs::write(&path, text.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))?;
-        self.clean = self.state.timeline.clone();
+        self.clean = self.state.timeline.clone(); self.drop_autosave();
         Ok(text.len())
     }
 }
@@ -5073,4 +5074,150 @@ pub fn normalize_gain_cdb(peak: f32, target_cdb: i32) -> Option<i32> {
         return None;
     }
     Some((target_cdb as f64 - 2000.0 * p.log10()).floor() as i32)
+}
+
+// ---- STRIAAUTOSAVE (LEDGER SR883): <doc>.autosave.edl beside the document; recover at open (named tail block) ----
+// The autosave is `save`'s text (`doc_text`: `edl::write` titled by the document's stem, as `save` titles it) written to the
+// sibling `<stem>.autosave.edl` through `<stem>.autosave.edl.tmp` + rename; the document itself is never written. It is
+// written on `serve`'s clock (`autosave_tick`; the clock runs while `autosave_pending`) after AUTOSAVE_EDITS edits (the undo
+// depth's distance from the last write) or AUTOSAVE_SECS of clock ticks at the timeline's frame rate, synchronously on the
+// face's thread (a 60-clip EDL is ~6 KB: the cost `save` already pays inline). `save` and a return to the clean timeline
+// remove it. At open (`with_doc`) an autosave newer than the document is OFFERED on the message row; only the word
+// `recover` reads it, and applies it as ONE commit (`EditorState::restore`). Owed: NLE-HOST-AUTOSAVE-KERNEL (the kernel
+// Player's face), NLE-HOST-AUTOSAVE-WITNESS (stria-view's JSON line), NLE-HOST-AUTOSAVE-CAP (the edit count is blind at
+// `UNDO_MAX`; the clock still writes), NLE-HOST-AUTOSAVE-KEEP (a declined older autosave is replaced by the first write).
+
+/// STRIAAUTOSAVE (SR883): the edits (undo-depth distance) after which a dirty face writes its autosave.
+pub const AUTOSAVE_EDITS: usize = 8;
+/// STRIAAUTOSAVE (SR883): the seconds of `serve` clock ticks (at the timeline's frame rate) after which it writes anyway.
+pub const AUTOSAVE_SECS: u32 = 60;
+
+/// STRIAAUTOSAVE (SR883): the autosave beside `doc` (`cut.edl` -> `cut.autosave.edl`).
+pub fn autosave_path(doc: &std::path::Path) -> std::path::PathBuf {
+    doc.with_extension("autosave.edl")
+}
+
+/// STRIAAUTOSAVE (SR883): the timeline the autosave file holds (`None`: no file this face wrote), the undo depth at the last
+/// write (or open / save) and the clock ticks counted since the timeline last differed from it.
+#[derive(Default)]
+struct Autosave {
+    written: Option<Timeline>,
+    depth: usize,
+    ticks: u32,
+}
+
+impl Face {
+    /// STRIAAUTOSAVE (SR883): an autosave is owed (dirty and unwritten) or owed removal (clean with one written): `serve`
+    /// runs its clock. Never without a document path.
+    pub fn autosave_pending(&self) -> bool {
+        if self.doc_path.is_none() {
+            return false;
+        }
+        if self.dirty() { self.autosave.written.as_ref() != Some(&self.state.timeline) } else { self.autosave.written.is_some() }
+    }
+    /// STRIAAUTOSAVE (SR883): one clock tick of the autosave: a clean face removes the file it wrote; a dirty unwritten one
+    /// counts the tick and writes once AUTOSAVE_EDITS edits or AUTOSAVE_SECS of ticks have passed. True only when a write
+    /// failed (`autosave: <path>: <why>` on the message row: repaint); each attempt restarts both counts.
+    pub fn autosave_tick(&mut self) -> bool {
+        let Some(doc) = self.doc_path.clone() else { return false };
+        if !self.dirty() {
+            if self.autosave.written.is_some() {
+                self.drop_autosave();
+            } else {
+                self.autosave.depth = self.state.undo_depth();
+                self.autosave.ticks = 0;
+            }
+            return false;
+        }
+        if self.autosave.written.as_ref() == Some(&self.state.timeline) {
+            return false;
+        }
+        self.autosave.ticks = self.autosave.ticks.saturating_add(1);
+        let fps = self.state.timeline.fps().unwrap_or(25).max(1);
+        let edits = self.state.undo_depth().abs_diff(self.autosave.depth);
+        if edits < AUTOSAVE_EDITS && self.autosave.ticks < AUTOSAVE_SECS.saturating_mul(fps) {
+            return false;
+        }
+        self.autosave.ticks = 0;
+        self.autosave.depth = self.state.undo_depth();
+        match self.write_autosave(&doc) {
+            Ok(()) => false,
+            Err(e) => {
+                self.last_error = Some(format!("autosave: {e}"));
+                true
+            }
+        }
+    }
+    /// STRIAAUTOSAVE (SR883): the timeline the autosave file holds, when this face wrote (or recovered) one.
+    pub fn autosaved(&self) -> Option<&Timeline> {
+        self.autosave.written.as_ref()
+    }
+    /// STRIAAUTOSAVE (SR883): `save`'s text for `doc` (the ONE writer, titled by the document's stem).
+    fn doc_text(&self, doc: &std::path::Path) -> Result<String, String> {
+        let title = doc.file_stem().and_then(|s| s.to_str()).unwrap_or("untitled");
+        timeline_core::edl::write(&self.state.timeline, title).map_err(|e| format!("{}: {e}", doc.display()))
+    }
+    /// STRIAAUTOSAVE (SR883): write the autosave atomically (the `.tmp` sibling, then rename over the autosave).
+    fn write_autosave(&mut self, doc: &std::path::Path) -> Result<(), String> {
+        let path = autosave_path(doc);
+        let text = self.doc_text(doc)?;
+        let mut tmp = path.clone().into_os_string();
+        tmp.push(".tmp");
+        let tmp = std::path::PathBuf::from(tmp);
+        std::fs::write(&tmp, text.as_bytes()).map_err(|e| format!("{}: {e}", tmp.display()))?;
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("{}: {e}", path.display()));
+        }
+        self.autosave.written = Some(self.state.timeline.clone());
+        Ok(())
+    }
+    /// STRIAAUTOSAVE (SR883): remove the autosave (a saved document) and restart the counts from the current undo depth.
+    fn drop_autosave(&mut self) {
+        if let Some(doc) = self.doc_path.clone() {
+            let _ = std::fs::remove_file(autosave_path(&doc));
+        }
+        self.autosave = Autosave { written: None, depth: self.state.undo_depth(), ticks: 0 };
+    }
+    /// STRIAAUTOSAVE (SR883): at open, an autosave strictly newer than the document is offered on the message row. Nothing
+    /// is read or applied here.
+    fn offer_autosave(&mut self) {
+        let Some(doc) = self.doc_path.clone() else { return };
+        let path = autosave_path(&doc);
+        let modified = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified());
+        let newer = match (modified(&path), modified(&doc)) {
+            (Ok(a), Ok(d)) => a > d,
+            _ => false,
+        };
+        if newer {
+            let name = |p: &std::path::Path| p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned());
+            self.last_error = Some(format!("autosave: {} is newer than {}; the word recover loads it", name(&path), name(&doc)));
+        }
+    }
+    /// STRIAAUTOSAVE (SR883): the `recover` word; a refusal is `recover: <why>` on the message row.
+    fn autosave_verb(&mut self, v: &str) -> Option<bool> {
+        if v != "recover" {
+            return None;
+        }
+        if let Err(e) = self.recover() {
+            self.last_error = Some(format!("recover: {e}"));
+        }
+        Some(true)
+    }
+    /// STRIAAUTOSAVE (SR883): read the autosave and apply it as ONE commit; the face is then dirty against the document and
+    /// the file stays (it holds the timeline) until `save`.
+    pub fn recover(&mut self) -> Result<(), String> {
+        let Some(doc) = self.doc_path.clone() else { return Err("no document path".into()) };
+        let path = autosave_path(&doc);
+        if !path.is_file() {
+            return Err(format!("no autosave ({})", path.display()));
+        }
+        let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let tl = timeline_core::edl::parse(&text, self.state.timeline.fps().unwrap_or(25)).map_err(|e| format!("{}: {e}", path.display()))?;
+        if !self.state.restore(tl) {
+            return Err("the autosave matches the timeline".into());
+        }
+        self.autosave = Autosave { written: Some(self.state.timeline.clone()), depth: self.state.undo_depth(), ticks: 0 };
+        Ok(())
+    }
 }
