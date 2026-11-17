@@ -1090,7 +1090,7 @@ fn btrt_box(data: &[u8], kids: &[BoxHeader]) -> Option<(u32, u32, u32)> {
 // the chapters read so far; a file cut short is walked as `Demuxer::open_partial` walks it.
 
 /// STRIACHAPTERSMKV (SR9096): the file's `chpl` chapters as (start ns, title), in file order; empty when it has none.
-pub fn chapters(data: &[u8]) -> Vec<(i64, String)> {
+pub fn chapters(data: &[u8]) -> Vec<(i64, String, Option<i64>)> { // STRIACHAPTERSRANGE (SR9121): the triple of `facts::chapters_of`; chpl carries no end (None)
     let mut out = Vec::new();
     let top = boxes_partial(data);
     let Some(moov) = child(&top, b"moov") else { return out };
@@ -1105,7 +1105,7 @@ pub fn chapters(data: &[u8]) -> Vec<(i64, String)> {
     for _ in 0..n {
         let (Ok(start), Ok(len)) = (r.u64(), r.u8()) else { break };
         let Ok(title) = r.bytes(len as usize) else { break };
-        out.push((start.saturating_mul(100).min(i64::MAX as u64) as i64, String::from_utf8_lossy(title).into_owned()));
+        out.push((start.saturating_mul(100).min(i64::MAX as u64) as i64, String::from_utf8_lossy(title).into_owned(), None)); // STRIACHAPTERSRANGE (SR9121): chpl has no end
     }
     out
 }

@@ -2435,7 +2435,7 @@ mod chapters_mkv_kats {
         let (a, b) = (crate::Demuxer::open(plain).unwrap(), crate::Demuxer::open(file.clone()).unwrap());
         let rows = |d: &crate::Demuxer| d.track_samples(0).map(|s| d.sample_data(s).to_vec()).collect::<Vec<_>>();
         assert_eq!(rows(&a), rows(&b), "samples unchanged");
-        let back = vec![(80_000_000i64, String::from("Act 1")), (400_000_000, String::from("End"))];
+        let back = vec![(80_000_000i64, String::from("Act 1"), None), (400_000_000, String::from("End"), Some(800_000_000i64))]; // STRIACHAPTERSRANGE (SR9121): the ChapterTimeEnd read back
         assert_eq!(crate::mkv::chapters(&file), back);
         assert_eq!(crate::facts::chapters_of(&file), back);
     }
@@ -2448,11 +2448,35 @@ mod chapters_mkv_kats {
         let x = Mp4Extras { chapters: vec![(80_000_050, String::from("Act 1"), None), (400_000_000, long, None)], ..Default::default() };
         let file = synth_reel(1000, 30, 25, &x);
         let cut: String = core::iter::repeat('x').take(255).collect();
-        let back = vec![(80_000_000i64, String::from("Act 1")), (400_000_000, cut)];
+        let back = vec![(80_000_000i64, String::from("Act 1"), None::<i64>), (400_000_000, cut, None)]; // STRIACHAPTERSRANGE (SR9121): chpl has no end
         assert_eq!(crate::mp4::chapters(&file), back);
         assert_eq!(crate::facts::chapters_of(&file), back);
         assert!(crate::mp4::chapters(&synth_reel(1000, 30, 25, &Mp4Extras::default())).is_empty());
         assert!(crate::facts::chapters_of(b"not a container at all").is_empty());
         assert!(crate::mkv::chapters(&mux(&[pcm()], Container::Mkv, &Mp4Extras::default()).unwrap()).is_empty());
+    }
+}
+
+// ---- STRIACHAPTERSRANGE (LEDGER SR9121): a Matroska chapter's end read back (named tail block) ----
+
+#[cfg(test)]
+mod striachaptersrange_kats {
+    use super::*;
+    use alloc::string::String;
+    use alloc::vec;
+
+    /// STRIACHAPTERSRANGE M3: a ranged chapter's ChapterTimeEnd comes back from the Matroska one-shot (`mkv::chapters`
+    /// and `facts::chapters_of`), a point chapter's as None; an MP4's `chpl` gives None for every chapter.
+    #[test]
+    fn striachaptersrange_mkv_end_read_back() {
+        let pcm: Vec<i16> = (0..48_000 * 2 / 5).map(|i| (i % 3000) as i16 - 1500).collect();
+        let t = [pcm16_track(1, 48_000, 2, &pcm, 1024)];
+        let ch = vec![(80_000_000i64, String::from("Act 1"), None), (400_000_000, String::from("End"), Some(800_000_000i64))];
+        let file = mux(&t, Container::Mkv, &Mp4Extras { chapters: ch.clone(), ..Default::default() }).unwrap();
+        assert_eq!(crate::mkv::chapters(&file), ch);
+        assert_eq!(crate::facts::chapters_of(&file), ch);
+        let mp4 = synth_reel(1000, 30, 25, &Mp4Extras { chapters: ch, ..Default::default() });
+        assert!(crate::facts::chapters_of(&mp4).iter().all(|c| c.2.is_none()), "chpl carries no end");
+        assert_eq!(crate::mp4::chapters(&mp4).len(), 2);
     }
 }

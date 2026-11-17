@@ -863,10 +863,10 @@ fn colour_master(data: &[u8], e: &El) -> Option<crate::colour::Colour> {
 // ---- STRIACHAPTERSMKV (LEDGER SR9096): the Matroska chapters read back (named tail block) ----
 // NLE-CHAPTERS-PROBE: Chapters 0x1043A770 -> the first EditionEntry 0x45B9 holding a ChapterAtom 0xB6 -> each atom's
 // ChapterTimeStart 0x91 (ns) and its first ChapterDisplay 0x80's ChapString 0x85. The Segment's top level is walked by
-// `read_el` up to an unknown-size element (a live Cluster); nested chapters and ChapterTimeEnd are not read.
+// `read_el` up to an unknown-size element (a live Cluster); nested chapters are not read. STRIACHAPTERSRANGE (SR9121): ChapterTimeEnd 0x92 is read too.
 
 /// STRIACHAPTERSMKV (SR9096): the file's chapters as (start ns, title), sorted by start; empty when it has none.
-pub fn chapters(data: &[u8]) -> Vec<(i64, String)> {
+pub fn chapters(data: &[u8]) -> Vec<(i64, String, Option<i64>)> { // STRIACHAPTERSRANGE (SR9121): a ranged chapter's ChapterTimeEnd (ns) too, None without one
     let mut out = Vec::new();
     let Ok((_, seg)) = segment(data) else { return out };
     let mut p = seg.body;
@@ -883,7 +883,7 @@ pub fn chapters(data: &[u8]) -> Vec<(i64, String)> {
                         .and_then(|d| kids(data, d.body, d.end).ok()?.into_iter().find(|x| x.id == 0x85))
                         .map(|s| string(data, &s))
                         .unwrap_or_default();
-                    out.push((start.min(i64::MAX as u64) as i64, title));
+                    let end = parts.iter().find(|x| x.id == 0x92).and_then(|x| uint(data, x).ok()).map(|e| e.min(i64::MAX as u64) as i64); out.push((start.min(i64::MAX as u64) as i64, title, end)); // STRIACHAPTERSRANGE (SR9121): the ChapterTimeEnd
                 }
                 if !out.is_empty() {
                     break;

@@ -5232,12 +5232,12 @@ impl Timeline {
     }
 
     /// The timeline with a point marker per chapter of `ch` ((start ns, title)) at tick `tb.from_ns(start)`; a chapter
-    /// `mark` refuses (a negative tick, a tick already marked) is skipped, so the first at a tick wins.
-    pub fn with_chapters(&self, ch: &[(i64, String)]) -> Timeline {
+    /// `mark` refuses (a negative tick, a tick already marked) is skipped, so the first at a tick wins. STRIACHAPTERSRANGE (SR9121): a chapter with an end after its start becomes a ranged marker.
+    pub fn with_chapters(&self, ch: &[(i64, String, Option<i64>)]) -> Timeline {
         let mut tl = self.clone();
-        for (ns, name) in ch {
+        for (ns, name, end) in ch {
             if let Ok(t) = tl.mark(self.tb.from_ns(*ns), name) {
-                tl = t;
+                tl = t.with_chapter_len(self.tb.from_ns(*ns), self.tb.from_ns(end.unwrap_or(*ns))); // STRIACHAPTERSRANGE (SR9121): the read-back end as `Marker.len` (file tail)
             }
         }
         tl
@@ -5253,7 +5253,7 @@ mod striachaptersmkv_tests {
     #[test]
     fn striachaptersmkv_with_chapters() {
         let tl = Timeline::new(25);
-        let ch = alloc::vec![(80_000_000, String::from("Act 1")), (400_000_000, String::from("End")), (401_000_000, String::from("Dup")), (-40_000_000, String::from("Neg"))];
+        let ch = alloc::vec![(80_000_000, String::from("Act 1"), None), (400_000_000, String::from("End"), None), (401_000_000, String::from("Dup"), None), (-40_000_000, String::from("Neg"), None)]; // STRIACHAPTERSRANGE (SR9121): the triple
         let t = tl.with_chapters(&ch);
         assert_eq!(t.markers.iter().map(|m| (m.at, m.name.as_str(), m.len)).collect::<Vec<_>>(), alloc::vec![(2, "Act 1", 0), (10, "End", 0)]);
         assert_eq!(tl.with_chapters(&[]), tl);
@@ -5420,5 +5420,47 @@ impl Timeline {
             SizePolicy::Adopt if !alone => SizePolicy::Letterbox,
             p => p,
         }
+    }
+}
+
+// ---- STRIACHAPTERSRANGE (LEDGER SR9121): a read-back chapter end as a ranged marker (named tail block) ----
+// NLE-CHAPTERS-RANGE-PROBE: a chapter read back with an end (Matroska ChapterTimeEnd, demux_core `facts::chapters_of`)
+// becomes a ranged marker through the one `range_marker` (`Marker.len` = end tick - start tick); an end at or before its
+// start, or none (an MP4 `chpl`), leaves the point marker. A QuickTime text chapter track is owed (NLE-CHAPTERS-QT).
+
+impl Timeline {
+    /// The timeline with the marker at tick `at` spanning to tick `end` when `end > at`; otherwise (or when
+    /// `range_marker` refuses) the timeline unchanged.
+    fn with_chapter_len(self, at: i64, end: i64) -> Timeline {
+        if end > at {
+            if let Some(t) = self.range_marker(at, end - at) {
+                return t;
+            }
+        }
+        self
+    }
+}
+
+#[cfg(test)]
+mod striachaptersrange_tests {
+    use super::*;
+
+    /// STRIACHAPTERSRANGE M3: at 25 fps a chapter 80 ms .. 400 ms lands at tick 2 with len 8; an end equal to or before
+    /// its start, and no end, give point markers; a chapter at a taken tick is skipped and the first keeps its len.
+    #[test]
+    fn striachaptersrange_with_chapters_ranged() {
+        let tl = Timeline::new(25);
+        let ch = alloc::vec![
+            (80_000_000, String::from("A"), Some(400_000_000)),
+            (81_000_000, String::from("Dup"), Some(1_000_000_000)),
+            (600_000_000, String::from("Same"), Some(600_000_000)),
+            (800_000_000, String::from("Back"), Some(400_000_000)),
+            (1_000_000_000, String::from("Point"), None),
+        ];
+        let t = tl.with_chapters(&ch);
+        assert_eq!(
+            t.markers.iter().map(|m| (m.at, m.name.as_str(), m.len)).collect::<Vec<_>>(),
+            alloc::vec![(2, "A", 8), (15, "Same", 0), (20, "Back", 0), (25, "Point", 0)]
+        );
     }
 }
