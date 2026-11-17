@@ -186,7 +186,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         ["wheel", n] => SMessage::BrowserScroll(0.0, -nle_face::WHEEL_STEP * px(n)?, 0),
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
         [w @ ("kind" | "ease"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
-        ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, // NLE5DKEYSHELP (SR744): the keys help word (no button: not a VERBS word)
+        ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button
         _ => return None,
     };
     Some(vec![one])
@@ -517,6 +517,7 @@ fn transport() -> TetraNode {
         button("in", "Range In"), button("out", "Range Out"), // NLE5DEXPORTRANGE (SR717): the export range's marks at the playhead
         button("kind", "Kind"), button("ease", "Ease"), // NLETRANSITIONFACE (SR691): the selected transition's kind / ease cycle
         button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
+        button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
 }
 
@@ -731,6 +732,34 @@ mod nle5dkeyshelp_tests {
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!((f.help_shown(), f.playing, f.rate), (false, false, 1));
         println!("nle5dkeyshelp witness: help -> ,\"help\":true; key:? shows; key:j dismisses unapplied");
+    }
+}
+
+// ---- NLE5DKEYSHELPBUTTON (LEDGER SR765): the `?` transport button — the keys help word on the bar (named tail block) ----
+
+#[cfg(test)]
+mod nle5dkeyshelpbutton_tests {
+    use super::*;
+
+    /// NLE5DKEYSHELPBUTTON M3: the transport row's LAST button is `help` labelled `?`, firing the face's `help` word; driving
+    /// that word (the `--do` road the click takes) carries `"help":true` on the line, a second press clears it.
+    #[test]
+    fn help_button_is_the_last_and_toggles_the_help() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let Some(TetraNode::Button { id, label, action }) = row.last() else { panic!("no last button") };
+        assert_eq!((id.as_str(), label.as_str()), ("help", "?"));
+        let SMessage::Input { target, text } = action else { panic!("not an Input") };
+        assert_eq!((target.as_str(), text.as_str()), (SURFACE, "help"));
+        let (tl, src) = nle_face::synth_fixture();
+        let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert_eq!(help_json(&f), "");
+        let errors = drive(&mut f, text);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(help_json(&f), ",\"help\":true");
+        let errors = drive(&mut f, text);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(help_json(&f), "");
+        println!("nle5dkeyshelpbutton witness: last button {id} {label:?} -> ,\"help\":true, again -> cleared");
     }
 }
 
