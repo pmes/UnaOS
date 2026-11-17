@@ -360,7 +360,7 @@ impl FontDb {
                     .min()
                     .unwrap_or(usize::MAX)
             };
-            let mut idx: Vec<(usize, usize, usize, usize)> = self
+            let mut idx: Vec<(usize, usize, (f32, f32, f32), usize)> = self
                 .faces
                 .iter()
                 .enumerate()
@@ -368,11 +368,11 @@ impl FontDb {
                     let r = rank(f);
                     // inside one family the regular face first (the pattern asks for weight 400, roman)
                     let st =
-                        (f.style.weight - 400.0).abs() as usize + if f.style.slant == Slant::Normal { 0 } else { 1000 };
+                        fc_default_key(f.style); // AETHERFALLBACKFCPATTERNORDER (SR787): fontconfig's distance to the default pattern
                     (r, if r == usize::MAX { scanned += 1; latin_rank(self, i) } else { 0 }, st, i)
                 })
                 .collect();
-            idx.sort();
+            idx.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let kb = (self.scan_bytes() - b0) / 1024;
             eprintln!("[fonts] fallback faces={scanned} bytes_read={kb} ms={}", t0.elapsed().as_millis());
             idx.into_iter().map(|t| t.3).collect()
@@ -926,7 +926,7 @@ mod tests {
     fn whole_order(db: &FontDb) -> Vec<usize> {
         let expanded = db.config.expand(&["sans-serif"]);
         let mut last: Option<(PathBuf, Option<Vec<u8>>)> = None;
-        let mut idx: Vec<(usize, usize, usize, usize)> = Vec::new();
+        let mut idx: Vec<(usize, usize, (f32, f32, f32), usize)> = Vec::new();
         for (i, f) in db.faces.iter().enumerate() {
             let r = f
                 .families
@@ -934,7 +934,7 @@ mod tests {
                 .filter_map(|n| expanded.iter().position(|e| family_eq(e, n)))
                 .min()
                 .unwrap_or(usize::MAX);
-            let st = (f.style.weight - 400.0).abs() as usize + if f.style.slant == Slant::Normal { 0 } else { 1000 };
+            let st = fc_default_key(f.style); // AETHERFALLBACKFCPATTERNORDER (SR787): the walk's own key
             let lr = if r == usize::MAX {
                 if last.as_ref().is_none_or(|(p, _)| *p != f.path) {
                     last = Some((f.path.clone(), std::fs::read(&f.path).ok()));
@@ -950,7 +950,7 @@ mod tests {
             };
             idx.push((r, lr, st, i));
         }
-        idx.sort();
+        idx.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         idx.into_iter().map(|t| t.3).collect()
     }
 
@@ -991,6 +991,90 @@ mod tests {
             return;
         }
         assert_eq!(db.fallback_order(), &whole_order(db)[..], "the host's fallback order");
+    }
+
+    // ---- AETHERFALLBACKFCPATTERNORDER (LEDGER SR787): the within-family fallback order is fontconfig's (named tail block) ----
+
+    /// A fake two-family database (ranked faces read no file): inside one family rank the faces sort by
+    /// [`fc_default_key`] (slant, then FC weight, then FC width against the default pattern), the family rank
+    /// first and the unaliased face last; the whole-read twin agrees.
+    #[test]
+    fn fallback_fc_default_order_kat() {
+        let (n, i, o) = (Slant::Normal, Slant::Italic, Slant::Oblique);
+        let face = |name: &str, family: &str, style: Style| FaceInfo {
+            path: PathBuf::from(format!("/fake/{name}.ttf")),
+            index: 0,
+            families: vec![family.to_string()],
+            full_names: vec![name.to_string()],
+            style,
+        };
+        let faces = vec![
+            face("A-Oblique", "Fam A", st(400.0, o, 100.0)),
+            face("A-Bold", "Fam A", st(700.0, n, 100.0)),
+            face("B-Regular", "Fam B", st(400.0, n, 100.0)),
+            face("A-Italic", "Fam A", st(400.0, i, 100.0)),
+            face("A-Condensed", "Fam A", st(400.0, n, 75.0)),
+            face("A-Regular", "Fam A", st(400.0, n, 100.0)),
+            face("Unlisted", "Unlisted", st(400.0, n, 100.0)),
+        ];
+        let mut c = Config::default();
+        c.read_str(
+            r#"<fontconfig>
+  <alias><family>sans-serif</family><prefer><family>Fam A</family><family>Fam B</family></prefer></alias>
+</fontconfig>"#,
+            Path::new("/etc/fonts"),
+        );
+        let db = FontDb::from_faces(faces, c);
+        let names: Vec<&str> = db.fallback_order().iter().map(|&k| db.faces[k].full_names[0].as_str()).collect();
+        assert_eq!(names, ["A-Regular", "A-Condensed", "A-Bold", "A-Italic", "A-Oblique", "B-Regular", "Unlisted"]);
+        assert_eq!(db.fallback_order(), &whole_order(&db)[..], "the twin reads the same key");
+    }
+
+    /// The host's within-family order against `fc-match -a sans-serif` (the unpruned sort): over the first 30
+    /// faces fc-match lists that this database indexes, grouped by consecutive first family, each group's
+    /// [`fc_default_key`] sequence in fc-match's order equals the one in our fallback order (blind to the order
+    /// of tied faces). Skipped without faces or fontconfig's tools.
+    #[test]
+    fn fallback_within_family_vs_fc_match() {
+        let db = db();
+        if db.faces.is_empty() {
+            return;
+        }
+        let Ok(out) = std::process::Command::new("fc-match")
+            .args(["-a", "--format", "%{file}#%{index}\\n", "sans-serif"])
+            .output()
+        else {
+            return;
+        };
+        let key = |f: &FaceInfo| format!("{}#{}", f.path.display(), f.index);
+        let mut fc: Vec<usize> = Vec::new();
+        for l in String::from_utf8_lossy(&out.stdout).lines() {
+            if let Some(k) = db.faces.iter().position(|f| key(f) == l) {
+                if !fc.contains(&k) {
+                    fc.push(k);
+                }
+            }
+            if fc.len() == 30 {
+                break;
+            }
+        }
+        let order = db.fallback_order();
+        let pos = |k: usize| order.iter().position(|&x| x == k).unwrap_or(usize::MAX);
+        let mut groups = 0usize;
+        let mut start = 0;
+        while start < fc.len() {
+            let fam = &db.faces[fc[start]].families[0];
+            let end = (start..fc.len()).find(|&j| &db.faces[fc[j]].families[0] != fam).unwrap_or(fc.len());
+            let group = &fc[start..end];
+            let theirs: Vec<(f32, f32, f32)> = group.iter().map(|&k| fc_default_key(db.faces[k].style)).collect();
+            let mut ours_idx = group.to_vec();
+            ours_idx.sort_by_key(|&k| pos(k));
+            let ours: Vec<(f32, f32, f32)> = ours_idx.iter().map(|&k| fc_default_key(db.faces[k].style)).collect();
+            assert_eq!(ours, theirs, "{fam}: our within-family order vs fc-match -a");
+            groups += 1;
+            start = end;
+        }
+        eprintln!("[fcpattern] within-family oracle faces={} groups={groups}", fc.len());
     }
 }
 
@@ -1347,4 +1431,13 @@ mod fcpattern_tests {
         }
         eprintln!("[fcpattern] style oracle compared={compared} skipped={skipped}");
     }
+}
+
+// ---- AETHERFALLBACKFCPATTERNORDER (LEDGER SR787): the fallback sort's within-family key (named tail block) ----
+
+/// The within-family key of [`FontDb::fallback_order`] (fontconfig's `sans-serif` FcFontSort): the face's
+/// [`fc_style_distance`] to fontconfig's default pattern (weight REGULAR 80, slant ROMAN 0, width NORMAL 100,
+/// i.e. `Style::default()`), compared lexicographically. The fallback walk and its test twin read this ONE fn.
+pub fn fc_default_key(s: Style) -> (f32, f32, f32) {
+    fc_style_distance(s, Style::default())
 }
