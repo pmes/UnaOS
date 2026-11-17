@@ -3661,3 +3661,28 @@ fn striamultiselect_shift_click_two_clips_gain_steps_both_one_undo() {
     assert!(face.verb("undo"));
     assert_eq!(face.state.timeline, tl0, "one undo per word restores the whole set");
 }
+
+// ---- STRIAFADESET (LEDGER SR906): fades over the whole selection (named tail block) ----
+// A click and a shift-click build NLE2c's set across V1 and A1; `fade-in <n>` sets every clip of it through timeline_core's
+// `EditorState::fades_set` as ONE commit (the message line reads the primary's fades), so one undo restores the whole set.
+
+#[test]
+fn striafadeset_shift_click_two_clips_fade_in_both_one_undo() {
+    let (tl, src) = stria::nle_face::synth_fixture();
+    let mut face = stria::nle_face::Face::new(stria::nle_face::EditorState::new(tl), src, (320, 160), stria::nle_face::PixelOrder::Rgba, false);
+    let tl0 = face.state.timeline.clone();
+    let (x, y) = face.layout().point(0, 15); // V1's B[0,10)@10
+    face.on(&nle3eslipdrag_btn(true, x, y, 0));
+    face.on(&nle3eslipdrag_btn(false, x, y, 0));
+    let (x, y) = face.layout().point(1, 30); // A1's A[23,33)@25
+    face.on(&nle3eslipdrag_btn(true, x, y, bandy::MOD_SHIFT));
+    face.on(&nle3eslipdrag_btn(false, x, y, bandy::MOD_SHIFT));
+    assert_eq!((face.state.selection, face.state.set.clone()), (Some((1, 2)), vec![(0, 1), (1, 2)]));
+    assert!(face.verb("fade-in 2"));
+    let f = |f: &stria::nle_face::Face| f.state.timeline.tracks.iter().map(|t| t.clips.iter().map(|c| (c.fade_in, c.fade_out)).collect::<Vec<_>>()).collect::<Vec<_>>();
+    assert_eq!(f(&face), vec![vec![(0, 0), (2, 0), (0, 0)], vec![(0, 0), (0, 0), (2, 0)]], "both selected clips faded, the rest none");
+    assert_eq!(face.last_error.take().as_deref(), Some("fade-in 2, fade-out 0"));
+    assert_eq!(face.state.undo_depth(), 1, "ONE commit for the set");
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.timeline, tl0, "one undo restores the whole set");
+}
