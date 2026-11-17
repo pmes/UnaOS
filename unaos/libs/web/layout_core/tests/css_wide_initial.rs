@@ -510,6 +510,83 @@ fn inherit_box_paint_families() {
     assert_eq!(c.position_kind, Some(1), "position: inherit is relative");
 }
 
+// ---- AETHERFONTRELINVALIDSUPERSEDES (LEDGER SR1055): font_rel records only the length declarations an arm accepted (named tail block) ----
+
+/// The value `font_rel` holds for `prop` (the font-relative replay's entry), if any.
+fn font_rel_of(s: &SpecifiedStyle<TH>, prop: &str) -> Option<String> {
+    s.paint.font_rel.as_ref()?.iter().find(|(p, _)| p == prop).map(|(_, v)| v.clone())
+}
+
+/// AETHERFONTRELINVALIDSUPERSEDES (SR1055): `width: 2em; width: bogus` keeps `width -> 2em` in the replay list (it held
+/// `bogus`, so the element's width stopped following its font). The first pass's width is None (the arm writes None on
+/// refusal: AETHER-CSS-INVALID-DECLARATION-AUDIT), pinned as today.
+#[test]
+fn font_rel_invalid_width_keeps_earlier() {
+    let s = styled(&[("width", "2em"), ("width", "bogus")]);
+    assert_eq!(font_rel_of(&s, "width").as_deref(), Some("2em"), "the refused bogus does not displace 2em");
+    assert_eq!(s.width, None, "the first pass's None write, pinned as today");
+    let one = styled(&[("width", "2em")]);
+    assert_eq!(font_rel_of(&one, "width").as_deref(), Some("2em"), "a lone 2em is recorded");
+}
+
+/// AETHERFONTRELINVALIDSUPERSEDES (SR1055): a later ACCEPTED value supersedes (`2em; 3em` keeps 3em, one entry).
+#[test]
+fn font_rel_invalid_later_valid_supersedes() {
+    let s = styled(&[("width", "2em"), ("width", "3em")]);
+    assert_eq!(font_rel_of(&s, "width").as_deref(), Some("3em"));
+    let n = s.paint.font_rel.as_ref().unwrap().iter().filter(|(p, _)| p == "width").count();
+    assert_eq!(n, 1, "one entry per property");
+}
+
+/// AETHERFONTRELINVALIDSUPERSEDES (SR1055): a css-wide value never reaches an arm and stays recorded (`width: inherit`
+/// must re-resolve).
+#[test]
+fn font_rel_invalid_css_wide_recorded() {
+    let s = styled(&[("width", "2em"), ("width", "inherit")]);
+    assert_eq!(font_rel_of(&s, "width").as_deref(), Some("inherit"));
+}
+
+/// AETHERFONTRELINVALIDSUPERSEDES (SR1055): `padding-left: auto` (refused: padding takes no auto) keeps 1em; a negative
+/// padding is ACCEPTED by the arm today (parse_length_percentage_str takes negatives: the audit's), pinned as today.
+#[test]
+fn font_rel_invalid_padding_refused() {
+    let s = styled(&[("padding-left", "1em"), ("padding-left", "auto")]);
+    assert_eq!(font_rel_of(&s, "padding-left").as_deref(), Some("1em"), "auto refused: 1em stands");
+    let s = styled(&[("padding-left", "1em"), ("padding-left", "-1px")]);
+    assert_eq!(font_rel_of(&s, "padding-left").as_deref(), Some("-1px"), "a negative is accepted today (pinned)");
+}
+
+/// AETHERFONTRELINVALIDSUPERSEDES (SR1055): the undo puts the displaced entry back at its index, so cascade order holds:
+/// `margin-left: 1em; margin: 2em; margin-left: bogus` replays margin-left THEN margin (the shorthand wins).
+#[test]
+fn font_rel_invalid_keeps_cascade_order() {
+    let s = styled(&[("margin-left", "1em"), ("margin", "2em"), ("margin-left", "bogus")]);
+    let list: Vec<(String, String)> = s.paint.font_rel.clone().unwrap();
+    let want = vec![("margin-left".to_string(), "1em".to_string()), ("margin".to_string(), "2em".to_string())];
+    assert_eq!(list, want);
+}
+
+/// AETHERFONTRELINVALIDSUPERSEDES (SR1055): the guard that no refusal road was missed: every length property given
+/// `1em` then a refused `bogus` keeps `1em`.
+#[test]
+fn font_rel_invalid_every_length_arm() {
+    let props = [
+        "width", "height", "min-width", "min-height", "max-width", "max-height", "margin", "margin-top", "margin-right",
+        "margin-bottom", "margin-left", "padding", "padding-top", "padding-right", "padding-bottom", "padding-left", "top",
+        "right", "bottom", "left", "inset", "gap", "row-gap", "column-gap", "flex-basis", "flex", "border", "border-top",
+        "border-right", "border-bottom", "border-left", "border-width", "border-top-width", "border-right-width",
+        "border-bottom-width", "border-left-width", "border-radius", "letter-spacing", "line-height", "vertical-align",
+        "border-spacing", "outline", "outline-width", "outline-offset", "text-indent",
+    ];
+    for p in props {
+        assert!(layout_core::css::is_length_property(p), "{p} is a length property");
+        let s = styled(&[(p, "1em"), (p, "bogus")]);
+        assert_eq!(font_rel_of(&s, p).as_deref(), Some("1em"), "{p}: the refused bogus leaves 1em in font_rel");
+    }
+    let extra = styled(&[("border-radius", "1em"), ("border-radius", "1px 2px 3px 4px 5px")]);
+    assert_eq!(font_rel_of(&extra, "border-radius").as_deref(), Some("1em"), "five radii refused through the early return");
+}
+
 // ---- AETHERCSSWIDEALL (LEDGER SR1021): css-cascade-4 §3.1 the all shorthand over ONE longhand list (named tail block) ----
 
 use layout_core::css::{ALL_LONGHANDS, ALL_SKIPPED};

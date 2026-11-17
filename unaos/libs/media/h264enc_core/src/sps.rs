@@ -66,6 +66,10 @@ pub struct SeqParams {
     pub colour: Option<(u8, u8, u8, bool)>,
     /// H264ENCHRD (SR699): the rate controller's bucket as the VUI's timing_info + nal_hrd_parameters; None writes both flags 0.
     pub hrd: Option<Hrd>,
+    /// H264ENCHRDVCL (SR1060): beside `hrd`, the same table as vcl_hrd_parameters with cbr_flag 0; unread when `hrd` is None.
+    pub hrd_vcl: bool,
+    /// H264ENCHRDPICSTRUCT (SR1066): VUI pic_struct_present_flag 1 (`Config::pic_struct`); unread when `hrd` is None.
+    pub pic_struct: bool,
 }
 
 /// level_idc for a frame of `mb_w` x `mb_h` macroblocks: the lowest level of Table A-1 whose
@@ -135,8 +139,8 @@ pub fn write_sps(p: &SeqParams) -> Vec<u8> {
     w.flag(false); // chroma_loc_info_present_flag
     w.flag(p.hrd.is_some()); if let Some(h) = p.hrd { timing_info(&mut w, &h); } // timing_info_present_flag (H264ENCHRD SR699: the HRD's clock)
     w.flag(p.hrd.is_some()); if let Some(h) = p.hrd { hrd_parameters(&mut w, &h); } // nal_hrd_parameters_present_flag (H264ENCHRD SR699)
-    w.flag(false); if p.hrd.is_some() { w.flag(false); } // vcl_hrd_parameters_present_flag; low_delay_hrd_flag 0 under the NAL HRD (SR699)
-    w.flag(false); // pic_struct_present_flag
+    let vcl = p.hrd.filter(|_| p.hrd_vcl).map(|h| Hrd { cbr: false, ..h }); w.flag(vcl.is_some()); if let Some(h) = vcl { hrd_parameters(&mut w, &h); } if p.hrd.is_some() { w.flag(false); } // vcl_hrd_parameters_present_flag (+ the NAL table with cbr_flag 0 under Config::hrd_vcl, H264ENCHRDVCL SR1060); low_delay_hrd_flag 0, written once (SR699)
+    w.flag(p.pic_struct && p.hrd.is_some()); // pic_struct_present_flag (H264ENCHRDPICSTRUCT SR1066: Config::pic_struct under the HRD, the pic_timing its carrier)
     w.flag(true); // bitstream_restriction_flag
     w.flag(true); // motion_vectors_over_pic_boundaries_flag
     w.ue(2); // max_bytes_per_pic_denom
@@ -373,20 +377,21 @@ fn sei_payload(mut w: BitWriter) -> Vec<u8> {
 }
 
 /// sei_rbsp (7.3.2.3) of one access unit under the HRD: on an IDR (`bp` Some(initial_cpb_removal_delay in 90 kHz units)) a
-/// buffering_period (D.1.2: seq_parameter_set_id 0, the delay and a zero offset for the one NAL CPB), then the pic_timing
-/// (D.1.3: cpb_removal_delay and dpb_output_delay in ticks, pic_struct_present_flag 0); rbsp_trailing_bits.
-pub fn sei_rbsp(bp: Option<u32>, cpb_removal_delay: u32, dpb_output_delay: u32) -> Vec<u8> {
+/// buffering_period (D.1.2: seq_parameter_set_id 0, the delay and a zero offset for the one NAL CPB, and with `vcl` (SR1060) the same
+/// pair for the one VCL CPB), then the pic_timing
+/// (D.1.3: cpb_removal_delay and dpb_output_delay in ticks, then with `pic_struct` (SR1066) its pic_struct fields); rbsp_trailing_bits.
+pub fn sei_rbsp(bp: Option<u32>, vcl: bool, cpb_removal_delay: u32, dpb_output_delay: u32, pic_struct: Option<u8>) -> Vec<u8> {
     let mut out = Vec::new();
     if let Some(delay) = bp {
         let mut w = BitWriter::new();
         w.ue(0); // seq_parameter_set_id
         w.u(24, delay); // initial_cpb_removal_delay[0]
-        w.u(24, 0); // initial_cpb_removal_delay_offset[0]
+        w.u(24, 0); if vcl { w.u(24, delay); w.u(24, 0); } // initial_cpb_removal_delay_offset[0]; the VCL HRD's pair under Config::hrd_vcl (H264ENCHRDVCL SR1060)
         sei_message(&mut out, 0, &sei_payload(w));
     }
     let mut w = BitWriter::new();
     w.u(24, cpb_removal_delay & 0xFF_FFFF); // cpb_removal_delay
-    w.u(24, dpb_output_delay & 0xFF_FFFF); // dpb_output_delay
+    w.u(24, dpb_output_delay & 0xFF_FFFF); if let Some(s) = pic_struct { pic_struct_fields(&mut w, s); } // dpb_output_delay; pic_struct + its clock_timestamp_flags (H264ENCHRDPICSTRUCT SR1066)
     sei_message(&mut out, 1, &sei_payload(w));
     out.push(0x80); // rbsp_trailing_bits
     out
@@ -397,4 +402,18 @@ pub fn filler_rbsp(n: usize) -> Vec<u8> {
     let mut v = alloc::vec![0xFFu8; n];
     v.push(0x80);
     v
+}
+
+// ---- H264ENCHRDPICSTRUCT (LEDGER SR1066): the pic_timing SEI's pic_struct fields (named tail block) ----
+
+/// NumClockTS per pic_struct 0..=8 (D.2.3 Table D-1).
+const NUM_CLOCK_TS: [u8; 9] = [1, 1, 1, 2, 2, 3, 3, 2, 3];
+
+/// The pic_struct_present_flag fields of pic_timing (D.1.3): pic_struct u(4), then NumClockTS clock_timestamp_flag 0 (no clock
+/// timestamps: owed H264ENC-HRD-CLOCK-TIMESTAMP). Written after the CpbDpbDelaysPresentFlag fields.
+fn pic_struct_fields(w: &mut BitWriter, s: u8) {
+    w.u(4, s as u32); // pic_struct
+    for _ in 0..NUM_CLOCK_TS[s.min(8) as usize] {
+        w.flag(false); // clock_timestamp_flag[i]
+    }
 }
