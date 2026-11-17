@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 26] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail)
+pub const VERBS: [&str; 28] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "opacity-", "opacity+", "help"]; // STRIAOPACITYFACE (SR898): `opacity-` / `opacity+` step the selection's opacity 10 % (file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -235,7 +235,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
+        if let Some(r) = self.opacity_word(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } // STRIAOPACITYFACE (SR898): the opacity step words name the percent (file tail); NLEHOSTSAVE (SR677): the save verb (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -3095,5 +3095,25 @@ impl Face {
             return None;
         }
         stall_since(j.rate_at.0.elapsed(), j.rate_ema)
+    }
+}
+
+// ---- STRIAOPACITYFACE (LEDGER SR898): the opacity step buttons and their message (named tail block) ----
+// `opacity-` / `opacity+` (VERBS, the transport's two buttons) go through timeline_core's ONE verb dispatch
+// (`EditorState::step_opacity`, one commit) and the message line then reads `opacity: <pct> %` (the primary selected clip's
+// percent); a refusal reads `opacity: <EditError>`. The typed `opacity <pct>` keeps SR868's road (silent on success).
+
+impl Face {
+    /// STRIAOPACITYFACE: an opacity step word through the one dispatch, its percent on the message line; `None` for any
+    /// other word.
+    fn opacity_word(&mut self, v: &str) -> Option<bool> {
+        if !matches!(v, "opacity-" | "opacity+") {
+            return None;
+        }
+        self.last_error = Some(match self.state.verb(v).unwrap_or(Err(EditError::NoClip)) {
+            Ok(()) => format!("opacity: {} %", self.state.selected().map_or(timeline_core::OPAQUE, |c| c.opacity)),
+            Err(e) => format!("opacity: {e}"),
+        });
+        Some(true)
     }
 }

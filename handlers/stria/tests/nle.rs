@@ -3700,3 +3700,29 @@ fn striaopacity_face_word_is_one_undo_step() {
     assert_eq!(face.last_error.take().as_deref(), Some("opacity 150: opacity is a percent 0..=100, and video only"));
     assert_eq!(face.state.undo_depth(), 1);
 }
+
+// ---- STRIAOPACITYFACE (LEDGER SR898): the opacity buttons step the clip and the message names the percent (named tail block) ----
+
+/// The transport's `opacity-` five times takes the selected clip to 50 % as five undo steps and the message line reads
+/// `opacity: 50 %`; `opacity+` reads `opacity: 60 %`; with nothing selected the refusal is named on the message line.
+#[test]
+fn striaopacityface_face_buttons_step_and_name_the_percent() {
+    use stria::nle_face::{EditorState, Face, PixelOrder, VERBS, synth_fixture};
+    let (tl0, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl0.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    assert!(face.verb("opacity-"));
+    assert_eq!(face.last_error.take(), Some(format!("opacity: {}", EditError::NoClip)), "nothing selected");
+    assert_eq!(face.state.timeline, tl0);
+    face.state.select(0, 1).unwrap();
+    for _ in 0..5 {
+        assert!(VERBS.contains(&"opacity-"));
+        assert!(face.verb("opacity-"));
+    }
+    assert_eq!(face.last_error.take().as_deref(), Some("opacity: 50 %"));
+    assert_eq!(face.state.undo_depth(), 5);
+    assert_eq!(face.state.timeline, tl0.set_opacity(&[(0, 1)], 50).unwrap());
+    assert!(face.verb("opacity+"));
+    assert_eq!(face.last_error.take().as_deref(), Some("opacity: 60 %"));
+    assert_eq!(face.message_text(), face.reel_line(), "the message is taken: the idle line again");
+    println!("striaopacityface: opacity- x5 -> 50 %, opacity+ -> 60 %, undo depth {}", face.state.undo_depth());
+}

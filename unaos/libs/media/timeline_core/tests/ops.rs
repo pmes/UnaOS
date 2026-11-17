@@ -266,3 +266,63 @@ fn striaopacity_opacity_word_is_one_undo_step() {
     assert_eq!(st.verb("opacity 50"), Some(Err(EditError::Opacity)), "an audio clip");
     assert_eq!(st.timeline, tl);
 }
+
+// ---- STRIAOPACITYFACE (LEDGER SR898): the opacity step words and the body painted at its opacity (named tail block) ----
+
+/// `opacity-` steps the primary's opacity 10 % down as ONE undo step each, clamped at 0 (the eleventh step commits
+/// nothing); `opacity+` steps back up; no selection is `NoClip`, an audio clip `Opacity`.
+#[test]
+fn striaopacityface_step_words_clamp_and_commit_once() {
+    use timeline_core::editor::EditorState;
+    let (mut tl, a, _) = base();
+    tl.tracks[1].clips = vec![Clip::new(a, 0, 10, 0)];
+    let mut st = EditorState::new(tl.clone());
+    assert_eq!(st.verb("opacity-"), Some(Err(EditError::NoClip)), "nothing selected");
+    st.select(0, 0).unwrap();
+    assert_eq!(st.verb("opacity-"), Some(Ok(())));
+    assert_eq!((st.selected().map(|c| c.opacity), st.undo_depth()), (Some(90), 1));
+    for _ in 0..9 {
+        assert_eq!(st.verb("opacity-"), Some(Ok(())));
+    }
+    assert_eq!((st.selected().map(|c| c.opacity), st.undo_depth()), (Some(0), 10));
+    assert_eq!(st.verb("opacity-"), Some(Ok(())));
+    assert_eq!((st.selected().map(|c| c.opacity), st.undo_depth()), (Some(0), 10), "at 0 nothing commits");
+    assert_eq!(st.verb("opacity+"), Some(Ok(())));
+    assert_eq!((st.selected().map(|c| c.opacity), st.undo_depth()), (Some(10), 11));
+    assert_eq!(st.timeline, tl.set_opacity(&[(0, 0)], 10).unwrap());
+    st.select(1, 0).unwrap();
+    assert_eq!(st.verb("opacity-"), Some(Err(EditError::Opacity)), "an audio clip");
+    assert_eq!(st.undo_depth(), 11);
+}
+
+/// A clip at 50 % paints its body as `view::opacity_colour` of its reel colour over the row colour, at 0 % the row colour
+/// itself; an opaque clip (also one set back to 100 %) paints byte for byte as before.
+#[test]
+fn striaopacityface_body_paints_at_its_opacity() {
+    use timeline_core::editor::EditorState;
+    use timeline_core::view::{self, Layout, Order, ROW, clip_colour, opacity_colour};
+    let (tl, a, _) = base();
+    let (w, h) = (320u32, 160u32);
+    let paint = |tl: &Timeline| view::paint(&EditorState::new(tl.clone()), w, h, Order::Rgba, None, None);
+    let st = EditorState::new(tl.clone());
+    let l = Layout::of(w, h, &st);
+    let (x, y) = l.point(0, 5);
+    let at = |px: &[u8]| {
+        let i = ((y as usize) * w as usize + x as usize) * 4;
+        [px[i], px[i + 1], px[i + 2], px[i + 3]]
+    };
+    let before = paint(&tl);
+    let reel = clip_colour(a.0, Kind::Video);
+    assert_eq!(at(&before), reel, "opaque: the reel colour");
+    let half = tl.set_opacity(&[(0, 0)], 50).unwrap();
+    let want = opacity_colour(reel, ROW[0], 50);
+    assert_ne!(want, reel);
+    assert_eq!(at(&paint(&half)), want, "50 %: the blend");
+    for ch in 0..3 {
+        let (c, r) = (reel[ch] as i32, ROW[0][ch] as i32);
+        assert!((want[ch] as i32 - (r + (c - r) / 2)).abs() <= 1, "channel {ch}: half way");
+    }
+    assert_eq!(at(&paint(&tl.set_opacity(&[(0, 0)], 0).unwrap())), ROW[0], "0 %: the row colour");
+    assert_eq!(paint(&half.set_opacity(&[(0, 0)], timeline_core::OPAQUE).unwrap()), before, "back to opaque: byte-identical");
+    assert_eq!(opacity_colour(reel, ROW[0], timeline_core::OPAQUE), reel);
+}
