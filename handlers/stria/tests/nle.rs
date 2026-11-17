@@ -3792,7 +3792,7 @@ fn striarollkeys_paren_keys_roll_one_frame() {
 }
 
 /// Rule: `Ctrl+Shift+parenright` rolls the cut SLIP_STEP frames later through slipslide_word's `roll+10` -> `roll 10`
-/// (A [13,23)@0 | B [0,20)@10 -> A [13,33)@0 | B [10,20)@20), `Meta+Shift+parenleft` ten back; a roll the ops refuse is
+/// (A [13,23)@0 | B [0,20)@10 -> A [13,33)@0 | B [10,20)@20), `Shift+Meta+parenleft` ten back; a roll the ops refuse is
 /// taken and read on the message row as `roll+10: <err>` with the timeline kept.
 #[test]
 fn striarollkeys_chords_roll_ten_frames() {
@@ -3804,7 +3804,7 @@ fn striarollkeys_chords_roll_ten_frames() {
     assert!(face.on(&bandy::SMessage::BrowserKey("Ctrl+Shift+parenright".into())));
     assert_eq!(face.state.timeline, tl.roll(0, 0, 10).unwrap());
     assert_eq!(face.state.timeline.tracks[0].clips[..], [Clip::new(SourceId(0), 13, 33, 0), Clip::new(SourceId(1), 10, 20, 20)]);
-    assert!(face.on(&bandy::SMessage::BrowserKey("Meta+Shift+parenleft".into())));
+    assert!(face.on(&bandy::SMessage::BrowserKey("Shift+Meta+parenleft".into())));
     assert_eq!(face.state.timeline, tl);
     assert!(face.last_error.is_none(), "{:?}", face.last_error);
     let (plain, src) = synth_fixture();
@@ -3822,7 +3822,7 @@ fn striarollkeys_chords_roll_ten_frames() {
 #[test]
 fn striarollkeys_help_rows_and_not_verbs() {
     let rows = help_rows();
-    for (keys, w) in [(&["("][..], "roll-"), (&[")"][..], "roll+"), (&["Ctrl+Shift+parenleft", "Meta+Shift+parenleft"][..], "roll-10"), (&["Ctrl+Shift+parenright", "Meta+Shift+parenright"][..], "roll+10")] {
+    for (keys, w) in [(&["("][..], "roll-"), (&[")"][..], "roll+"), (&["Ctrl+Shift+parenleft", "Shift+Meta+parenleft"][..], "roll-10"), (&["Ctrl+Shift+parenright", "Shift+Meta+parenright"][..], "roll+10")] {
         let row = rows.iter().find(|r| r.1 == help_phrase(w)).expect("a help row");
         assert!(HELP.iter().any(|(x, _)| *x == w), "no phrase for {w}");
         assert!(!row.1.is_empty() && row.1 != w, "{w}: a phrase, not the word");
@@ -3840,4 +3840,73 @@ fn striarollkeys_help_rows_and_not_verbs() {
     }
     assert_eq!(face.state.timeline, tl);
     println!("striarollkeys: help rows={} keys={}", rows.len(), KEYS.len());
+}
+
+// ---- STRIAROLLMORE (LEDGER SR954): the roll tool on the face — r / `roll-tool`, the trim-handle drag rolls (named tail block) ----
+
+/// Rule: `r` (text) and the word `roll-tool` toggle the roll tool; the word is view-only (no undo step, the document stays
+/// clean); it is a VERBS word right before `help` with a HELP phrase, and `r` alone as `BrowserKey` is not taken.
+#[test]
+fn striarollmore_r_and_the_word_toggle_the_tool() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    assert!(!face.roll_tool());
+    assert!(!face.on(&bandy::SMessage::BrowserKey("r".into())), "a one-char BrowserKey alone is not taken");
+    assert!(face.on(&bandy::SMessage::BrowserText("r".into())));
+    assert!(face.roll_tool());
+    assert!(face.verb("roll-tool"));
+    assert!(!face.roll_tool());
+    assert_eq!((&face.state.timeline, face.state.undo_depth(), face.dirty()), (&tl, 0, false));
+    assert_eq!(VERBS[VERBS.len() - 2..], ["roll-tool", "help"]);
+    assert!(KEYS.contains(&("r", "roll-tool")));
+    assert_ne!(help_phrase("roll-tool"), "roll-tool");
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    println!("striarollmore: r / roll-tool toggle the tool, no undo step, clean");
+}
+
+/// Rule: the tool on, an Alt-press (no snap) on V1 clip 0's out handle (synth_fixture: A [13,23)@0 | B [0,10)@10 butted)
+/// dragged +3 ticks is ONE roll: the timeline equals `Timeline::roll(0, 0, 3)`, one undo step restores it; the tool off,
+/// the same handle dragged -3 is the plain trim (clip 0 ends at 7, clip 1 stays at 10).
+#[test]
+fn striarollmore_tool_drag_rolls_the_cut() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    face.state.select(0, 0).unwrap();
+    assert!(face.verb("roll-tool"));
+    let l = face.layout();
+    let (x, y) = (l.x_of(10) as f64 - 2.0, l.point(0, 5).1);
+    face.on(&nle3eslipdrag_btn(true, x, y, bandy::MOD_ALT));
+    assert_eq!(face.dragging().map(|d| (d.kind, d.idx, d.roll)), Some((DragKind::TrimOut, 0, true)));
+    face.on(&bandy::SMessage::BrowserMouseMove(x + 3.0 * l.zoom as f64, y, 0));
+    face.on(&nle3eslipdrag_btn(false, x + 3.0 * l.zoom as f64, y, bandy::MOD_ALT));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!(face.state.timeline, tl.roll(0, 0, 3).unwrap());
+    assert_eq!(face.state.undo_depth(), 1);
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.timeline, tl);
+    assert!(face.verb("roll-tool"));
+    face.state.select(0, 0).unwrap();
+    face.on(&nle3eslipdrag_btn(true, x, y, bandy::MOD_ALT));
+    assert_eq!(face.dragging().map(|d| (d.kind, d.roll)), Some((DragKind::TrimOut, false)));
+    face.on(&bandy::SMessage::BrowserMouseMove(x - 3.0 * l.zoom as f64, y, 0));
+    face.on(&nle3eslipdrag_btn(false, x - 3.0 * l.zoom as f64, y, bandy::MOD_ALT));
+    let v1 = &face.state.timeline.tracks[0].clips;
+    assert_eq!((v1[0], v1[1].at), (Clip::new(SourceId(0), 13, 20, 0), 10));
+    println!("striarollmore: tool on = Timeline::roll(0, 0, 3); tool off = the plain trim");
+}
+
+/// Rule: while the tool is on the message line names it (after any error); off, the line is what it was.
+#[test]
+fn striarollmore_message_names_the_tool() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    let before = face.message_text();
+    assert!(face.verb("roll-tool"));
+    assert_eq!(face.message_text().as_deref(), Some(stria::nle_face::ROLL_TOOL_NOTE));
+    face.last_error = Some("x".into());
+    assert_eq!(face.message_text().as_deref(), Some("x"));
+    face.last_error = None;
+    assert!(face.verb("roll-tool"));
+    assert_eq!(face.message_text(), before);
+    println!("striarollmore: the message line reads {:?} while the tool is on", stria::nle_face::ROLL_TOOL_NOTE);
 }
