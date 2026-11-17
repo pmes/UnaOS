@@ -237,13 +237,14 @@ pub struct Face {
     watched: Vec<(String, String)>, // STRIAPROXYTHREE (SR9026): each reel's file stamp as last opened (file tail)
     ripple_all: bool, // STRIARIPPLETHREE (SR9034): a ripple drag runs on every track (file tail)
     xform_drag: Option<view::XformDrag>, // STRIAXFORMTHREE (SR9033): the live placement drag on the preview picture (file tail)
+    entry: Option<String>, // STRIAGOTOMORE (SR9097): the open entry line's text (`None`: closed, the default) (file tail)
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, note: None, note: None, rate: 1, drag: None, drag_shown: DragShown::default(), pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, frame_saved: None, peaks: WavePeaks::default(), tc: None, slip_view: None, loudness: None, meter_hold: MeterHold::default(), help_query: None, info: None, export_queue: std::collections::VecDeque::new(), snap_off: false, autosave: Autosave::default(), keymap: Keymap::default(), proxy: None, reel_paths: Vec::new(), zoom_fit: None, pcache: PreviewCache::default(), proxy_queue: Vec::new(), proxy_hold: None, laid: None, lcache: LabelCache::default(), xform_note: None, export_preset: None, preset_note: None, roll_tool: false, slip_hold: None, crop_drag: None, note: None, note: None, note: None, note: None, note: None, note: None, note: None, note: None, watched: Vec::new(), scan: NormalizeScan::default(), note: None, ripple_all: false, headers: None, xform_drag: None, note: None, note: None, sources_gen: 0, reloaded: Vec::new() }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, note: None, note: None, rate: 1, drag: None, drag_shown: DragShown::default(), pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, frame_saved: None, peaks: WavePeaks::default(), tc: None, slip_view: None, loudness: None, meter_hold: MeterHold::default(), help_query: None, info: None, export_queue: std::collections::VecDeque::new(), snap_off: false, autosave: Autosave::default(), keymap: Keymap::default(), proxy: None, reel_paths: Vec::new(), zoom_fit: None, pcache: PreviewCache::default(), proxy_queue: Vec::new(), proxy_hold: None, laid: None, lcache: LabelCache::default(), xform_note: None, export_preset: None, preset_note: None, roll_tool: false, slip_hold: None, crop_drag: None, note: None, note: None, note: None, note: None, note: None, note: None, note: None, note: None, watched: Vec::new(), scan: NormalizeScan::default(), note: None, ripple_all: false, headers: None, xform_drag: None, note: None, note: None, sources_gen: 0, reloaded: Vec::new(), entry: None }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -251,7 +252,7 @@ impl Face {
     }
     /// One message from the surface or the buttons; true when the canvas must be repainted.
     pub fn on(&mut self, msg: &SMessage) -> bool {
-        if let Some(r) = self.bin_input(msg) { return r; } if let Some(r) = self.preview_meter_input(msg) { return r; } if let Some(r) = self.crop_drag_on(msg) { return r; } if let Some(r) = self.xform_drag_on(msg) { return r; } if let Some(r) = self.preview_history_input(msg) { return r; } if let Some(r) = self.source_ruler_input(msg) { return r; } if let Some(r) = self.source_drag_input(msg) { return r; } if !self.takes(msg) { return false; } self.laid_clear(msg); self.xform_note = None; self.preset_note = None; self.note = None; self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); self.watch_sources(msg); self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } if let Some(r) = self.clipboard_key(msg) { return r; } if let Some(r) = self.help_type_input(msg) { return r; } if let Some(r) = self.history_pick(msg) { return r; } // STRIAPASTEKEYS (SR921): BrowserCopy / BrowserPaste reach Face::key as the Ctrl+c / Ctrl+v chords (file tail); NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's; STRIAPROJECTBIN (SR885): the bin Surface's pointer first (file tail); STRIATRACKGAINTHREE (SR9024): an acting input clears the note (file tail); STRIATITLESTYLEFACE (SR9077): an input clears the note (file tail); STRIASOURCEDRAG (SR9081): the split preview Surface's source drag (file tail)
+        if let Some(r) = self.bin_input(msg) { return r; } if let Some(r) = self.preview_meter_input(msg) { return r; } if let Some(r) = self.crop_drag_on(msg) { return r; } if let Some(r) = self.xform_drag_on(msg) { return r; } if let Some(r) = self.preview_history_input(msg) { return r; } if let Some(r) = self.source_ruler_input(msg) { return r; } if let Some(r) = self.source_drag_input(msg) { return r; } if !self.takes(msg) { return false; } self.laid_clear(msg); self.xform_note = None; self.preset_note = None; self.note = None; self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); self.watch_sources(msg); self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } if let Some(r) = self.clipboard_key(msg) { return r; } if let Some(r) = self.help_type_input(msg) { return r; } if let Some(r) = self.history_pick(msg) { return r; } if let Some(r) = self.entry_input(msg) { return r; } // STRIAPASTEKEYS (SR921): BrowserCopy / BrowserPaste reach Face::key as the Ctrl+c / Ctrl+v chords (file tail); NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's; STRIAPROJECTBIN (SR885): the bin Surface's pointer first (file tail); STRIATRACKGAINTHREE (SR9024): an acting input clears the note (file tail); STRIATITLESTYLEFACE (SR9077): an input clears the note (file tail); STRIASOURCEDRAG (SR9081): the split preview Surface's source drag (file tail)
         match msg {
             SMessage::Input { target, text } if target == SURFACE => self.verb(text), SMessage::ConsoleInput(q) => self.help_field(q), // STRIAHELPMORE (SR977): the bar's help query field, its Enter (file tail)
             SMessage::BrowserClick(x, y, _) if !self.buttons => self.click(*x, *y),
@@ -278,7 +279,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     fn verb_unnamed(&mut self, v: &str) -> bool {
-        if let Some(r) = self.env_curve_face_verb(v) { return r; } if let Some(r) = self.transition_step_note(v) { return r; } if let Some(r) = self.env_face_verb(v) { return r; } if let Some(r) = self.normalize_lufs_verb(v) { return r; } if let Some(r) = self.opacity_key_word(v) { return r; } if let Some(r) = self.target_verb(v) { return r; } if let Some(r) = self.proxy_words(v) { return r; } if let Some(r) = self.opacity_word(v) { return r; } if let Some(r) = self.meter_reset_verb(v) { return r; } if let Some(r) = self.normalize_verb(v) { return r; } if let Some(r) = self.proxy_verb(v) { return r; } if let Some(r) = self.gaps_note_verb(v) { return r; } if let Some(r) = self.track_order_word(v) { return r; } if let Some(r) = self.laid_verb(v) { return r; } if let Some(r) = self.xform_note_verb(v) { return r; } if let Some(r) = self.preset_verb(v) { return r; } if let Some(r) = self.transition_len_verb(v) { return r; } if let Some(r) = self.track_flag_face_verb(v) { return r; } if let Some(r) = self.headers_verb(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.info_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.snap_verb(v) { return r; } if let Some(r) = self.export_marker_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.frame_verb(v) { return r; } if let Some(r) = self.clip_audio_verb(v) { return r; } if let Some(r) = self.marker_verb(v) { return r; } if let Some(r) = self.fit_verb(v) { return r; } if let Some(r) = self.tc_verb(v) { return r; } if let Some(r) = self.nudge_verb(v) { return r; } if let Some(r) = self.track_remove_verb(v) { return r; } if let Some(r) = self.loudness_verb(v) { return r; } if let Some(r) = self.help_search_verb(v) { return r; } if let Some(r) = self.autosave_verb(v) { return r; } if let Some(r) = self.pan_face_verb(v) { return r; } if let Some(r) = self.track_gain_face_verb(v) { return r; } if let Some(r) = self.export_queue_verb(v) { return r; } if let Some(r) = self.jump_verb(v) { return r; } if let Some(r) = self.roll_tool_verb(v) { return r; } if let Some(r) = self.marker_style_verb(v) { return r; } if let Some(r) = self.ripple_all_verb(v) { return r; } if let Some(r) = self.marker_marks_verb(v) { return r; } if let Some(r) = self.goto_verb(v) { return r; } // STRIANORMALIZE (SR878): the normalize word (file tail); STRIACLIPGAINFACE (SR838): the gain / fade words and their message (file tail); STRIATRACKGAINSTEP (SR901): the track gain words and their message (file tail); STRIAOPACITYKEYS (SR9048): `opacity-key` / `opacity-unkey` and their note (file tail); STRIAOPACITYFACE (SR898): the opacity step words name the percent (file tail); STRIAPANFACE (SR897): the pan words and their readout (file tail); STRIATRACKORDERKEYS (SR922): the track words name the move (file tail); STRIAEXPORTRANGE (SR9075): `export marker(s)` before `export` takes the words (file tail); STRIAMARKERRANGES (SR9052): `marker marks` (file tail); STRIAMARKERJUMPKEYSNEXT (SR984): `marker colour` / `marker range` (file tail); NLEHOSTSAVE (SR677): the save verb (file tail); STRIATRACKADDREMOVE (SR856): `track-` names what went (file tail); STRIAGAPSBLACK (SR909): the close-gaps note of removed black fades (file tail); STRIAINSERTMARKSKEYSNEXT (SR985): `target` (file tail); STRIATRACKGAINTHREE (SR9024): mute / solo and their note (file tail); STRIATRACKSTHREE (SR9038): `headers` (file tail); STRIAGAINENVELOPE (SR9047): the env words and their note (file tail); STRIAGAINENVCURVE (SR9083): `env-curve` and its note (file tail)
+        if let Some(r) = self.env_curve_face_verb(v) { return r; } if let Some(r) = self.transition_step_note(v) { return r; } if let Some(r) = self.env_face_verb(v) { return r; } if let Some(r) = self.normalize_lufs_verb(v) { return r; } if let Some(r) = self.opacity_key_word(v) { return r; } if let Some(r) = self.target_verb(v) { return r; } if let Some(r) = self.proxy_words(v) { return r; } if let Some(r) = self.opacity_word(v) { return r; } if let Some(r) = self.meter_reset_verb(v) { return r; } if let Some(r) = self.normalize_verb(v) { return r; } if let Some(r) = self.proxy_verb(v) { return r; } if let Some(r) = self.gaps_note_verb(v) { return r; } if let Some(r) = self.track_order_word(v) { return r; } if let Some(r) = self.laid_verb(v) { return r; } if let Some(r) = self.xform_note_verb(v) { return r; } if let Some(r) = self.preset_verb(v) { return r; } if let Some(r) = self.transition_len_verb(v) { return r; } if let Some(r) = self.track_flag_face_verb(v) { return r; } if let Some(r) = self.headers_verb(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.info_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.snap_verb(v) { return r; } if let Some(r) = self.export_marker_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.frame_verb(v) { return r; } if let Some(r) = self.clip_audio_verb(v) { return r; } if let Some(r) = self.marker_verb(v) { return r; } if let Some(r) = self.fit_verb(v) { return r; } if let Some(r) = self.tc_verb(v) { return r; } if let Some(r) = self.nudge_verb(v) { return r; } if let Some(r) = self.track_remove_verb(v) { return r; } if let Some(r) = self.loudness_verb(v) { return r; } if let Some(r) = self.help_search_verb(v) { return r; } if let Some(r) = self.autosave_verb(v) { return r; } if let Some(r) = self.pan_face_verb(v) { return r; } if let Some(r) = self.track_gain_face_verb(v) { return r; } if let Some(r) = self.export_queue_verb(v) { return r; } if let Some(r) = self.jump_verb(v) { return r; } if let Some(r) = self.roll_tool_verb(v) { return r; } if let Some(r) = self.marker_style_verb(v) { return r; } if let Some(r) = self.ripple_all_verb(v) { return r; } if let Some(r) = self.marker_marks_verb(v) { return r; } if let Some(r) = self.goto_verb(v) { return r; } if let Some(r) = self.tc_amount_verb(v) { return r; } // STRIANORMALIZE (SR878): the normalize word (file tail); STRIACLIPGAINFACE (SR838): the gain / fade words and their message (file tail); STRIATRACKGAINSTEP (SR901): the track gain words and their message (file tail); STRIAOPACITYKEYS (SR9048): `opacity-key` / `opacity-unkey` and their note (file tail); STRIAOPACITYFACE (SR898): the opacity step words name the percent (file tail); STRIAPANFACE (SR897): the pan words and their readout (file tail); STRIATRACKORDERKEYS (SR922): the track words name the move (file tail); STRIAEXPORTRANGE (SR9075): `export marker(s)` before `export` takes the words (file tail); STRIAMARKERRANGES (SR9052): `marker marks` (file tail); STRIAMARKERJUMPKEYSNEXT (SR984): `marker colour` / `marker range` (file tail); NLEHOSTSAVE (SR677): the save verb (file tail); STRIATRACKADDREMOVE (SR856): `track-` names what went (file tail); STRIAGAPSBLACK (SR909): the close-gaps note of removed black fades (file tail); STRIAINSERTMARKSKEYSNEXT (SR985): `target` (file tail); STRIATRACKGAINTHREE (SR9024): mute / solo and their note (file tail); STRIATRACKSTHREE (SR9038): `headers` (file tail); STRIAGAINENVELOPE (SR9047): the env words and their note (file tail); STRIAGAINENVCURVE (SR9083): `env-curve` and its note (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -480,6 +481,10 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Alt+o", "src-out"),
     ("_", "dur-"), ("*", "dur+"), // STRIAKDUR (SR9089): _ / * (text) the kernel Player's bytes for the transition step
     ("Alt+e", "env"), ("Alt+Shift+E", "env-del"), ("Alt+Down", "env-"), ("Alt+Up", "env+"), // STRIAGAINENVDRAG (SR9082): chords for the env words (GTK order Ctrl, Alt, Shift, Meta; Face::verb: the note)
+    ("Ctrl+g", "enter goto"), // STRIAGOTOMORE (SR9097): Ctrl / Cmd+g opens the entry line holding `goto `, Ctrl / Cmd+Return opens it empty (file tail)
+    ("Meta+g", "enter goto"),
+    ("Ctrl+Return", "enter"),
+    ("Meta+Return", "enter"),
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
     ("E", "export-skip"), // STRIAEXPORTQUEUELIST (SR932): Shift+e (text, both faces) skips the running export through the `export-skip` word; STRIAUNDOJUMP (SR934): `h` lists the undo history
     ("Shift+Escape", "export-skip"), // STRIAEXPORTQUEUETHREE (SR9042): GTK's Shift+Esc skips the running export (AppKit drops Escape; `E` is its key)
@@ -581,7 +586,7 @@ impl Face {
             return false;
         }
         let Some(act) = self.bound(k) else { return false }; // STRIAKEYBOARDMAP (SR886): the face's key overlay first, then KEYS (file tail)
-        if self.help { self.help = false; return true; } if act == "help" { return self.verb(act); } // NLE5DKEYSHELP (SR744): a taken key while the help shows only dismisses it (not applied); `?` shows it through the one verb
+        if self.help { self.help = false; return true; } if act == "help" { return self.verb(act); } if let Some(r) = self.entry_open(act) { return r; } // NLE5DKEYSHELP (SR744): a taken key while the help shows only dismisses it (not applied); `?` shows it through the one verb
         if VERBS.contains(&act) || slipslide_word(act).is_some() || act.starts_with("crop-") || matches!(act, "pip key" | "pip unkey") { // STRIACROPMORE (SR960): the crop chords' SR900 step words; STRIAKXFORMKEYS (LEDGER SR9073): the key words through the face's one verb road; NLE3ESLIPSTEP (SR752): the 10-frame words are keys, not VERBS: the same road
             return self.verb(act);
         }
@@ -2400,7 +2405,7 @@ impl Face {
     }
     /// The face's message line: the last error while one stands, else [`Face::reel_line`].
     pub fn message_text(&self) -> Option<String> {
-        self.last_error.clone().or_else(|| self.info_text()).or_else(|| self.xform_note.clone()).or_else(|| self.preset_note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.export.as_ref().map(|j| job_line(j) + &self.waiting_note())).or_else(|| self.laid.clone()).or_else(|| self.shuttle_line()).or_else(|| self.roll_tool_note()).or_else(|| self.ripple_all_note()).or_else(|| self.state.source_line()).or_else(|| self.stack_note()).or_else(|| self.reel_line()) // STRIAXFORMPRESETS (SR938): the placement line after a pip / scale word (file tail) // STRIAJKLMORE (SR945): the shuttle rate after the export line (file tail) // STRIAEXPORTQUEUEMORE (SR971): the running row names the waiting count (file tail).or_else(|| self.picked_line()) // STRIAEXPORTPRESETSNEXT (SR989): the picked preset as the last fallback (file tail) // STRIASTACKTOOL (SR9093): the layer count under the playhead (file tail). STRIAOPACITYNEXT (SR993): a standing note after the error (file tail) // STRIAGAPSTHREE (SR9028): the face note after the error (file tail) // STRIARIPPLETHREE (SR9034): the tool's line while it is on // STRIASOURCEVIEWER (SR9045): the loaded source's standing line (timeline_core editor.rs tail)
+        self.entry_line().or_else(|| self.last_error.clone().or_else(|| self.info_text()).or_else(|| self.xform_note.clone()).or_else(|| self.preset_note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone())).or_else(|| self.export.as_ref().map(|j| job_line(j) + &self.waiting_note())).or_else(|| self.laid.clone()).or_else(|| self.shuttle_line()).or_else(|| self.roll_tool_note()).or_else(|| self.ripple_all_note()).or_else(|| self.state.source_line()).or_else(|| self.stack_note()).or_else(|| self.reel_line()) // STRIAXFORMPRESETS (SR938): the placement line after a pip / scale word (file tail) // STRIAJKLMORE (SR945): the shuttle rate after the export line (file tail) // STRIAEXPORTQUEUEMORE (SR971): the running row names the waiting count (file tail).or_else(|| self.picked_line()) // STRIAEXPORTPRESETSNEXT (SR989): the picked preset as the last fallback (file tail) // STRIASTACKTOOL (SR9093): the layer count under the playhead (file tail). STRIAOPACITYNEXT (SR993): a standing note after the error (file tail) // STRIAGAPSTHREE (SR9028): the face note after the error (file tail) // STRIARIPPLETHREE (SR9034): the tool's line while it is on // STRIASOURCEVIEWER (SR9045): the loaded source's standing line (timeline_core editor.rs tail) // STRIAGOTOMORE (SR9097): the open entry line wins the row (file tail)
     }
     /// The message over a painted canvas: one line at x 4, baseline the message row's foot - 4, clipped to the canvas width, through
     /// [`Labels`]; unchanged with labels off, on the tracks Surface, or a band under [`MESSAGE_H`].
@@ -2672,6 +2677,8 @@ pub const HELP: &[(&str, &str)] = &[
     ("src-out", "source out at its playhead"),
     ("dur-", "the clip's transition (its head, else its fade to black) one frame shorter"), ("dur+", "the clip's transition (its head, else its fade to black) one frame longer"), // STRIAKDUR (SR9089)
     ("env", "gain point at the playhead"), ("env-del", "remove the gain point at the playhead"), ("env-", "gain point down one step"), ("env+", "gain point up one step"), // STRIAGAINENVDRAG (SR9082)
+    ("enter goto", "go to a typed timecode (Return: go, Escape: cancel)"), // STRIAGOTOMORE (SR9097)
+    ("enter", "type a face word (Return: do it, Escape: cancel)"),
     ("help", "show / hide this help"),
     ("export-skip", "skip the running export (the next waiting one starts)"), // STRIAEXPORTQUEUELIST (SR932): the `E` row // STRIAUNDOJUMP (SR934)
 ];
@@ -10645,7 +10652,7 @@ impl Face {
         }
         let args: Vec<&str> = words.collect();
         match args.as_slice() {
-            [a] => match timeline_core::edl::tc_entry(a, &self.state.timeline) {
+            [a] => match goto_target(a, self.state.playhead, &self.state.timeline) { // STRIAGOTOMORE (SR9097): `goto +<tc>` / `goto -<tc>` from the playhead (file tail)
                 Ok(t) => self.state.seek(t),
                 Err(m) => self.last_error = Some(format!("goto: {m}")),
             },
@@ -11750,5 +11757,113 @@ mod striapacetail_tests {
         assert_eq!((small.width, small.height), (32, 24));
         assert_eq!(paint_in(&st, l, PixelOrder::Rgba, None, Some(&small)), paint_in(&st, l, PixelOrder::Rgba, None, Some(&full)));
         assert!(pace_small(&small, l.w, l.preview_h).is_none());
+    }
+}
+
+// ---- STRIAGOTOMORE (LEDGER SR9097): relative `goto`, timecode amounts and the face's entry line (named tail block) ----
+// `goto +<tc>` / `goto -<tc>` seek from the playhead (`goto_target`, through `timeline_core::edl::tc_delta`, the signed form
+// of THE typed reader `tc_entry`; the seek clamps as every seek does). `slip` / `slide <tc>` and `rtrim in|out <tc>` read a
+// signed timecode through the same `tc_delta` and are rewritten to editor.rs's integer words, then go through `Face::verb` again
+// (THE dispatch, ONE commit); an integer or a text with no `:` / `;` keeps the old road. The entry line: a KEYS action `enter
+// <text>` opens it holding `<text> ` (`Ctrl+g` / `Meta+g`: `goto `), `enter` opens it empty (`Ctrl+Return` / `Meta+Return`);
+// while open it takes `BrowserText` (appended), `BackSpace`, `Return` / `KP_Enter` (closes, fires the trimmed line through
+// `Face::verb`; a word the face does not take is `last_error`) and `Escape` (closes); every other key is taken and ignored.
+// It shows on the message row (`message_text`) as `<text>_`, labels on only, so every labels-off golden is byte-identical.
+// Owed: NLE-TC-ENTRY-FADE / -MARKER / -NUDGE, NLE-TC-ENTRY-SRCRATE, NLE-TC-ENTRY-KERNEL, NLE-TC-ENTRY-CURSOR, NLE-TC-ENTRY-APPKIT-CHORD.
+
+/// STRIAGOTOMORE (SR9097): the tick `goto <a>` names: a signed `a` is relative to the playhead `ph`, else absolute.
+fn goto_target(a: &str, ph: i64, tl: &Timeline) -> Result<i64, String> {
+    if a.starts_with(['+', '-']) {
+        timeline_core::edl::tc_delta(a, tl).map(|d| ph.saturating_add(d))
+    } else {
+        timeline_core::edl::tc_entry(a, tl)
+    }
+}
+
+impl Face {
+    /// `slip` / `slide <tc>` and `rtrim in|out <tc>`: the signed timecode as ticks, then the integer word through
+    /// [`Face::verb`]; a refusal is `last_error`. `None` for any other word, or an amount that is an integer or no timecode.
+    fn tc_amount_verb(&mut self, v: &str) -> Option<bool> {
+        let w: Vec<&str> = v.split_whitespace().collect();
+        let (word, x) = match w.as_slice() {
+            [h @ ("slip" | "slide"), x] => (String::from(*h), *x),
+            ["rtrim", e @ ("in" | "out"), x] => (format!("rtrim {e}"), *x),
+            _ => return None,
+        };
+        if x.parse::<i64>().is_ok() || !x.contains([':', ';']) {
+            return None;
+        }
+        match timeline_core::edl::tc_delta(x, &self.state.timeline) {
+            Ok(d) => Some(self.verb(&format!("{word} {d}"))),
+            Err(m) => {
+                self.last_error = Some(format!("{}: {m}", w[0]));
+                Some(true)
+            }
+        }
+    }
+    /// A KEYS action `enter <text>` opens the entry line holding `<text> `; `enter` opens it empty. `None` for any other action.
+    fn entry_open(&mut self, act: &str) -> Option<bool> {
+        let text = if act == "enter" { String::new() } else { format!("{} ", act.strip_prefix("enter ")?) };
+        self.entry = Some(text);
+        Some(true)
+    }
+    /// While the entry line is open: the typed text, BackSpace, Return (fire), Escape (close); any other key is taken and
+    /// ignored (`Some(false)`). `None` with the line closed, and for every message that is not a key.
+    fn entry_input(&mut self, msg: &SMessage) -> Option<bool> {
+        self.entry.as_ref()?;
+        match msg {
+            SMessage::BrowserText(t) => {
+                if let Some(e) = self.entry.as_mut() {
+                    e.extend(t.chars().filter(|c| !c.is_control()));
+                }
+                Some(true)
+            }
+            SMessage::BrowserKey(k) => match k.as_str() {
+                "Return" | "KP_Enter" => {
+                    let owned = self.entry.take().unwrap_or_default();
+                    let line = owned.trim();
+                    if !line.is_empty() && !self.verb(line) {
+                        self.last_error = Some(format!("{line}: not a face word"));
+                    }
+                    Some(true)
+                }
+                "BackSpace" => {
+                    if let Some(e) = self.entry.as_mut() {
+                        e.pop();
+                    }
+                    Some(true)
+                }
+                "Escape" => {
+                    self.entry = None;
+                    Some(true)
+                }
+                _ => Some(false),
+            },
+            _ => None,
+        }
+    }
+    /// The open entry line as the message row shows it (`<text>_`); `None` while closed.
+    fn entry_line(&self) -> Option<String> {
+        self.entry.as_ref().map(|e| format!("{e}_"))
+    }
+    /// The open entry line's text; `None` while closed.
+    pub fn entry(&self) -> Option<&str> {
+        self.entry.as_deref()
+    }
+}
+
+#[cfg(test)]
+mod striagotomore_tests {
+    use super::*;
+
+    /// `goto_target`: a signed entry is relative to the playhead (clamping is the seek's), a bare one absolute.
+    #[test]
+    fn striagotomore_goto_target_signs() {
+        let tl = Timeline::new(25);
+        assert_eq!(goto_target("+00:00:01:00", 12, &tl), Ok(37));
+        assert_eq!(goto_target("-5", 12, &tl), Ok(7));
+        assert_eq!(goto_target("00:00:01:00", 12, &tl), Ok(25));
+        assert_eq!(goto_target("-20", 12, &tl), Ok(-8), "the seek clamps, not the reader");
+        assert!(goto_target("+", 12, &tl).is_err());
     }
 }

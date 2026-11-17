@@ -2057,3 +2057,17 @@ mod striagainenvcurve_tests {
         assert_eq!(parse(&format!("{plain}* UNA GENV EQUAL \n"), 25), Err(EdlError::Syntax { line: at }));
     }
 }
+
+// ---- STRIAGOTOMORE (LEDGER SR9097): the signed typed timecode (named tail block) ----
+// `tc_delta` is `tc_entry` with an optional leading sign: a relative `goto +<tc>` / `goto -<tc>` and the face's timecode
+// amounts (`slip` / `slide <tc>`, `rtrim in|out <tc>`) read through it. One sign only; the rest is `tc_entry`'s, refusals and all.
+
+/// STRIAGOTOMORE (SR9097): the signed tick count a typed `s` names on `tl` (`+<tc>`, `-<tc>` or a bare `tc_entry` text).
+pub fn tc_delta(s: &str, tl: &Timeline) -> Result<i64, String> {
+    let s = s.trim();
+    match s.as_bytes().first() {
+        Some(b'+') => tc_entry(&s[1..], tl),
+        Some(b'-') => tc_entry(&s[1..], tl).map(|t| -t),
+        _ => tc_entry(s, tl),
+    }
+}

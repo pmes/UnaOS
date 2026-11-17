@@ -15196,3 +15196,117 @@ fn striastackkernel_handoff_renders_with_fewer_seeks() {
     assert_eq!(r.seeks, 3, "B and A at 0, C at 10; no reopen as the stack forms or shrinks");
     println!("striastackkernel: frames={} seeks={} runup={}", r.frames, r.seeks, r.runup_frames);
 }
+
+// ---- STRIAGOTOMORE (LEDGER SR9097): relative `goto`, timecode amounts and the face's entry line (named tail block) ----
+
+fn striagotomore_key(f: &mut Face, k: &str) -> bool {
+    f.on(&bandy::SMessage::BrowserKey(k.into()))
+}
+
+fn striagotomore_text(f: &mut Face, t: &str) -> bool {
+    f.on(&bandy::SMessage::BrowserText(t.into()))
+}
+
+/// On 1/25 from tick 12: `goto +00:00:00:20` seeks to 32, `goto -5` to 27, `goto -99999` clamps to 0; a drop-frame `;` in a
+/// relative entry is refused by name and the playhead stays; no undo step, the document stays clean.
+#[test]
+fn striagotomore_goto_relative() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    let before = face.state.timeline.clone();
+    face.state.seek(12);
+    assert!(face.verb("goto +00:00:00:20"));
+    assert_eq!((face.state.playhead, face.last_error.take()), (32, None));
+    assert!(face.verb("goto -5"));
+    assert_eq!(face.state.playhead, 27);
+    assert!(face.verb("goto +00:00:01;00"));
+    let e = face.last_error.take().unwrap_or_default();
+    assert!(e.starts_with("goto: 00:00:01;00: `;` is drop-frame timecode"), "{e}");
+    assert_eq!(face.state.playhead, 27, "a refused entry does not move the playhead");
+    assert!(face.verb("goto -99999"));
+    assert_eq!(face.state.playhead, 0, "clamped as every seek");
+    assert_eq!((&face.state.timeline, face.state.undo_depth(), face.dirty()), (&before, 0, false));
+    println!("striagotomore: goto +20 frames from 12 -> 32, -5 -> 27, -99999 -> 0");
+}
+
+/// `slip 00:00:00:01` is `slip 1`, `slide -00:00:00:01` is `slide -1`, `rtrim out -00:00:00:01` is `rtrim out -1` (a twin
+/// editor's integer words, the same timelines); `slip 00:00:00;01` off an NTSC base is refused by name and moves nothing;
+/// `slide sideways` stays no face word.
+#[test]
+fn striagotomore_amount_words_take_timecode() {
+    let (mut face, mut twin, tl) = nle3eslipface_pair();
+    assert!(face.verb("slip 00:00:00:01"));
+    assert_eq!(twin.verb("slip 1"), Some(Ok(())));
+    assert_eq!(face.state.timeline, twin.timeline);
+    assert!(face.verb("slide -00:00:00:01"));
+    assert_eq!(twin.verb("slide -1"), Some(Ok(())));
+    assert_eq!(face.state.timeline, twin.timeline);
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.verb("rtrim out -00:00:00:01"));
+    let _ = twin.verb("rtrim out -1");
+    assert_eq!(face.state.timeline, twin.timeline);
+    face.last_error = None;
+    let mid = face.state.timeline.clone();
+    assert!(face.verb("slip 00:00:00;01"));
+    let e = face.last_error.take().unwrap_or_default();
+    assert!(e.starts_with("slip: 00:00:00;01: `;` is drop-frame timecode"), "{e}");
+    assert_eq!(face.state.timeline, mid, "a refused amount moves nothing");
+    assert!(!face.verb("slide sideways"));
+    assert_ne!(face.state.timeline, tl);
+    println!("striagotomore: slip / slide / rtrim read a signed timecode");
+}
+
+/// `Ctrl+g` opens the entry holding `goto `; GTK's single-char `BrowserKey` is taken and ignored, `BrowserText` appends,
+/// BackSpace pops, Return fires `goto 1` (playhead 1, no undo step) and closes; `Meta+Return` opens it empty, Left is taken
+/// and does not nudge, Escape closes; a typed word the face does not take is named; `Ctrl+g` while the help shows only
+/// dismisses the help. No chord is bound to anything else.
+#[test]
+fn striagotomore_chords_open_the_entry_line() {
+    for k in ["Ctrl+g", "Meta+g", "Ctrl+Return", "Meta+Return"] {
+        assert_eq!(KEYS.iter().filter(|(n, _)| *n == k).count(), 1, "{k}");
+    }
+    assert!(!KEYS.iter().any(|(n, _)| *n == "g"), "`g` is the sibling's gap word");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(face.entry().is_none());
+    assert!(striagotomore_key(&mut face, "Ctrl+g"));
+    assert_eq!(face.entry(), Some("goto "));
+    assert!(!striagotomore_key(&mut face, "1"), "taken and ignored");
+    assert!(striagotomore_text(&mut face, "1"));
+    assert!(striagotomore_text(&mut face, "x"));
+    assert!(striagotomore_key(&mut face, "BackSpace"));
+    assert_eq!(face.entry(), Some("goto 1"));
+    assert!(striagotomore_key(&mut face, "Return"));
+    assert_eq!((face.entry(), face.state.playhead, face.state.undo_depth(), face.last_error.take()), (None, 1, 0, None));
+    assert!(striagotomore_key(&mut face, "Meta+Return"));
+    assert_eq!(face.entry(), Some(""));
+    assert!(!striagotomore_key(&mut face, "Right"));
+    assert_eq!(face.state.playhead, 1, "a key while typing is not applied");
+    assert!(striagotomore_key(&mut face, "Escape"));
+    assert!(face.entry().is_none());
+    assert!(striagotomore_key(&mut face, "Ctrl+Return"));
+    assert!(striagotomore_text(&mut face, "bogus"));
+    assert!(striagotomore_key(&mut face, "KP_Enter"));
+    assert_eq!(face.last_error.take().as_deref(), Some("bogus: not a face word"));
+    assert!(face.verb("help"));
+    assert!(striagotomore_key(&mut face, "Ctrl+g"));
+    assert!(!face.help_shown() && face.entry().is_none(), "the shown help is only dismissed");
+    println!("striagotomore: Ctrl+g -> `goto `, typed 1, Return -> playhead 1; Meta+Return empty; Escape closes");
+}
+
+/// A labelled face paints the open entry on the message row and is byte-identical after Escape; a labels-off face is
+/// byte-identical while it is open.
+#[test]
+fn striagotomore_entry_paints_on_the_message_row() {
+    let mut f = nle5dkeyshelp_face(640, 480, true);
+    let before = f.paint();
+    assert!(striagotomore_key(&mut f, "Ctrl+g"));
+    assert_eq!(f.message_text().as_deref(), Some("goto _"));
+    assert_ne!(f.paint(), before, "the entry shows");
+    assert!(striagotomore_key(&mut f, "Escape"));
+    assert_eq!(f.paint(), before, "byte-identical after Escape");
+    let mut off = nle5dkeyshelp_face(640, 480, false);
+    let blank = off.paint();
+    assert!(striagotomore_key(&mut off, "Ctrl+g"));
+    assert_eq!(off.paint(), blank, "labels off: byte-identical");
+}

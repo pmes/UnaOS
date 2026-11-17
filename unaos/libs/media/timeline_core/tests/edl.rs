@@ -753,3 +753,21 @@ fn striadropframeface_entry_refuses_by_name() {
     }
     assert_eq!(edl::tc_entry("00:00:01:25", &striadropframeface_tl(1, 25)), Err(String::from("00:00:01:25 is not HH:MM:SS:FF or a frame count")));
 }
+
+// ---- STRIAGOTOMORE (LEDGER SR9097): the signed typed timecode (named tail block) ----
+
+/// `edl::tc_delta`: `+` / `-` / bare over `tc_entry`, on 1/25 and 30000/1001; a lone sign, a doubled sign and a dropped
+/// drop-frame number are each refused by `tc_entry`'s name.
+#[test]
+fn striagotomore_tc_delta_signs() {
+    let pal = striadropframeface_tl(1, 25);
+    let df = striadropframeface_tl(1001, 30000);
+    assert_eq!(edl::tc_delta("+00:00:01:00", &pal), Ok(25));
+    assert_eq!(edl::tc_delta("-00:00:01:00", &pal), Ok(-25));
+    assert_eq!(edl::tc_delta(" -7 ", &pal), Ok(-7));
+    assert_eq!(edl::tc_delta("00:00:00:05", &pal), Ok(5));
+    assert_eq!(edl::tc_delta("-00:01:00;02", &df), Ok(-1800));
+    assert!(edl::tc_delta("+", &pal).unwrap_err().ends_with("is not HH:MM:SS:FF or a frame count"));
+    assert_eq!(edl::tc_delta("--5", &pal), Err(String::from("-5 is not HH:MM:SS:FF or a frame count")));
+    assert!(edl::tc_delta("-00:01:00;00", &df).unwrap_err().starts_with("00:01:00;00 is a dropped drop-frame number"));
+}
