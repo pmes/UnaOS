@@ -5555,3 +5555,53 @@ mod striaksnap_tests {
         assert_eq!((d.delta, d.guide), (19, None), "the default off moves raw");
     }
 }
+
+// ---- STRIAKSCRUB (LEDGER SR9060): the scrub step's tick (named tail block) ----
+
+impl Drag {
+    /// STRIAKSCRUB (SR9060): THE tick a ruler scrub step shows (the pointer's tick: the press plus the snapped delta);
+    /// `None` for any other drag. The host face's `hover` and the kernel Player's per-step seek both read it.
+    pub fn scrub_tick(&self) -> Option<i64> {
+        (self.kind == DragKind::Scrub).then(|| self.origin_tick + self.delta)
+    }
+}
+
+#[cfg(test)]
+mod kscrub_tests {
+    use super::*;
+    use crate::{Clip, Timeline};
+
+    /// NLEFXA 0..20 at 0 and NLEFXA 20..30 at 20, the view band `Role::Tracks` 320x56 (the slip fixture's shape).
+    fn kscrub_fixture() -> (EditorState, Layout, f64) {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("NLEFXA", 40);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 20, 0), Clip::new(a, 20, 30, 20)];
+        let st = EditorState::new(tl);
+        let l = Layout::of_role(Role::Tracks, 320, 56, &st);
+        (st, l, l.zoom as f64)
+    }
+
+    /// STRIAKSCRUB M3: a ruler press (no snap) at tick 5 moved five ticks right is the scrub step at tick 10.
+    #[test]
+    fn striakscrub_scrub_tick_is_the_pointer() {
+        let (mut st, l, z) = kscrub_fixture();
+        let (x, y) = (l.x_of(5) as f64 + z / 2.0, l.ruler_y as f64 + RULER_H as f64 / 2.0);
+        let mut d = Drag::begin_with(&mut st, l, x, y, false, true, false).unwrap();
+        assert_eq!(d.kind, DragKind::Scrub);
+        assert_eq!(d.scrub_tick(), Some(d.origin_tick));
+        d.update(&st, x + 5.0 * z, y);
+        assert_eq!(d.scrub_tick(), Some(d.origin_tick + 5));
+        assert_eq!(d.origin_tick, 5);
+    }
+
+    /// STRIAKSCRUB M3: a press on a clip body (a Move) names no scrub tick.
+    #[test]
+    fn striakscrub_scrub_tick_none_off_ruler() {
+        let (mut st, l, z) = kscrub_fixture();
+        let (x, y) = (l.x_of(25) as f64 + z / 2.0, l.row_y(0) as f64 + ROW_H as f64 / 2.0);
+        let d = Drag::begin_with(&mut st, l, x, y, false, false, false).unwrap();
+        assert_eq!(d.kind, DragKind::Move);
+        assert_eq!(d.scrub_tick(), None);
+    }
+}
