@@ -3648,3 +3648,71 @@ fn nle5dexportmessageetastallwitness_paused_face_export_stall() {
     let _ = std::fs::remove_dir_all(&dir);
     println!("nle5dexportmessageetastallwitness: paused face export_stall {stall:?}, line \"{line}\"");
 }
+
+// ---- H264ENCTWOPASSQCOMPFACE (LEDGER SR1076): the face's export takes the rate and two-pass plan words (named tail block) ----
+
+#[test]
+fn face_export_twopass_words_parse_as_the_cli() {
+    use stria::nle_export::{Pass2Cli, pass2_cli_of, qblur_of, qcomp_of, qpstep_of};
+    use stria::nle_face::export_plan_of;
+    let p = export_plan_of("out/ h264 bitrate 400 two-pass qcomp 0.6 qblur 1 cplxblur 10 qpstep 2").expect("the plan words");
+    assert!(p.two_pass);
+    assert_eq!(p.opts.bitrate, Some(400));
+    assert_eq!(p.opts.qcomp, qcomp_of("0.6"), "the CLI's own parse of 0.6");
+    assert_eq!(p.opts.qcomp, Some((60, 100)));
+    assert_eq!((p.opts.qblur_q8, qblur_of("1")), (Some(256), Some(256)));
+    assert_eq!(p.opts.cplxblur, Some(10));
+    assert_eq!((p.opts.qpstep, qpstep_of("2")), (Some(2), Some(2)));
+    let cli = pass2_cli_of("qcomp=0.6,qblur=1,cplxblur=10,qpstep=2").expect("the CLI's --pass2 of the same four");
+    assert_eq!(Pass2Cli { qcomp: p.opts.qcomp, cplxblur: p.opts.cplxblur, qblur_q8: p.opts.qblur_q8, qpstep: p.opts.qpstep }, cli);
+    assert_eq!(export_plan_of("bitrate 400 two-pass qcomp 0.2 qcomp 0.7").expect("last wins").opts.qcomp, Some((70, 100)));
+    let d = export_plan_of("out/ png").expect("no plan words");
+    assert!(!d.two_pass && d.opts.bitrate.is_none() && d.opts.qcomp.is_none() && d.opts.qpstep.is_none());
+    assert_eq!(export_plan_of("bitrate 400 two-pass qcomp bogus").unwrap_err(), "qcomp bogus: not a fraction within 0..=1");
+    assert_eq!(export_plan_of("bitrate 400 two-pass qpstep 52").unwrap_err(), "qpstep 52: not an integer within 0..=51");
+    assert_eq!(export_plan_of("bitrate 400 two-pass qpstep").unwrap_err(), "qpstep: a value is required");
+    assert_eq!(export_plan_of("h264 qcomp 0.6").unwrap_err(), "qcomp needs two-pass");
+    assert_eq!(export_plan_of("two-pass qcomp 0.6").unwrap_err(), "two-pass needs bitrate");
+    assert_eq!(export_plan_of("bitrate x").unwrap_err(), "bitrate x: not a positive integer");
+    println!("face_export_twopass: words parse as the CLI's pass2_cli_of, qcomp 0.6 = {:?}", p.opts.qcomp);
+}
+
+#[test]
+fn face_export_twopass_refused_by_name_exports_nothing() {
+    let root = nlefaceexport_dir("twopass-refused");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    for (words, want) in [
+        ("h264 bitrate 400 two-pass qcomp bogus", "export: qcomp bogus: not a fraction within 0..=1"),
+        ("h264 qcomp 0.6", "export: qcomp needs two-pass"),
+        ("h264 two-pass", "export: two-pass needs bitrate"),
+        ("png bitrate 400 two-pass", "export: two-pass needs h264"),
+        ("png bitrate 400", "export: bitrate needs h264"),
+    ] {
+        assert!(face.verb(&format!("export {} {words}", root.display())));
+        assert_eq!(face.last_error.take().as_deref(), Some(want), "{words}");
+        assert!(!face.exporting() && !root.exists(), "{words}: a refused word makes nothing");
+    }
+    assert!(face.verb(&format!("export {} h264 x y z", root.display())));
+    let usage = face.last_error.take().expect("the usage refusal");
+    for w in ["bitrate <kbps>", "two-pass", "qcomp F", "cplxblur N", "qblur F", "qpstep N"] {
+        assert!(usage.starts_with("export: usage: ") && usage.contains(w), "{w}: {usage}");
+    }
+    println!("face_export_twopass: refused by name, nothing exported; {usage}");
+}
+
+#[test]
+fn face_export_twopass_plans_from_a_first_pass() {
+    let dir = nlefaceexport_dir("twopass");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(face.verb(&format!("export {} h264 bitrate 400 two-pass qcomp 0.6 qblur 1 cplxblur 10 qpstep 2", dir.display())));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.wait_export());
+    let line = face.last_error.take().expect("the message line");
+    assert!(line.starts_with("export: 35 frames, "), "{line}");
+    assert!(dir.join("video.mp4").is_file(), "{line}");
+    assert!(!dir.join("pass1").exists(), "the first pass's dir is removed");
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("face_export_twopass: planned export {line}");
+}
