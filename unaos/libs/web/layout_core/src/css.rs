@@ -3193,16 +3193,13 @@ fn outline_width_value(v: &str, cx: &ParseCx) -> Option<f32> {
 }
 
 /// A11YFACE (SR124): an `outline-color` as the RGBA [`PaintStyle::outline_color`] holds: `currentColor` and
-/// `invert` (a UA that cannot invert paints currentColor, css-ui-4 §4.4) are `Some(None)`.
+/// `invert` (a UA that cannot invert paints currentColor, css-ui-4 §4.4) are `Some(None)`; any other colour's RGB through [`border_rgb`] (SR1119: alpha 0 included, `transparent` (0, 0, 0, 0)) and its alpha through [`color_alpha`].
 fn outline_color_value<H: Host>(v: &str) -> Option<Option<(u8, u8, u8, u8)>> {
     let v = v.trim();
     if v.eq_ignore_ascii_case("currentcolor") || v.eq_ignore_ascii_case("invert") {
         return Some(None);
     }
-    if v.eq_ignore_ascii_case("transparent") {
-        return Some(Some((0, 0, 0, 0)));
-    }
-    let (r, g, b) = parse_color_str::<H>(v)?;
+    let (r, g, b) = border_rgb::<H>(v)?;
     let a = (color_alpha::<H>(v).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
     Some(Some((r, g, b, a)))
 }
@@ -3768,11 +3765,11 @@ fn apply_align_content<H: Host>(value: &str, style: &mut SpecifiedStyle<H>) {
 
 // ---- AETHERCSSBORDERSIDECOLOR (LEDGER SR1014): the border-*-color longhands write one side's colour (named tail block) ----
 
-/// AETHERCSSBORDERSIDECOLOR (SR1014): `transparent`, or a fully transparent rgba (`parse_color_str` answers None), as a
+/// AETHERCSSBORDERSIDECOLOR (SR1014): `transparent`, or any colour the host reads at alpha 0 (SR1119; `parse_color_str` refuses those), as a
 /// border colour: a colour at alpha 0 (SR1112: the side is kept, its width sizes the box, `border_rgb` reads its RGB).
 fn border_transparent<H: Host>(v: &str) -> bool {
     let v = v.trim().to_ascii_lowercase();
-    v == "transparent" || (v.starts_with("rgba(") && parse_color_str::<H>(&v).is_none())
+    v == "transparent" || H::parse_color_alpha(&v).is_some_and(|c| c.1 <= 0.0)
 }
 
 /// AETHERCSSBORDERSIDECOLOR (SR1014): `border-top-color` / `-right-` / `-bottom-` / `-left-color` (css-backgrounds-3
@@ -5055,7 +5052,7 @@ fn align_word<H: Host>(value: &str) -> &str {
 // ---- AETHERCSSBORDERPENDINGTRANSPARENT (LEDGER SR1112): a transparent border colour keeps the side at alpha 0 (named tail block) ----
 
 /// AETHERCSSBORDERPENDINGTRANSPARENT (SR1112): a border colour's RGB: what [`parse_color_str`] reads, else a transparent
-/// colour (`border_transparent`: `transparent`, a zero-alpha rgba) as its own RGB (black for the keyword). A transparent
+/// colour (`border_transparent`: `transparent`, any zero-alpha colour) as its own RGB (black for the keyword). A transparent
 /// colour is a COLOUR, not an eraser: the side is kept (its width sizes the box) and paints nothing at alpha 0.
 fn border_rgb<H: Host>(v: &str) -> Option<(u8, u8, u8)> {
     parse_color_str::<H>(v).or_else(|| border_transparent::<H>(v).then(|| H::parse_color_alpha(v).map_or((0, 0, 0), |p| p.0)))

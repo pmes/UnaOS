@@ -2268,3 +2268,62 @@ fn place_shorthands_in_skipped() {
         assert!(ALL_SKIPPED.contains(&n) && !ALL_LONGHANDS.contains(&n), "{n} is a skipped shorthand");
     }
 }
+
+// ---- AETHERCSSOUTLINETRANSPARENT (LEDGER SR1119): outline-color reads an alpha-0 colour through SR1112's one road (named tail block) ----
+
+/// AETHERCSSOUTLINETRANSPARENT (SR1119): `outline-color` takes ANY colour at alpha 0 as `transparent` already was: the
+/// RGB through `border_rgb`, the alpha through `color_alpha` (before SR1119 `parse_color_str` refused the function
+/// spellings and the declaration was dropped: two spellings of one colour, one kept).
+#[test]
+fn outline_transparent_alpha_zero_colours() {
+    let oc = |v: &str| styled(&[("outline-color", v)]).paint.outline_color;
+    assert_eq!(oc("rgba(0, 0, 0, 0)"), Some(Some((0, 0, 0, 0))), "armed: rgba(0, 0, 0, 0) is transparent black");
+    assert_eq!(oc("rgba(255, 0, 0, 0)"), Some(Some((255, 0, 0, 0))), "armed: a zero-alpha rgba keeps its RGB");
+    assert_eq!(oc("rgb(255 0 0 / 0)"), Some(Some((255, 0, 0, 0))), "armed: the slash alpha");
+    assert_eq!(oc("hsla(0, 100%, 50%, 0)"), Some(Some((255, 0, 0, 0))), "armed: a zero-alpha hsla");
+    assert_eq!(oc("#ff000000"), Some(Some((255, 0, 0, 0))), "#rrggbb00 (hex was never refused)");
+    assert_eq!(oc("transparent"), Some(Some((0, 0, 0, 0))), "the keyword unchanged");
+    assert_eq!(oc("TRANSPARENT"), Some(Some((0, 0, 0, 0))), "case-insensitive");
+    assert_eq!(oc("rgba(255, 0, 0, 0.5)"), Some(Some((255, 0, 0, 128))), "a half alpha unchanged");
+    for v in ["bogus", "rgba(foo)", ""] {
+        assert_eq!(oc(v), None, "{v:?} is dropped");
+    }
+}
+
+/// AETHERCSSOUTLINETRANSPARENT (SR1119): the `outline` shorthand reads the colour word through the same road (before
+/// SR1119 an alpha-0 rgba dropped the whole shorthand), and a later `outline-color: rgba(255, 0, 0, 0)` replaces an
+/// earlier red (before SR1119 the red stayed and painted).
+#[test]
+fn outline_transparent_shorthand() {
+    use layout_core::paint::OUTLINE_SOLID;
+    let s = styled(&[("outline", "2px solid rgba(255, 0, 0, 0)")]);
+    assert_eq!(
+        (s.paint.outline_style, s.paint.outline_width, s.paint.outline_color),
+        (Some(OUTLINE_SOLID), Some(2.0), Some(Some((255, 0, 0, 0)))),
+        "armed: the shorthand keeps solid 2px at alpha 0"
+    );
+    let s = cascade(&[&[("outline", "2px solid red")], &[("outline-color", "rgba(255, 0, 0, 0)")]]);
+    assert_eq!(s.paint.outline_color, Some(Some((255, 0, 0, 0))), "armed: the later alpha-0 colour wins over red");
+    assert_eq!(s.paint.outline_style, Some(OUTLINE_SOLID), "the style kept");
+}
+
+/// AETHERCSSOUTLINETRANSPARENT (SR1119): `caret-color` delegates to `outline_color_value`, so it follows: an alpha-0
+/// colour is `Some(Some((r, g, b, 0)))` (no caret paints), `invert` is still no caret-color value.
+#[test]
+fn outline_transparent_caret() {
+    let cc = |v: &str| styled(&[("caret-color", v)]).paint.caret_color;
+    assert_eq!(cc("rgba(0, 0, 0, 0)"), Some(Some((0, 0, 0, 0))), "armed: caret-color rgba(0, 0, 0, 0)");
+    assert_eq!(cc("hsla(0, 100%, 50%, 0)"), Some(Some((255, 0, 0, 0))), "armed: caret-color hsla alpha 0");
+    assert_eq!(cc("transparent"), Some(Some((0, 0, 0, 0))), "the keyword unchanged");
+    assert_eq!(cc("invert"), None, "invert is not a caret-color value");
+}
+
+/// AETHERCSSOUTLINETRANSPARENT (SR1119): `border_transparent` reads any colour the host reads at alpha 0, so `border:
+/// 2px solid hsla(0, 100%, 50%, 0)` keeps four 2px sides (RGB red) at alpha 0, as SR1112 does for rgba(.., 0) (before
+/// SR1119 the hsla word was no colour: grey sides, opaque).
+#[test]
+fn outline_transparent_border_hsla() {
+    let s = styled(&[("border", "2px solid hsla(0, 100%, 50%, 0)")]);
+    assert_eq!(s.paint.border, Some([Some((2.0, (255, 0, 0))); 4]), "armed: four 2px red-RGB sides");
+    assert_eq!(s.paint.border_alpha, Some([Some(0.0); 4]), "armed: alpha 0 on every side");
+}
