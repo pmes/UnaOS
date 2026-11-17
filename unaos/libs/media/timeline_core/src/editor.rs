@@ -361,6 +361,7 @@ impl EditorState {
             }
             "nudge-" => self.move_set(-1),
             "nudge+" => self.move_set(1),
+            _ if nudge_words(v).is_some() => self.move_set(nudge_words(v).unwrap_or(0)), // STRIANUDGE (SR855): `nudge <d>` moves the set d ticks (file tail)
             _ if rtrim_words(v).is_some() => self.rtrim_verb(v),
             _ if slipslide_words(v).is_some() => self.slipslide_verb(v),
             _ if mark_words(v).is_some() => self.marks_verb(v),
@@ -659,4 +660,18 @@ impl EditorState {
             _ => Err(EditError::Transition),
         })
     }
+}
+
+// ---- STRIANUDGE (LEDGER SR855): the nudge by a count (named tail block) ----
+// `nudge <d>` rides THE verb dispatch both faces call: the selection set moves `d` ticks (one tick is one frame) through
+// [`EditorState::move_set`], the same op and ONE commit `nudge-` / `nudge+` take; a refusal leaves the state unchanged.
+
+/// `nudge <d>` (signed, nonzero ticks) -> `d`; any other shape (`nudge 0`, `nudge x`, `nudge 1 2`) is not this verb.
+fn nudge_words(v: &str) -> Option<i64> {
+    let mut w = v.split_ascii_whitespace();
+    if w.next() != Some("nudge") {
+        return None;
+    }
+    let d = w.next()?.parse::<i64>().ok().filter(|&d| d != 0)?;
+    w.next().is_none().then_some(d)
 }

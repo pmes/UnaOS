@@ -235,7 +235,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
+        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.nudge_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -369,6 +369,8 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Right", "nudge+"),
     ("\u{f702}", "nudge-"),
     ("\u{f703}", "nudge+"),
+    ("Shift+Left", "nudge-10"), // STRIANUDGE (SR855): Shift with the arrows nudges the selection SLIP_STEP frames
+    ("Shift+Right", "nudge+10"),
     ("[", "["),
     ("]", "]"),
     ("I", "mark in"), // NLE5DRANGEKEYS (SR735): Shift+i / Shift+o / Shift+x (text) bind the editor's export-mark words
@@ -2543,7 +2545,7 @@ pub const SLIP_STEP: i64 = 10;
 fn slipslide_word(v: &str) -> Option<String> {
     let (word, rest) = match v.strip_prefix("slip") {
         Some(r) => ("slip", r),
-        None => ("slide", v.strip_prefix("slide")?),
+        None => match v.strip_prefix("slide") { Some(r) => ("slide", r), None => ("nudge", v.strip_prefix("nudge")?) }, // STRIANUDGE (SR855): and `nudge±[10]` -> `nudge <d>`
     };
     let (sign, count) = match rest.as_bytes().first().copied()? {
         b'-' => (-1i64, &rest[1..]),
@@ -2589,6 +2591,8 @@ pub const HELP: &[(&str, &str)] = &[
     ("save", "save"),
     ("nudge-", "move the selection one frame earlier"),
     ("nudge+", "move the selection one frame later"),
+    ("nudge-10", "move the selection 10 frames earlier"), // STRIANUDGE (SR855)
+    ("nudge+10", "move the selection 10 frames later"),
     ("[", "clip start one frame earlier"),
     ("]", "clip start one frame later"),
     ("mark in", "export from the playhead"),
@@ -3060,4 +3064,36 @@ pub fn stall_words(since_last: Duration, rate: f64) -> Option<String> {
     let after = STALL_AFTER.as_secs_f64();
     let limit = if rate > 0.0 && rate.is_finite() { after.max(STALL_FRAMES / rate) } else { after };
     (since_last.as_secs_f64() > limit).then(|| format!("stalled {}", eta_words_of(since_last).trim_start_matches('~')))
+}
+
+// ---- STRIANUDGE (LEDGER SR855): the ten-frame nudge and the `at` on the message line (named tail block) ----
+// `nudge-` / `nudge+` (Left / Right) and `nudge-10` / `nudge+10` (Shift+Left / Shift+Right, KEYS only, no button) are
+// rewritten by `slipslide_word` to timeline_core's `nudge <d>` (THE dispatch: `EditorState::move_set`, ONE commit). A
+// refusal is the message `nudge: <why>` as before; a move puts the primary clip's new `at` on the message line. Owed:
+// NLE-NUDGE-KERNEL (the Player binds no nudge key), NLE-NUDGE-MACSHIFT (AppKit sends Shift+arrow as the plain U+F702 /
+// U+F703 text: one frame there), NLE-NUDGE-DOWORD (stria-view `--do` takes VERBS only).
+impl Face {
+    /// A `nudge±[10]` word: timeline_core's `nudge <d>`, the message line set either way; `None` for any other word.
+    fn nudge_verb(&mut self, v: &str) -> Option<bool> {
+        if !v.starts_with("nudge") {
+            return None;
+        }
+        let w = slipslide_word(v)?;
+        let r = self.state.verb(&w).unwrap_or(Err(EditError::NoClip));
+        self.last_error = match r {
+            Ok(()) => self.nudge_line(),
+            Err(e) => Some(format!("nudge: {e}")),
+        };
+        Some(true)
+    }
+    /// The selection's new place: `nudge: at <at> (<HH:MM:SS:FF>)` for one clip, `nudge: <n> clips, at <at> (<tc>)` for a
+    /// set of `n` (the primary's `at`); `None` with nothing selected.
+    pub fn nudge_line(&self) -> Option<String> {
+        let c = self.state.selected()?;
+        let tc = timeline_core::edl::timecode(c.at, self.state.timeline.fps().unwrap_or(25));
+        Some(match self.state.set.len() {
+            n if n > 1 => format!("nudge: {n} clips, at {} ({tc})", c.at),
+            _ => format!("nudge: at {} ({tc})", c.at),
+        })
+    }
 }
