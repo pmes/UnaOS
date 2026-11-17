@@ -1374,7 +1374,7 @@ mod strialoudnessreadout_tests {
         assert!(errors.is_empty(), "{errors:?}");
         assert!(f.loudness_pending());
         assert!(f.wait_loudness());
-        let want = nle_face::loudness_line(&stria::nle::loudness(&tl2, 0..tl2.end(), &src2), &None);
+        let want = nle_face::loudness_reading_line(&stria::nle::loudness_reading(&tl2, 0..tl2.end(), &src2, None), &None); // STRIALOUDNESSNEXT (SR995): the line carries the range and true peak
         assert_eq!(f.last_error.take(), Some(want.clone()));
         println!("strialoudnessreadout witness: button {id} {label:?} -> {want}");
     }

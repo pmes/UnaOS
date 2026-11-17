@@ -216,6 +216,7 @@ pub struct Loudness {
     acc: f64,
     /// Each closed hop's weighted sum of squares.
     hops: Vec<f64>,
+    tp: Option<crate::resample::Sinc>, tp_buf: Vec<f32>, peak: f64, // STRIALOUDNESSNEXT (SR995): the true-peak oversampler, its output buffer, the largest |x| seen (file tail)
 }
 
 impl Loudness {
@@ -224,10 +225,10 @@ impl Loudness {
         let (shelf, rlb) = k_weighting(rate);
         let weights = if ch == 6 { vec![1.0, 1.0, 1.0, 0.0, 1.41, 1.41] } else { vec![1.0; ch] };
         let hop = ((rate.max(1) as usize + 5) / 10).max(1);
-        Loudness { ch, shelf, rlb, state: vec![[0.0; 4]; ch], weights, hop, n: 0, acc: 0.0, hops: Vec::new() }
+        Loudness { ch, shelf, rlb, state: vec![[0.0; 4]; ch], weights, hop, n: 0, acc: 0.0, hops: Vec::new(), tp: tp_oversampler(rate, ch), tp_buf: Vec::new(), peak: 0.0 } // STRIALOUDNESSNEXT (SR995): the true-peak state (file tail)
     }
     /// Feed interleaved samples of the meter's channel count (a trailing partial frame is ignored).
-    pub fn push(&mut self, interleaved: &[f32]) {
+    pub fn push(&mut self, interleaved: &[f32]) { self.tp_push(interleaved); // STRIALOUDNESSNEXT (SR995): the true peak over the same samples (file tail)
         for frame in interleaved.chunks_exact(self.ch) {
             let mut sum = 0.0;
             for (i, &x) in frame.iter().enumerate() {
@@ -249,12 +250,8 @@ impl Loudness {
         if self.hops.len() < LUFS_BLOCK_HOPS {
             return LUFS_FLOOR;
         }
-        let per = (LUFS_BLOCK_HOPS * self.hop) as f64;
-        let z: Vec<f64> = self.hops.windows(LUFS_BLOCK_HOPS).map(|w| w.iter().sum::<f64>() / per).collect();
-        let mean_over = |gate: f64| {
-            let (s, n) = z.iter().filter(|&&zj| lufs_of(zj) > gate).fold((0.0, 0usize), |(s, n), &zj| (s + zj, n + 1));
-            (n > 0).then(|| s / n as f64)
-        };
+        let z = self.blocks(LUFS_BLOCK_HOPS); // STRIALOUDNESSNEXT (SR995): the one block builder (file tail)
+        let mean_over = |gate: f64| gate_mean(&z, gate); // STRIALOUDNESSNEXT (SR995): the one gate (file tail)
         let Some(abs) = mean_over(LUFS_FLOOR) else { return LUFS_FLOOR };
         match mean_over(lufs_of(abs) - 10.0) {
             Some(m) => lufs_of(m),
@@ -330,5 +327,132 @@ mod strialoudnessreadout_tests {
             m.push(c);
         }
         assert_eq!(m.integrated(), integrated_lufs(&s, 2, 48_000));
+    }
+}
+
+// ---- STRIALOUDNESSNEXT (LEDGER SR995): loudness range and true peak beside the integrated measure (named tail block) ----
+//
+// EBU Tech 3342 loudness range: the short-term loudness of 3 s blocks (30 of the meter's 100 ms hops, so a block every
+// 100 ms), the -70 LUFS absolute gate and a -20 LU relative gate (relative to the mean `z` of the blocks above the
+// absolute gate: the integrated measure's gating, [`gate_mean`], with a wider relative gate), and the range is the
+// 95th minus the 10th percentile of what both gates keep (0 LU with fewer than two). ITU-R BS.1770-4 Annex 2 true
+// peak: each sample oversampled to at least 192 kHz (4x under 96 kHz, 2x under 192 kHz, none at or over) through THE
+// windowed-sinc converter (`resample::Sinc`, its streaming form; no second interpolation filter), the largest `|y|`
+// over the oversampled stream and the samples themselves (the converter holds its last `delay` frames; their own
+// values still count), in dBTP through [`dbfs`]. Both read off the same `push`; K-weighting is not applied to either
+// peak (the standard's true peak is unweighted); the range reuses the K-weighted hops the integrated measure keeps.
+
+/// Hops per short-term block (3 s of 100 ms hops).
+pub const LRA_BLOCK_HOPS: usize = 30;
+/// The loudness range's relative gate, LU under the gated mean.
+pub const LRA_RELATIVE_GATE: f64 = -20.0;
+
+/// The mean of the block mean squares `z` whose loudness is above `gate` (LUFS); `None` when none is.
+fn gate_mean(z: &[f64], gate: f64) -> Option<f64> {
+    let (s, n) = z.iter().filter(|&&zj| lufs_of(zj) > gate).fold((0.0, 0usize), |(s, n), &zj| (s + zj, n + 1));
+    (n > 0).then(|| s / n as f64)
+}
+
+/// The true-peak oversampler at `rate` (`None` at 192 kHz or over: the samples are the peak).
+fn tp_oversampler(rate: u32, ch: usize) -> Option<crate::resample::Sinc> {
+    let factor = if rate < 96_000 { 4 } else if rate < 192_000 { 2 } else { return None };
+    Some(crate::resample::Sinc::new(rate, rate.max(1) * factor, ch))
+}
+
+impl Loudness {
+    /// Each `n_hops`-hop block's mean square (the hops slide one at a time: 100 ms apart).
+    fn blocks(&self, n_hops: usize) -> Vec<f64> {
+        let per = (n_hops * self.hop) as f64;
+        self.hops.windows(n_hops).map(|w| w.iter().sum::<f64>() / per).collect()
+    }
+    /// The EBU Tech 3342 loudness range of everything pushed, LU (0 when fewer than two short-term blocks pass the gates).
+    pub fn range_lu(&self) -> f64 {
+        let st = self.blocks(LRA_BLOCK_HOPS);
+        let Some(abs) = gate_mean(&st, LUFS_FLOOR) else { return 0.0 };
+        let gate = (lufs_of(abs) + LRA_RELATIVE_GATE).max(LUFS_FLOOR);
+        let mut l: Vec<f64> = st.iter().map(|&z| lufs_of(z)).filter(|&lz| lz > gate).collect();
+        if l.len() < 2 {
+            return 0.0;
+        }
+        l.sort_unstable_by(f64::total_cmp);
+        let at = |p: f64| l[((l.len() - 1) as f64 * p + 0.5) as usize];
+        at(0.95) - at(0.10)
+    }
+    /// The BS.1770-4 true peak of everything pushed, dBTP ([`FLOOR_DB`] for silence).
+    pub fn true_peak_db(&self) -> f64 {
+        dbfs(self.peak)
+    }
+    /// Raise the peak over `interleaved`'s samples and their oversampled stream.
+    fn tp_push(&mut self, interleaved: &[f32]) {
+        let ch = self.ch;
+        let x = &interleaved[..interleaved.len() / ch * ch];
+        for &v in x {
+            self.peak = self.peak.max(math::fabs(v as f64));
+        }
+        let Some(sinc) = self.tp.as_mut() else { return };
+        let (from, to) = sinc.rates();
+        let room = (x.len() / ch * (to / from.max(1)) as usize + sinc.taps() + 1) * ch;
+        self.tp_buf.resize(room, 0.0);
+        let (_, mut made) = sinc.process(x, &mut self.tp_buf);
+        loop {
+            for &y in &self.tp_buf[..made * ch] {
+                self.peak = self.peak.max(math::fabs(y as f64));
+            }
+            if made * ch < room {
+                break;
+            }
+            made = sinc.process(&[], &mut self.tp_buf).1;
+        }
+    }
+}
+
+#[cfg(test)]
+mod strialoudnessnext_tests {
+    use super::*;
+
+    /// `secs` of a `hz` sine at `dbfs` peak, starting at `phase`, on each of `ch` identical channels.
+    fn tone(rate: u32, ch: usize, hz: f64, dbfs: f64, phase: f64, secs: f64) -> Vec<f32> {
+        let a = math::pow(10.0, dbfs / 20.0);
+        let n = (rate as f64 * secs) as usize;
+        (0..n).flat_map(|i| core::iter::repeat_n((a * math::sin(2.0 * math::PI * hz * i as f64 / rate as f64 + phase)) as f32, ch)).collect()
+    }
+
+    /// EBU Tech 3342 case 1: 20 s at -20 dBFS then 20 s at -30 dBFS (1 kHz stereo) reads 10 LU within 1; one level reads
+    /// near 0; silence and less than one 3 s block read 0; the integrated measure is unchanged by the shared gate.
+    #[test]
+    fn strialoudnessnext_range_reads_the_step() {
+        let mut s = tone(48_000, 2, 1000.0, -20.0, 0.0, 20.0);
+        s.extend(tone(48_000, 2, 1000.0, -30.0, 0.0, 20.0));
+        let mut m = Loudness::new(48_000, 2);
+        m.push(&s);
+        assert!((m.range_lu() - 10.0).abs() < 1.0, "{}", m.range_lu());
+        let mut flat = Loudness::new(48_000, 2);
+        flat.push(&tone(48_000, 2, 1000.0, -20.0, 0.0, 10.0));
+        assert!(flat.range_lu() < 0.1, "{}", flat.range_lu());
+        let mut quiet = Loudness::new(48_000, 2);
+        quiet.push(&vec![0.0; 2 * 48_000 * 5]);
+        assert_eq!(quiet.range_lu(), 0.0);
+        let mut short = Loudness::new(48_000, 2);
+        short.push(&tone(48_000, 2, 1000.0, -20.0, 0.0, 2.0));
+        assert_eq!(short.range_lu(), 0.0);
+        assert!((flat.integrated() + 20.0).abs() < 0.2, "{}", flat.integrated());
+    }
+
+    /// A 12 kHz sine at 48 kHz started at 45 degrees has every sample at 0.707 of its peak (-3 dB): the sample peak
+    /// under-reads, the true peak reads the sine's own level within 0.5 dB; silence reads the floor.
+    #[test]
+    fn strialoudnessnext_true_peak_finds_the_intersample_peak() {
+        let s = tone(48_000, 2, 12_000.0, -6.0, math::PI / 4.0, 1.0);
+        let sample_peak = dbfs(s.iter().fold(0.0f64, |p, &v| p.max(math::fabs(v as f64))));
+        assert!((sample_peak + 9.01).abs() < 0.1, "{sample_peak}");
+        let mut m = Loudness::new(48_000, 2);
+        for c in s.chunks(2 * 1001) {
+            m.push(c);
+        }
+        assert!((m.true_peak_db() + 6.0).abs() < 0.5, "{}", m.true_peak_db());
+        assert_eq!(Loudness::new(48_000, 2).true_peak_db(), FLOOR_DB);
+        let mut hi = Loudness::new(192_000, 1);
+        hi.push(&[0.5, -0.25]);
+        assert!((hi.true_peak_db() - dbfs(0.5)).abs() < 1e-12);
     }
 }
