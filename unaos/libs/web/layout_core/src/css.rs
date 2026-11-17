@@ -76,7 +76,7 @@ pub struct SpecifiedStyle<H: Host> {
     pub inset_bottom: Option<LengthPercentageAuto>,
     pub justify: Option<taffy::style::JustifyContent>,
     pub align_items: Option<taffy::style::AlignItems>, pub align_content: Option<taffy::style::AlignContent>, // AETHERCSSALIGNCONTENTFIELD (SR1016): align-content's own field, folded by fold_into on a flex container
-    pub align_self: Option<taffy::style::AlignSelf>,
+    pub align_self: Option<taffy::style::AlignSelf>, pub align_self_auto: bool, // AETHERCSSALIGNSELFARM (SR1068): an explicit align-self auto (taffy None), carried over an earlier rule by merge_specified
     pub box_sizing: Option<taffy::style::BoxSizing>,
     /// `display: flex` (Some(true)) versus any other display (Some(false)).
     /// Aether lays every block out as a column flex box, so a real flex
@@ -1463,7 +1463,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 apply_declaration("font-family", family, style, cx);
             }
         }
-        "align-content" => apply_align_content(align_word::<H>(value), style), "align-items" => match align_word::<H>(value) {
+        "align-self" => apply_align_self::<H>(align_word::<H>(value), style), "align-content" => apply_align_content(align_word::<H>(value), style), "align-items" => match align_word::<H>(value) {
             "center" => style.align_items = Some(taffy::style::AlignItems::CENTER),
             "flex-end" | "end" => style.align_items = Some(taffy::style::AlignItems::END),
             "flex-start" | "start" => style.align_items = Some(taffy::style::AlignItems::START),
@@ -2734,7 +2734,7 @@ pub fn merge_specified<H: Host>(dst: &mut SpecifiedStyle<H>, src: &SpecifiedStyl
     macro_rules! take {
         ($($f:ident),*) => { $( if src.$f.is_some() { dst.$f = src.$f; } )* };
     }
-    erase_reverted(dst, src.revert_spec); dst.revert_spec |= src.revert_spec; for i in 0..4 { // AETHERCSSWIDEREVERTNONINHERITED (SR1037): a later revert erases the earlier rule's field before the Some-copy
+    erase_reverted(dst, src.revert_spec); dst.revert_spec |= src.revert_spec; if src.align_self_auto { dst.align_self = None; dst.align_self_auto = true; } for i in 0..4 { // AETHERCSSWIDEREVERTNONINHERITED (SR1037): a later revert erases the earlier rule's field before the Some-copy
         if src.padding[i].is_some() { dst.padding[i] = src.padding[i]; }
         if src.margin[i].is_some() { dst.margin[i] = src.margin[i]; }
     }
@@ -3709,7 +3709,7 @@ fn noninherited_initial<'a>(prop: &str, value: &'a str) -> &'a str {
         "flex-flow" => "row nowrap",
         "flex-basis" => "auto",
         "flex" => "0 1 auto",
-        "align-items" | "justify-content" | "align-content" => "normal",
+        "align-items" | "justify-content" | "align-content" => "normal", "align-self" => "auto",
         "gap" | "grid-gap" | "row-gap" | "grid-row-gap" => "0px", "column-gap" | "grid-column-gap" => "normal",
         "background-repeat" => "repeat",
         "background-position" => "0% 0%",
@@ -4051,7 +4051,7 @@ pub const ALL_LONGHANDS: &[&str] = &[
     "writing-mode", "text-combine-upright", "text-orientation",
     "column-count", "column-width", "column-fill", "column-rule-width", "column-rule-style", "column-rule-color", "column-span", "box-decoration-break",
     "filter", "backdrop-filter", "break-before", "break-after", "break-inside",
-    "vertical-align", "clear", "float", "text-indent", "text-align", "justify-content", "align-items", "align-content",
+    "vertical-align", "clear", "float", "text-indent", "text-align", "justify-content", "align-items", "align-content", "align-self",
     "background-color", "background-image", "background-size", "background-position", "background-repeat", "box-shadow",
     "color", "font-family", "font-stretch", "font-synthesis-weight", "font-synthesis-style", "font-synthesis-small-caps", "font-variant-caps", "font-size", "font-weight", "font-style", "line-height",
     "word-spacing", "letter-spacing", "text-shadow", "visibility", "opacity",
@@ -4237,4 +4237,34 @@ fn align_word<H: Host>(value: &str) -> &str {
         }
         None => value,
     }
+}
+
+// ---- AETHERCSSALIGNSELFARM (LEDGER SR1068): css-align-3 §6.2 align-self through align_word (named tail block) ----
+
+/// AETHERCSSALIGNSELFARM (SR1068): css-align-3 §6.2 `align-self: auto | normal | stretch | <baseline-position> |
+/// <overflow-position>? <self-position>` on a flex item, the align-items keyword map over the word [`align_word`] gives
+/// (safe / unsafe / first|last baseline as there). `auto` (and `initial` / `unset` through [`noninherited_initial`]) is
+/// taffy's None, marked `align_self_auto` so [`merge_specified`] carries it over an earlier rule's value; `inherit` is
+/// dropped (as align-items); anything else is refused and recorded (`align-self-value:`). A floated box keeps the
+/// float arm's START / END (Aether's float approximation; Chromium ignores align-self on a float in block flow).
+fn apply_align_self<H: Host>(word: &str, style: &mut SpecifiedStyle<H>) {
+    use taffy::style::AlignSelf as A;
+    let v = match word {
+        "auto" => None,
+        "center" => Some(A::CENTER),
+        "flex-end" | "end" => Some(A::END),
+        "flex-start" | "start" => Some(A::START),
+        "baseline" => Some(A::BASELINE),
+        "stretch" | "normal" => Some(A::STRETCH),
+        "inherit" => return,
+        other => {
+            H::record_css(&format!("align-self-value:{}", other));
+            return;
+        }
+    };
+    if matches!(style.paint.float, Some(1 | 2)) {
+        return;
+    }
+    style.align_self = v;
+    style.align_self_auto = v.is_none();
 }

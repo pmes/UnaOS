@@ -7995,4 +7995,55 @@ mod tests {
         let snap = crate::ledger::snapshot();
         assert!(snap.contains(crate::ledger::ApiCategory::Css, "align-overflow:safe"), "the safe modifier is recorded");
     }
+
+    // ---- AETHERCSSALIGNSELFARM (LEDGER SR1068): css-align-3 §6.2 align-self on a flex item (named tail block) ----
+
+    /// AETHERCSSALIGNSELFARM (SR1068): 200px-tall flex rows, one 50 x 50 item each, the rules in a sheet: `align-self:
+    /// center` sits at y 75 and `flex-end` at y 150 (before, the declaration was dropped and every item sat at y 0, the
+    /// control row's place); `auto` under `align-items: center` follows the container (75); `-webkit-align-self: center`
+    /// is the same arm (75); a later rule's `auto` beats an earlier `center` under `flex-start` (0); `bogus` is recorded.
+    #[test]
+    fn align_self_engine() {
+        crate::ledger::reset();
+        let html = r#"<!doctype html><html><head><style>
+            .f { display: flex; width: 200px; height: 200px }
+            .k { width: 50px; height: 50px }
+            .c { align-self: center }
+            .e { align-self: flex-end }
+            .ai { align-items: center }
+            .au { align-self: auto }
+            .w { -webkit-align-self: center }
+            .fs { align-items: flex-start }
+            .c.au2 { align-self: auto }
+            .b { align-self: bogus }
+            </style></head><body style="margin:0">
+            <div id="n" class="f"><div id="nk" class="k"></div></div>
+            <div id="c" class="f"><div id="ck" class="k c"></div></div>
+            <div id="e" class="f"><div id="ek" class="k e"></div></div>
+            <div id="a" class="f ai"><div id="ak" class="k au"></div></div>
+            <div id="w" class="f"><div id="wk" class="k w"></div></div>
+            <div id="x" class="f fs"><div id="xk" class="k c au2"></div></div>
+            <div id="b" class="f"><div id="bk" class="k b"></div></div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 1600));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        let top = |e: &mut crate::AetherEngine, k: &str, row: &str| imgalt_rect(e, k).1 - imgalt_rect(e, row).1;
+        let near = |v: f64, want: f64| (v - want).abs() <= 0.5;
+        let n = top(&mut e, "nk", "n");
+        assert!(near(n, 0.0), "control: no align-self sits at the top: {n}");
+        let c = top(&mut e, "ck", "c");
+        assert!(near(c, 75.0), "armed: align-self: center at y 75: {c}");
+        let f = top(&mut e, "ek", "e");
+        assert!(near(f, 150.0), "align-self: flex-end at y 150: {f}");
+        let a = top(&mut e, "ak", "a");
+        assert!(near(a, 75.0), "auto follows align-items: center: {a}");
+        let w = top(&mut e, "wk", "w");
+        assert!(near(w, 75.0), "-webkit-align-self: center: {w}");
+        let x = top(&mut e, "xk", "x");
+        assert!(near(x, 0.0), "a later rule's auto beats center under flex-start: {x}");
+        let snap = crate::ledger::snapshot();
+        assert!(snap.contains(crate::ledger::ApiCategory::Css, "align-self-value:bogus"), "the refused value is recorded");
+    }
 }

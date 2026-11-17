@@ -941,7 +941,7 @@ fn alignment_words_grammar() {
 }
 
 /// AETHERCSSALIGNCONTENTSAFE (SR1064): each of the three alignment arms (justify-content, align-content, align-items;
-/// align-self has no arm: AETHER-CSS-ALIGN-SELF-ARM) takes `safe center` as its plain `center` twin, `unsafe end` as
+/// align-self's arm is SR1068's, tested below) takes `safe center` as its plain `center` twin, `unsafe end` as
 /// `end`; align-items takes `first` / `last baseline` as `baseline`; the refused forms leave the field None.
 #[test]
 fn alignment_words_arms() {
@@ -978,4 +978,82 @@ fn alignment_words_safe_center_layout() {
     let (c, s) = (x("center"), x("safe center"));
     assert!((c - 75.0).abs() <= 0.5, "armed: center puts the child at 75: {c}");
     assert!((s - c).abs() <= 0.5, "safe center centres like center: {s} vs {c}");
+}
+
+// ---- AETHERCSSALIGNSELFARM (LEDGER SR1068): css-align-3 §6.2 align-self on a flex item (named tail block) ----
+
+use layout_core::taffy::style::AlignSelf;
+
+/// AETHERCSSALIGNSELFARM (SR1068): the align-items keyword map on align-self, SR1064's modifiers through `align_word`,
+/// the `-webkit-` alias routed to the same arm; a refused value leaves the field None.
+#[test]
+fn align_self_keywords() {
+    let one = |v: &str| styled(&[("align-self", v)]).align_self;
+    assert_eq!(one("center"), Some(AlignSelf::CENTER), "armed: center");
+    assert_eq!(one("flex-end"), Some(AlignSelf::END), "flex-end");
+    assert_eq!(one("end"), Some(AlignSelf::END), "end");
+    assert_eq!(one("flex-start"), Some(AlignSelf::START), "flex-start");
+    assert_eq!(one("start"), Some(AlignSelf::START), "start");
+    assert_eq!(one("baseline"), Some(AlignSelf::BASELINE), "baseline");
+    assert_eq!(one("stretch"), Some(AlignSelf::STRETCH), "stretch");
+    assert_eq!(one("normal"), Some(AlignSelf::STRETCH), "normal is stretch on a flex item");
+    assert_eq!(one("safe center"), Some(AlignSelf::CENTER), "safe center (SR1064's road)");
+    assert_eq!(one("unsafe end"), Some(AlignSelf::END), "unsafe end");
+    assert_eq!(one("first baseline"), Some(AlignSelf::BASELINE), "first baseline");
+    assert_eq!(styled(&[("-webkit-align-self", "center")]).align_self, Some(AlignSelf::CENTER), "-webkit-align-self");
+    for bad in ["bogus", "safe", "left", "safe safe center"] {
+        let s = styled(&[("align-self", bad)]);
+        assert_eq!(s.align_self, None, "{bad}: refused");
+        assert!(!s.align_self_auto, "{bad}: refused, not auto");
+    }
+}
+
+/// AETHERCSSALIGNSELFARM (SR1068): an explicit `auto` (taffy None) beats an earlier value in the same block and, through
+/// the `align_self_auto` marker `merge_specified` reads, an earlier rule's; `initial` / `unset` / `all: initial` are auto
+/// (the noninherited_initial row); a later value beats an earlier auto.
+#[test]
+fn align_self_auto_beats_earlier_rule() {
+    let s = styled(&[("align-self", "center"), ("align-self", "auto")]);
+    assert_eq!(s.align_self, None, "center then auto in one block");
+    assert!(s.align_self_auto, "auto is marked");
+    assert_eq!(cascade(&[&[("align-self", "center")]]).align_self, Some(AlignSelf::CENTER), "armed: the earlier rule's center");
+    assert_eq!(cascade(&[&[("align-self", "center")], &[("align-self", "auto")]]).align_self, None, "a later rule's auto wins");
+    assert_eq!(cascade(&[&[("align-self", "auto")], &[("align-self", "center")]]).align_self, Some(AlignSelf::CENTER), "a later center beats auto");
+    for kw in ["initial", "unset"] {
+        assert_eq!(cascade(&[&[("align-self", "center")], &[("align-self", kw)]]).align_self, None, "align-self: {kw} is auto");
+    }
+    assert_eq!(cascade(&[&[("align-self", "center")], &[("all", "initial")]]).align_self, None, "all: initial resets align-self");
+    assert_eq!(cascade(&[&[("align-self", "center")], &[("align-self", "inherit")]]).align_self, Some(AlignSelf::CENTER), "inherit is dropped (as align-items)");
+}
+
+/// AETHERCSSALIGNSELFARM (SR1068): a float keeps its START / END in either order (Aether's float approximation;
+/// Chromium ignores align-self on a float in block flow).
+#[test]
+fn align_self_float_wins() {
+    assert_eq!(styled(&[("float", "left"), ("align-self", "center")]).align_self, Some(AlignSelf::START), "float: left then center");
+    assert_eq!(styled(&[("align-self", "center"), ("float", "left")]).align_self, Some(AlignSelf::START), "center then float: left");
+    assert_eq!(styled(&[("float", "right"), ("align-self", "auto")]).align_self, Some(AlignSelf::END), "float: right then auto");
+    assert_eq!(styled(&[("float", "none"), ("align-self", "center")]).align_self, Some(AlignSelf::CENTER), "float: none does not guard");
+}
+
+/// AETHERCSSALIGNSELFARM (SR1068): a 200px-tall flex row with one 50 x 50 item: `align-self: center` puts it at y 75,
+/// `flex-end` at y 150; with no align-self it sits at y 0 (armed: before the arm the declaration was dropped).
+#[test]
+fn align_self_center_layout() {
+    let y = |a: Option<&'static str>| {
+        let doc = page(vec![el("div", &[("id", "fc")], vec![el("div", &[("id", "k")], vec![])])]);
+        let (fc, k) = (doc.by_id("fc"), doc.by_id("k"));
+        let row: &[(&str, &str)] = &[("display", "flex"), ("width", "200px"), ("height", "200px")];
+        let mut item: Vec<(&str, &str)> = vec![("width", "50px"), ("height", "50px")];
+        if let Some(a) = a {
+            item.push(("align-self", a));
+        }
+        let sheet = Sheet(vec![(fc.id, std::rc::Rc::new(cascade(&[row]))), (k.id, std::rc::Rc::new(cascade(&[item.as_slice()])))]);
+        let tree = lay_styled(&doc, &sheet, 400.0, 400.0);
+        box_of(&tree, &k).1 - box_of(&tree, &fc).1
+    };
+    let (none, c, e) = (y(None), y(Some("center")), y(Some("flex-end")));
+    assert!(none.abs() <= 0.5, "no align-self: the item sits at the top: {none}");
+    assert!((c - 75.0).abs() <= 0.5, "align-self: center at y 75: {c}");
+    assert!((e - 150.0).abs() <= 0.5, "align-self: flex-end at y 150: {e}");
 }
