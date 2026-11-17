@@ -102,12 +102,12 @@ pub struct Advancer {
     pub size: f32,
     pub letter_spacing: f32,
     pub word_spacing: f32,
-    pub dir: Direction, pub small_caps: u8,
+    pub dir: Direction, pub small_caps: u8, pub ovr: u8,
 }
 
 impl Advancer {
     pub fn new(sel: FontSel, size: f32, letter_spacing: f32) -> Self {
-        Advancer { sel, size, letter_spacing, word_spacing: 0.0, dir: Direction::Ltr, small_caps: 0 }
+        Advancer { sel, size, letter_spacing, word_spacing: 0.0, dir: Direction::Ltr, small_caps: 0, ovr: 0 }
     }
     pub fn with_word_spacing(mut self, ws: f32) -> Self {
         self.word_spacing = ws;
@@ -122,7 +122,7 @@ impl Advancer {
         self.letter_spacing == 0.0
     }
     pub fn shape(&self, s: &str) -> Rc<Shaped> {
-        shape(&self.sel, s, self.dir, self.ligatures())
+        if self.ovr != 0 { return shape_override(&self.sel, s, self.dir, self.ligatures(), self.ovr); } shape(&self.sel, s, self.dir, self.ligatures())
     }
     /// Advance of one character in px.
     pub fn char(&self, c: char) -> f32 {
@@ -242,4 +242,31 @@ impl Advancer {
             .map(|(r, lower)| if lower { (s[r].to_uppercase(), small) } else { (s[r].to_string(), plain) })
             .collect()
     }
+}
+
+// ---- AETHERCSSOMUNICODEBIDI (LEDGER SR1008): unicode-bidi override through the shaper's own X1-X8 (named tail block) ----
+
+impl Advancer {
+    /// AETHERCSSOMUNICODEBIDI (SR1008): the run's bidi override: 0 none, 1 left-to-right (LRO), 2 right-to-left (RLO).
+    pub fn with_bidi_override(mut self, ovr: u8) -> Self {
+        self.ovr = ovr;
+        self
+    }
+}
+
+/// AETHERCSSOMUNICODEBIDI (SR1008): css-writing-modes-4 §2.4.2: an overridden run is the text between LRO (`ovr` 1) or
+/// RLO (`ovr` 2) and PDF, so font_core's own explicit-level resolution (UAX #9 X4 / X5) forces every character to the
+/// override direction and the run's reordering is suppressed. The marks are X9-removed default ignorables (zero-width
+/// glyphs, no fallback face): their glyphs are dropped and every cluster is shifted back onto `text`.
+fn shape_override(sel: &FontSel, text: &str, dir: Direction, ligatures: bool, ovr: u8) -> Rc<Shaped> {
+    let open = if ovr == 2 { '\u{202E}' } else { '\u{202D}' };
+    let o = open.len_utf8();
+    let wrapped = format!("{open}{text}\u{202C}");
+    let sh = shape(sel, &wrapped, dir, ligatures);
+    let mut out = Shaped::default();
+    for g in sh.glyphs.iter().filter(|g| g.cluster >= o && g.cluster < o + text.len()) {
+        out.width += g.adv;
+        out.glyphs.push(ShapedGlyph { cluster: g.cluster - o, ..*g });
+    }
+    Rc::new(out)
 }

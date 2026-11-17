@@ -1406,6 +1406,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             "ltr" => style.paint.rtl = Some(false),
             _ => {}
         },
+        "unicode-bidi" => style.paint.unicode_bidi = unicode_bidi_code(value).or(style.paint.unicode_bidi),
         // css-text-decor-3 §4: offset-x offset-y [blur] && [color], comma-separated layers.
         "text-shadow" => {
             let layers: Vec<H::Shadow> = H::parse_box_shadow(value).into_iter().filter(|s| !H::shadow_is_inset(s)).collect();
@@ -2613,7 +2614,7 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
         white_space, word_break, overflow_wrap, letter_spacing, line_through, display_kind, decoration_color, decoration_style, decoration_thickness, underline_offset, underline_position,
         ua_vmargin, border_collapse, caption_side, border_spacing, has_width, position_kind, z_index,
         list_item, list_style, vertical_align, float, opacity, font_size_rel, table_fixed, bg_alpha, border_alpha,
-        stretch, word_spacing, rtl, clear, tf_translate, tf_rotate, tf_scale, transform_origin, inset_px,
+        stretch, word_spacing, rtl, unicode_bidi, clear, tf_translate, tf_rotate, tf_scale, transform_origin, inset_px,
         overflow, col_count, col_width, col_gap, col_fill, col_rule_width, col_rule_style, col_rule_color,
         writing_mode, text_orientation, container_type, contain_size,
         scrollbar_gutter, scroll_smooth, snap_type, snap_align, snap_stop, scroll_padding, col_span,
@@ -4052,7 +4053,6 @@ fn css_wide_box<H: Host>(prop: &str, value: &str, style: &mut SpecifiedStyle<H>)
     true
 }
 
-
 // ---- AETHERCSSTEXTDECORATIONSTYLETHICKNESS (LEDGER SR1038): text-decoration-style and -thickness values (named tail block) ----
 
 /// AETHERCSSTEXTDECORATIONSTYLETHICKNESS (SR1038): a `text-decoration-style` keyword as [`PaintStyle::decoration_style`]'s
@@ -4211,4 +4211,22 @@ fn underline_offset_value(v: &str, cx: &ParseCx) -> Option<Option<f32>> {
         return None;
     }
     parse_px(v, cx).filter(|px| px.is_finite()).map(Some)
+}
+
+// ---- AETHERCSSOMUNICODEBIDI (LEDGER SR1008): css-writing-modes-4 §2.2 unicode-bidi keyword codes (named tail block) ----
+
+/// AETHERCSSOMUNICODEBIDI (SR1008): the `unicode-bidi` keyword as its `PaintStyle::unicode_bidi` code: 0 normal, 1 embed,
+/// 2 isolate, 3 bidi-override, 4 isolate-override, 5 plaintext (ASCII-case-insensitive). The property is NOT inherited, so
+/// `initial` and `unset` are `normal` (0) and beat an earlier rule; `inherit` (owed to SR1007's non-inherited road),
+/// `revert` and an unknown keyword give None: the declaration keeps the earlier value.
+pub fn unicode_bidi_code(value: &str) -> Option<u8> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "normal" | "initial" | "unset" => Some(0),
+        "embed" => Some(1),
+        "isolate" => Some(2),
+        "bidi-override" => Some(3),
+        "isolate-override" => Some(4),
+        "plaintext" => Some(5),
+        _ => None,
+    }
 }

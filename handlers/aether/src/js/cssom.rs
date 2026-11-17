@@ -1147,7 +1147,7 @@ fn initial_value(p: &str) -> &'static str {
         "flex-grow" | "order" => "0",
         "flex-shrink" => "1",
         "justify-content" | "align-content" | "align-items" | "align-self" | "justify-items" | "justify-self" => "normal",
-        "direction" => "ltr",
+        "direction" => "ltr", "unicode-bidi" => "normal",
         "pointer-events" => "auto",
         "letter-spacing" | "word-spacing" => "normal",
         "font-synthesis" => "weight style small-caps", "font-synthesis-weight" | "font-synthesis-style" | "font-synthesis-small-caps" => "auto", "font-variant" | "font-variant-caps" => "normal",
