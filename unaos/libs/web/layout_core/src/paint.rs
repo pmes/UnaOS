@@ -25,6 +25,8 @@ pub struct PaintStyle<H: Host> {
     pub bg_image: Option<String>,
     /// AETHERCSSWIDEBACKGROUNDIMAGENONE (SR1015): this block declared `background-image: none` (`merge_paint` clears the earlier image and gradient).
     pub bg_image_none: bool,
+    /// AETHERCSSBACKGROUNDMULTILAYER (SR1052): background layers 2..n of a comma list in list order (the first layer is `bg_image` / `bg_gradient`; None = unspecified, Some = this block declared the list).
+    pub bg_more: Option<Vec<BgLayer<H>>>,
     /// visibility:hidden / opacity:0 — box keeps its space, paints nothing.
     pub hidden: Option<bool>,
     /// overflow != visible — descendants clip to this box's rect.
@@ -269,7 +271,7 @@ impl<H: Host> Default for PaintStyle<H> {
             border: None,
             line_height: None,
             bg_image: None,
-            bg_image_none: false,
+            bg_image_none: false, bg_more: None,
             hidden: None,
             clip: None,
             underline: None,
@@ -1039,5 +1041,66 @@ impl<H: Host> PaintStyle<H> {
         if src.background.is_some() {
             self.currentcolor = (self.currentcolor & !CC_BG) | (src.currentcolor & CC_BG);
         }
+    }
+}
+
+// ---- AETHERCSSBACKGROUNDMULTILAYER (LEDGER SR1052): background-image is a comma layer list, painted bottom-up (named tail block) ----
+
+/// AETHERCSSBACKGROUNDMULTILAYER (SR1052): one background layer past the first (css-backgrounds-3 §2.2 / §3.3).
+#[derive(Debug, Clone)]
+pub enum BgLayer<H: Host> {
+    Url(String),
+    Gradient(H::Gradient),
+}
+
+/// A borrowed layer for the painter: the first layer lives in `bg_image` / `bg_gradient`, the rest in `bg_more`.
+pub enum BgLayerRef<'a, H: Host> {
+    Url(&'a str),
+    Gradient(&'a H::Gradient),
+}
+
+impl<'a, H: Host> BgLayerRef<'a, H> {
+    pub fn url(&self) -> Option<&'a str> {
+        match self {
+            BgLayerRef::Url(u) => Some(*u),
+            BgLayerRef::Gradient(_) => None,
+        }
+    }
+
+    pub fn gradient(&self) -> Option<&'a H::Gradient> {
+        match self {
+            BgLayerRef::Gradient(g) => Some(*g),
+            BgLayerRef::Url(_) => None,
+        }
+    }
+}
+
+impl<H: Host> PaintStyle<H> {
+    /// The layers in paint order, bottom first: `bg_more` reversed, then the gradient field, then the url field (the
+    /// first layer of a list is painted last, on top; the two fields keep their pre-list order, the image over the
+    /// gradient).
+    pub fn bg_layers_bottom_up(&self) -> Vec<BgLayerRef<'_, H>> {
+        let mut out: Vec<BgLayerRef<'_, H>> = self
+            .bg_more
+            .iter()
+            .flatten()
+            .rev()
+            .map(|l| match l {
+                BgLayer::Url(u) => BgLayerRef::Url(u.as_str()),
+                BgLayer::Gradient(g) => BgLayerRef::Gradient(g),
+            })
+            .collect();
+        if let Some(Some(g)) = self.bg_gradient.as_ref() {
+            out.push(BgLayerRef::Gradient(g));
+        }
+        if let Some(u) = self.bg_image.as_deref() {
+            out.push(BgLayerRef::Url(u));
+        }
+        out
+    }
+
+    /// Whether any layer is a url image (its pixels arrive later).
+    pub fn has_bg_url(&self) -> bool {
+        self.bg_image.is_some() || self.bg_more.iter().flatten().any(|l| matches!(l, BgLayer::Url(_)))
     }
 }

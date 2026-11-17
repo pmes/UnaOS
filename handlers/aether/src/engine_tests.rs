@@ -7482,4 +7482,62 @@ mod tests {
         assert_eq!(crate::css::REPORT_PROPS[21], "unicode-bidi");
         assert_eq!(crate::css::REPORT_PROPS[20], "direction");
     }
+
+    // ---- AETHERCSSBACKGROUNDMULTILAYER (LEDGER SR1052): background-image is a comma layer list, painted bottom-up (named tail block) ----
+
+    /// AETHERCSSBACKGROUNDMULTILAYER (SR1052): one 20px row per probe at 400 px wide, rows 12px apart. The image is a
+    /// 2x2 checkerboard PNG data: URL (two opaque red pixels, two transparent: tiled, half the box red, the rest a hole),
+    /// the gradient solid blue. `.ug` url over gradient, `.u` / `.g` its one-layer twins, `.gu` gradient over url,
+    /// `.rp.g2` a url rule then a later gradient rule, `.sh` the shorthand's url over gradient.
+    fn background_multi_layer_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><head><style>
+            div { margin: 0 0 12px; height: 20px }
+            .ug { background-image: url(PNG), linear-gradient(rgb(0, 0, 255), rgb(0, 0, 255)) }
+            .u { background-image: url(PNG) }
+            .g { background-image: linear-gradient(rgb(0, 0, 255), rgb(0, 0, 255)) }
+            .gu { background-image: linear-gradient(rgb(0, 0, 255), rgb(0, 0, 255)), url(PNG) }
+            .rp { background-image: url(PNG) }
+            .rp.g2 { background-image: linear-gradient(rgb(0, 0, 255), rgb(0, 0, 255)) }
+            .sh { background: url(PNG), linear-gradient(rgb(0, 0, 255), rgb(0, 0, 255)) }
+            </style></head><body style="margin:0">
+            <div id="ug" class="ug"></div>
+            <div id="u" class="u"></div>
+            <div id="g" class="g"></div>
+            <div id="gu" class="gu"></div>
+            <div id="rp" class="rp g2"></div>
+            <div id="sh" class="sh"></div>
+        </body></html>"#
+            .replace("PNG", "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAEUlEQVR4nGP4z8AARFAA4gAAI+4D/QU7+oQAAAAASUVORK5CYII=");
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", &html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSBACKGROUNDMULTILAYER (SR1052): `url(PNG), linear-gradient(..)` paints the image's opaque pixels on top and
+    /// the gradient through its holes; the url-only twin shows no blue and the gradient-only twin no red (armed).
+    #[test]
+    fn background_multi_layer_url_over_gradient() {
+        let mut e = background_multi_layer_engine();
+        assert!(css_wide_color_ink(&mut e, "u", css_wide_red) > 100, "the url-only twin paints red (armed)");
+        assert_eq!(css_wide_color_ink(&mut e, "u", css_wide_blue), 0, "the url-only twin has no blue (armed)");
+        assert!(css_wide_color_ink(&mut e, "g", css_wide_blue) > 100, "the gradient-only twin paints blue (armed)");
+        assert_eq!(css_wide_color_ink(&mut e, "g", css_wide_red), 0, "the gradient-only twin has no red (armed)");
+        assert!(css_wide_color_ink(&mut e, "ug", css_wide_red) > 100, "the top image's opaque pixels");
+        assert!(css_wide_color_ink(&mut e, "ug", css_wide_blue) > 100, "the gradient through the image's holes");
+    }
+
+    /// AETHERCSSBACKGROUNDMULTILAYER (SR1052): the first layer is on top: an opaque gradient listed before the url covers
+    /// it (no red); a later rule's gradient replaces an earlier rule's url (no red); the shorthand's two layers both paint.
+    #[test]
+    fn background_multi_layer_order_replace_shorthand() {
+        let mut e = background_multi_layer_engine();
+        assert!(css_wide_color_ink(&mut e, "gu", css_wide_blue) > 100, "the top gradient paints");
+        assert_eq!(css_wide_color_ink(&mut e, "gu", css_wide_red), 0, "the url under an opaque gradient is covered");
+        assert!(css_wide_color_ink(&mut e, "rp", css_wide_blue) > 100, "the later rule's gradient paints");
+        assert_eq!(css_wide_color_ink(&mut e, "rp", css_wide_red), 0, "the earlier rule's url is replaced");
+        assert!(css_wide_color_ink(&mut e, "sh", css_wide_red) > 100, "shorthand: the url layer");
+        assert!(css_wide_color_ink(&mut e, "sh", css_wide_blue) > 100, "shorthand: the gradient layer");
+    }
 }
