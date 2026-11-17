@@ -305,7 +305,7 @@ impl Face {
 /// Serve one editor face on the bus: the first frame, then every surface / button message through [`Face::on`] and a
 /// fresh blit after each change; while playing, a clock at the timeline's frame rate steps the playhead.
 pub async fn serve(bus: Synapse, mut rx: tokio::sync::broadcast::Receiver<SMessage>, mut face: Face) {
-    use tokio::sync::broadcast::error::RecvError;
+    use tokio::sync::broadcast::error::RecvError; face.decode_off_thread(); // STRIATHUMBNAILSNEXT (SR997): the served face decodes heads and peak tables off its thread (file tail)
     for m in face.frames() { bus.fire(m); }
     let fps = face.state.timeline.fps().unwrap_or(25).max(1);
     let mut clock = tokio::time::interval(Duration::from_nanos(1_000_000_000 / fps as u64)); clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip); // STRIAINFOREELHOVERDELAY (SR789): a clock idle under its guard skips the missed ticks (no catch-up burst)
@@ -3132,7 +3132,7 @@ impl view::PeakSource for WavePeaks {
 impl Face {
     /// STRIAWAVEFORM (SR827): scan every audio-track source not scanned yet (once per source for the face's life).
     fn wave_fill(&mut self) {
-        let mut want: Vec<timeline_core::SourceId> = Vec::new();
+        let mut want: Vec<timeline_core::SourceId> = Vec::new(); self.peaks.drain_bg(false); // STRIATHUMBNAILSNEXT (SR997): the worker's finished heads and tables land first (file tail)
         for tr in self.state.timeline.tracks.iter().filter(|tr| tr.kind == Kind::Audio) {
             for c in &tr.clips {
                 if !self.peaks.map.contains_key(&c.src) && !want.contains(&c.src) {
@@ -3140,7 +3140,7 @@ impl Face {
                 }
             }
         }
-        for id in want {
+        for id in want { if self.peaks.thumbs.ask_scan(id) { self.peaks.map.insert(id, None); continue; } // STRIATHUMBNAILSNEXT (SR997): a served face queues the scan, the placeholder keeps the body flat (file tail)
             let p = match crate::nle::scan_peaks(&self.sources, id, view::PEAKS_PER_SEC) {
                 Ok(p) => p,
                 Err(e) => {
@@ -3194,6 +3194,7 @@ pub struct Thumbs {
     seq: u64,
     decodes: u32,
     pending: bool,
+    bg: Option<Bg>, // STRIATHUMBNAILSNEXT (SR997): the served face's decode worker (None: decode on the face's thread) (file tail)
 }
 
 impl Thumbs {
@@ -3226,7 +3227,7 @@ impl Thumbs {
     }
     /// The head of `src` at `src_in`: cached, else decoded once (see the block's RULES).
     fn thumb_for(&mut self, tl: &Timeline, sources: &Sources, src: timeline_core::SourceId, src_in: i64) -> Option<&Still> {
-        use timeline_core::SourceIndex as _;
+        use timeline_core::SourceIndex as _; if self.ask_head(tl, src, src_in) { return None; } // STRIATHUMBNAILSNEXT (SR997): a served face queues the head, a None placeholder holds the bar (file tail)
         if !self.map.contains_key(&(src, src_in)) {
             let still = if sources.duration(src).is_none() {
                 None
@@ -3271,7 +3272,7 @@ impl Face {
     }
     /// STRIATHUMBNAILS (SR839): the last paint's fill left a wanted head undecoded (`serve`'s clock runs while it is true).
     pub fn thumbs_pending(&self) -> bool {
-        self.peaks.thumbs.pending
+        self.peaks.thumbs.pending || self.peaks.thumbs.bg_busy() // STRIATHUMBNAILSNEXT (SR997): and while the worker holds a job (file tail)
     }
 }
 
@@ -3342,5 +3343,192 @@ impl Thumbs {
                 }
             }
         }
+    }
+}
+
+// ---- STRIATHUMBNAILSNEXT (LEDGER SR997): heads and peak tables decoded off the face's thread (named tail block) ----
+// SR839's heads (`Thumbs::thumb_for`) and SR827's peak tables (`nle::scan_peaks`) were decoded on the face's thread inside the
+// paint: a long-GOP head held a paint for its run-up, a long source's first paint for its whole audio decode. `serve` (the
+// windowed face; its only caller is stria-view's window) now calls `Face::decode_off_thread`, which starts ONE worker thread
+// holding a clone of the face's `Arc<Sources>` (already shared with the export thread). RULES:
+// * ASK: with a worker, `thumb_for` sends a `BgJob::Head` for an absent key and caches a `None` placeholder (the body keeps its
+//   bar; `fill`'s `contains_key` asks once); `wave_fill` sends a `BgJob::Scan` and caches `None` (the body stays flat). The
+//   THUMBS_PER_PAINT / THUMB_BUDGET_MS rules are unchanged: they bound the requests one paint makes.
+// * DECODE: the worker runs THE SAME roads: `thumb_for` on a scratch `Thumbs` (no worker: synchronous) and `scan_peaks`.
+// * TAKE: `WavePeaks::drain_bg`, at `wave_fill`'s start (every paint), moves each finished job into the face's maps (a head
+//   through `Thumbs::insert`, overwriting its placeholder; `decodes` / `scans` counted as they land).
+// * WAKE: `thumbs_pending` is also true while a job is out, so `serve`'s existing clock repaints until the results land.
+// * LOST: a worker gone (its channel disconnected) is dropped and its in-flight keys are removed, so the face's own thread asks
+//   again. A face not served (the witness, every test) never starts a worker and stays synchronous (its frames unchanged).
+// No lock: the maps stay the face thread's; the results move by channel. Owed: NLE-THUMBNAILS-BG-WAKE (a repaint per clock
+// tick while a job is out, not only on arrival), NLE-THUMBNAILS-BG-CANCEL (a queued job for a key scrolled away still runs; a
+// dropped face's running job finishes).
+
+/// STRIATHUMBNAILSNEXT (SR997): one job for the decode worker.
+enum BgJob {
+    /// A head: the face's timeline with its tracks cleared (`thumb_for` builds its one-clip timeline from it) and the key.
+    Head(Timeline, timeline_core::SourceId, i64),
+    /// A source's peak table.
+    Scan(timeline_core::SourceId),
+}
+
+/// STRIATHUMBNAILSNEXT (SR997): one finished job (a head with the worker's decode count; a table).
+enum BgDone {
+    Head((timeline_core::SourceId, i64), Option<Still>, u32),
+    Scan(timeline_core::SourceId, Option<view::Peaks>),
+}
+
+/// STRIATHUMBNAILSNEXT (SR997): the decode worker's channel ends and the jobs in flight.
+struct Bg {
+    tx: std::sync::mpsc::Sender<BgJob>,
+    rx: std::sync::mpsc::Receiver<BgDone>,
+    out: u32,
+    heads: Vec<(timeline_core::SourceId, i64)>,
+    scans: Vec<timeline_core::SourceId>,
+}
+
+impl Bg {
+    /// The worker thread over `sources`; it ends when the face's job sender drops. A refused spawn: `None` (synchronous).
+    fn start(sources: Arc<Sources>) -> Option<Bg> {
+        let (tx, jobs) = std::sync::mpsc::channel::<BgJob>();
+        let (done, rx) = std::sync::mpsc::channel::<BgDone>();
+        let spawned = std::thread::Builder::new().name("nle-face-decode".into()).spawn(move || {
+            for job in jobs {
+                let d = match job {
+                    BgJob::Head(tl, src, src_in) => {
+                        let mut t = Thumbs::default();
+                        let s = t.thumb_for(&tl, &sources, src, src_in).cloned();
+                        BgDone::Head((src, src_in), s, t.decodes)
+                    }
+                    BgJob::Scan(id) => {
+                        let p = match crate::nle::scan_peaks(&sources, id, view::PEAKS_PER_SEC) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                log::debug!("[nle-face] waveform {id:?}: {e}");
+                                None
+                            }
+                        };
+                        BgDone::Scan(id, p)
+                    }
+                };
+                if done.send(d).is_err() {
+                    break;
+                }
+            }
+        });
+        match spawned {
+            Ok(_) => Some(Bg { tx, rx, out: 0, heads: Vec::new(), scans: Vec::new() }),
+            Err(e) => {
+                log::warn!("[nle-face] decode worker: {e} (decoding on the face's thread)");
+                None
+            }
+        }
+    }
+}
+
+impl Thumbs {
+    /// STRIATHUMBNAILSNEXT (SR997): with a worker and `(src, src_in)` not keyed, queue its head and cache the `None`
+    /// placeholder (true); otherwise false (the synchronous road runs).
+    fn ask_head(&mut self, tl: &Timeline, src: timeline_core::SourceId, src_in: i64) -> bool {
+        if self.map.contains_key(&(src, src_in)) {
+            return false;
+        }
+        let sent = match self.bg.as_mut() {
+            None => false,
+            Some(bg) => {
+                let mut one = tl.clone();
+                one.tracks.clear();
+                let ok = bg.tx.send(BgJob::Head(one, src, src_in)).is_ok();
+                if ok {
+                    bg.out += 1;
+                    bg.heads.push((src, src_in));
+                }
+                ok
+            }
+        };
+        if sent {
+            self.insert((src, src_in), None);
+        }
+        sent
+    }
+    /// STRIATHUMBNAILSNEXT (SR997): with a worker, queue source `id`'s peak scan (true: the caller caches the placeholder).
+    fn ask_scan(&mut self, id: timeline_core::SourceId) -> bool {
+        match self.bg.as_mut() {
+            None => false,
+            Some(bg) => {
+                let ok = bg.tx.send(BgJob::Scan(id)).is_ok();
+                if ok {
+                    bg.out += 1;
+                    bg.scans.push(id);
+                }
+                ok
+            }
+        }
+    }
+    /// STRIATHUMBNAILSNEXT (SR997): a job is out on the worker.
+    fn bg_busy(&self) -> bool {
+        self.bg.as_ref().is_some_and(|b| b.out > 0)
+    }
+}
+
+impl WavePeaks {
+    /// STRIATHUMBNAILSNEXT (SR997): every finished job into the face's maps; `block`: wait until no job is out.
+    fn drain_bg(&mut self, block: bool) {
+        use std::sync::mpsc::TryRecvError;
+        loop {
+            let Some(bg) = self.thumbs.bg.as_mut() else { return };
+            if bg.out == 0 {
+                return;
+            }
+            let got = if block { bg.rx.recv().map_err(|_| TryRecvError::Disconnected) } else { bg.rx.try_recv() };
+            match got {
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    self.bg_lost();
+                    return;
+                }
+                Ok(BgDone::Head(k, s, n)) => {
+                    bg.out = bg.out.saturating_sub(1);
+                    bg.heads.retain(|h| *h != k);
+                    self.thumbs.decodes += n;
+                    self.thumbs.insert(k, s);
+                }
+                Ok(BgDone::Scan(id, p)) => {
+                    bg.out = bg.out.saturating_sub(1);
+                    bg.scans.retain(|x| *x != id);
+                    self.map.insert(id, p);
+                    self.scans += 1;
+                }
+            }
+        }
+    }
+    /// STRIATHUMBNAILSNEXT (SR997): the worker is gone: drop it and its in-flight placeholders (the face's thread asks again).
+    fn bg_lost(&mut self) {
+        if let Some(bg) = self.thumbs.bg.take() {
+            log::warn!("[nle-face] decode worker gone: {} jobs back on the face's thread", bg.out);
+            for k in &bg.heads {
+                self.thumbs.map.remove(k);
+            }
+            for id in &bg.scans {
+                self.map.remove(id);
+            }
+        }
+    }
+}
+
+impl Face {
+    /// STRIATHUMBNAILSNEXT (SR997): decode heads and peak tables on one worker thread from now on (`serve` calls it once).
+    pub fn decode_off_thread(&mut self) {
+        if self.peaks.thumbs.bg.is_none() {
+            self.peaks.thumbs.bg = Bg::start(self.sources.clone());
+        }
+    }
+    /// STRIATHUMBNAILSNEXT (SR997): wait until the worker holds no job, every result in the face's maps.
+    pub fn bg_settle(&mut self) {
+        self.peaks.drain_bg(true);
+    }
+    /// STRIATHUMBNAILSNEXT (SR997): the face decodes off its thread.
+    pub fn bg_running(&self) -> bool {
+        self.peaks.thumbs.bg.is_some()
     }
 }
