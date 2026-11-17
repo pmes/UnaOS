@@ -3655,7 +3655,7 @@ fn nle5dexportmessageetastallwitness_paused_face_export_stall() {
 fn striaexportframe_frame_path_kats() {
     use stria::nle_face::frame_path;
     use std::path::{Path, PathBuf};
-    assert!(frame_path(Some(Path::new("/x/reel.edl"contains&)"00:00:01:12"), PathBuf::from("/x/reel-00-00-01-12.png"))); // STRIAXFADECURVEBUTTON (SR925): siblings add words before help, so no position index
+    assert_eq!(frame_path(Some(Path::new("/x/reel.edl")), "00:00:01:12"), PathBuf::from("/x/reel-00-00-01-12.png"));
     assert_eq!(frame_path(None, "00:00:01:12"), PathBuf::from("untitled-00-00-01-12.png"));
     assert!(frame_path(None, "00:00:01:12").is_relative());
     assert_eq!(frame_path(Some(Path::new("/x/reel.edl")), &edl::timecode(37, 25)), PathBuf::from("/x/reel-00-00-01-12.png"), "edl's own timecode");
@@ -3971,7 +3971,7 @@ fn striasnapdrag_face_drag_snaps_to_the_in_mark_and_alt_does_not() {
     face.state.seek(22);
     assert!(face.verb("in"));
     face.state.seek(0);
-    assert_eq!(face.marks(), (Some(22).take().as_deref(), Some("xfade: 10 linear")));
+    assert_eq!(face.marks(), (Some(22), None));
     let tl0 = face.state.timeline.clone();
     let l = face.layout();
     let y = l.point(0, 28).1;
@@ -4818,7 +4818,7 @@ fn striatransitionlength_face_dur_input() {
 #[test]
 fn striaaudiocrossfade_face_word_is_one_undo_step() {
     use timeline_core::Curve;
-    assert_eq!(VERBS[VERBS.len() - 2], "xfade");
+    assert!(VERBS.contains(&"xfade")); // STRIAXFADECURVEBUTTON (SR925): siblings add words before help, so no position index
     assert_eq!(VERBS.last(), Some(&"help"));
     let (tl, src) = synth_fixture();
     let mut face = nlefaceexport_face(tl.clone(), src);
