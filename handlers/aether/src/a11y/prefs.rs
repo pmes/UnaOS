@@ -64,7 +64,7 @@ impl A11yPrefs {
 
     /// The media-query side of the preferences.
     pub fn media(&self) -> UserPreferences {
-        UserPreferences { reduced_motion: self.reduce_motion, contrast: self.contrast, forced_colors: self.forced_colors }
+        UserPreferences { reduced_motion: self.reduce_motion, contrast: self.contrast, forced_colors: self.forced_colors, dark: css_core::media::user_preferences().dark } // AETHERCOLORSCHEMEMETA (SR1047): an a11y apply keeps the recorded scheme
     }
 
     /// The focus ring these preferences ask for: 3px under more contrast or forced colors (WCAG 2.2

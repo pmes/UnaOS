@@ -906,7 +906,7 @@ pub fn push_button_edges() -> (taffy::Rect<f32>, taffy::Rect<f32>) {
 /// AETHERFILEFACE (SR463): Chromium's ButtonFace, the ONE source of a push button's UA background (`build_taffy_tree`)
 /// and of the face both rings' file paint draw on a file input's Choose-File button sub-box (the host's
 /// `paint_file_color`, AETHER.ELF's paint.rs `file_color`), the input itself painting none.
-pub const BUTTON_FACE: (u8, u8, u8) = (239, 239, 239);
+pub const BUTTON_FACE: (u8, u8, u8) = UA_LIGHT.face; // AETHERCSSWIDECOLORCONTROLSDARK (SR1031): the light row's face, (239, 239, 239)
 
 /// AETHERFILECOLORPAINT (SR456): a color input's swatch (Chromium html.css: the input's 1px border and 1px 2px padding,
 /// `::-webkit-color-swatch-wrapper { padding: 4px 2px }`, `::-webkit-color-swatch { border: 1px solid #777777 }`): the
@@ -3866,4 +3866,64 @@ fn inherit_box<H: Host>(child: &SpecifiedStyle<H>, ps: &Style, pp: &PaintStyle<H
         (p.paint.background, p.paint.bg_alpha) = (pp.background, pp.bg_alpha.or(pp.background.is_none().then_some(0.0)));
     }
     p
+}
+
+// ---- AETHERCSSWIDECOLORCONTROLSDARK (LEDGER SR1031): the ONE table of UA control / canvas colours, a light and a dark row (named tail block) ----
+
+/// AETHERCSSWIDECOLORCONTROLSDARK (SR1031): the UA colours the control painters and the canvas fill read, per colour
+/// scheme (css-color-adjust-1 §2.1; Chromium's html.css `-internal-light-dark` pairs): `face` ButtonFace (a push
+/// button's UA background, [`BUTTON_FACE`] the light row's), `frame` the 1px control-theme frame, `field` Field (a
+/// text field / textarea / select's background: the light road paints none, the canvas white showing through),
+/// `ink` ButtonText / FieldText, `canvas` Canvas (the root's canvas fill), `canvastext` CanvasText (the root's ink).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UaColours {
+    pub face: (u8, u8, u8),
+    pub frame: (u8, u8, u8),
+    pub field: (u8, u8, u8),
+    pub ink: (u8, u8, u8),
+    pub canvas: (u8, u8, u8),
+    pub canvastext: (u8, u8, u8),
+}
+
+/// AETHERCSSWIDECOLORCONTROLSDARK (SR1031): the light row: the constants the painters read before this arc.
+pub const UA_LIGHT: UaColours = UaColours {
+    face: (239, 239, 239),
+    frame: (118, 118, 118),
+    field: (255, 255, 255),
+    ink: (0, 0, 0),
+    canvas: (255, 255, 255),
+    canvastext: (0, 0, 0),
+};
+
+/// AETHERCSSWIDECOLORCONTROLSDARK (SR1031): Chromium's dark row: ButtonFace #6b6b6b, Field #3b3b3b, Canvas #121212,
+/// ButtonText / FieldText / CanvasText #fff; the frame #858585 (Chromium's dark text-field border; the dark push-button
+/// border is unverified, AETHER-COLOR-SCHEME-BUTTONBORDER owed).
+pub const UA_DARK: UaColours = UaColours {
+    face: (107, 107, 107),
+    frame: (133, 133, 133),
+    field: (59, 59, 59),
+    ink: (255, 255, 255),
+    canvas: (18, 18, 18),
+    canvastext: (255, 255, 255),
+};
+
+/// AETHERCSSWIDECOLORCONTROLSDARK (SR1031): an element's resolved `color-scheme` (PaintStyle::color_scheme bits, None or
+/// `normal` Some(0) the light default) uses the dark row only when it has dark and not light: `light dark` is light,
+/// unless the host prefers dark (css_core `UserPreferences::dark`, [`scheme_dark_for`]; AETHERCOLORSCHEMEMETA SR1047).
+pub fn scheme_dark(scheme: Option<u8>) -> bool {
+    scheme_dark_for(scheme, css_core::media::user_preferences().dark)
+}
+
+/// AETHERCSSWIDECOLORCONTROLSDARK (SR1031): the UA colour row of a resolved scheme ([`scheme_dark`]).
+pub fn ua_colours(scheme: Option<u8>) -> &'static UaColours {
+    if scheme_dark(scheme) { &UA_DARK } else { &UA_LIGHT }
+}
+
+// ---- AETHERCOLORSCHEMEMETA (LEDGER SR1047): `light dark` follows the host's preferred scheme (named tail block) ----
+
+/// AETHERCOLORSCHEMEMETA (SR1047): css-color-adjust-1 §2.1 with the user's preference explicit: a scheme with dark and
+/// not light is dark; `light dark` is dark iff the host prefers dark (the `prefers-color-scheme` answer); light alone,
+/// `normal` (Some(0)) and None stay light. [`scheme_dark`] passes css_core's recorded preference.
+pub fn scheme_dark_for(scheme: Option<u8>, prefers_dark: bool) -> bool {
+    scheme.is_some_and(|b| b & 2 != 0 && (b & 1 == 0 || prefers_dark))
 }

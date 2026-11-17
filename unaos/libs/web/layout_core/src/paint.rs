@@ -256,6 +256,8 @@ pub struct PaintStyle<H: Host> {
     pub currentcolor: u8,
     /// AETHERCSSBORDERCOLORSTORED (SR1058): a border colour declared on a side with no entry (style none here), kept per side [top, right, bottom, left] as (colour or the grey carrier, currentcolor) for the road that creates the side later (`border-width`, a style longhand, the merge onto an earlier rule's sides).
     pub border_pending: Option<[Option<((u8, u8, u8), bool)>; 4]>,
+    /// AETHERCSSWIDECOLORCONTROLSDARK (SR1031): css-color-adjust-1 §2.1 `color-scheme` (inherited): None unspecified (the parent's), Some(bits) bit 0 light, bit 1 dark, Some(0) `normal`; read through `tree::ua_colours`.
+    pub color_scheme: Option<u8>,
 }
 
 
@@ -368,6 +370,7 @@ impl<H: Host> Default for PaintStyle<H> {
             outline_color: None,
             outline_offset: None,
             currentcolor: 0, border_pending: None,
+            color_scheme: None,
         }
     }
 }
@@ -889,7 +892,7 @@ pub const INHERIT_WHITE_SPACE: u32 = 256;
 /// AETHERCSSWIDEINHERITEDREST (SR831): `direction` (inherited; its tag road is `default_rtl`: the `dir` attribute).
 pub const INHERIT_DIRECTION: u32 = 512;
 /// AETHERCSSWIDEINHERITEDREST (SR831): `list-style-type` (inherited; its tag road is the ul / menu / dir depth and ol match).
-pub const INHERIT_LIST_STYLE: u32 = 1024;
+pub const INHERIT_LIST_STYLE: u32 = 1024; pub const INHERIT_COLOR_SCHEME: u32 = 2048; // SR1031: `color-scheme` (inherited; its UA road is `tree::ua_colours`)
 /// AETHERCSSWIDELONGHANDS (SR815): every font field `font: inherit` / `font: unset` reaches.
 pub const INHERIT_FONT: u32 = 127;
 
@@ -906,7 +909,7 @@ pub fn inherit_bit(prop: &str) -> u32 {
         "color" => INHERIT_COLOR,
         "white-space" | "white-space-collapse" => INHERIT_WHITE_SPACE,
         "direction" => INHERIT_DIRECTION,
-        "list-style-type" | "list-style" => INHERIT_LIST_STYLE,
+        "list-style-type" | "list-style" => INHERIT_LIST_STYLE, "color-scheme" => INHERIT_COLOR_SCHEME,
         _ => 0,
     }
 }
@@ -926,7 +929,7 @@ impl<H: Host> PaintStyle<H> {
             | on(self.color.is_some(), INHERIT_COLOR)
             | on(self.white_space.is_some(), INHERIT_WHITE_SPACE)
             | on(self.rtl.is_some(), INHERIT_DIRECTION)
-            | on(self.list_style.is_some(), INHERIT_LIST_STYLE)
+            | on(self.list_style.is_some(), INHERIT_LIST_STYLE) | on(self.color_scheme.is_some(), INHERIT_COLOR_SCHEME)
     }
 
     /// AETHERCSSWIDELONGHANDS (SR815): this style explicitly inherits the field of `bit` (the bit is set and no later
@@ -962,7 +965,7 @@ impl<H: Host> PaintStyle<H> {
         if bits & INHERIT_COLOR != 0 { self.color = None; }
         if bits & INHERIT_WHITE_SPACE != 0 { self.white_space = None; self.nowrap = None; } // SR831: the arm's pair
         if bits & INHERIT_DIRECTION != 0 { self.rtl = None; }
-        if bits & INHERIT_LIST_STYLE != 0 { self.list_style = None; }
+        if bits & INHERIT_LIST_STYLE != 0 { self.list_style = None; } if bits & INHERIT_COLOR_SCHEME != 0 { self.color_scheme = None; }
         self.inherit |= bits; self.revert &= !bits; // SR1028: a later inherit beats an earlier revert
     }
 
@@ -1063,9 +1066,11 @@ impl<H: Host> PaintStyle<H> {
 /// AETHERCSSBORDERCOLORSTORED (SR1058): the 1px theme frame a control paints when the author gave it no side: each side
 /// takes its pending colour (`PaintStyle::border_pending`; the element's ink when the entry is currentcolor), else
 /// Chromium's #767676. Before SR1058 a lone `border-color` fabricated the author frame; now the colour waits in the store.
-pub fn pending_frame(pending: Option<[Option<((u8, u8, u8), bool)>; 4]>, ink: (u8, u8, u8)) -> [Option<(f32, (u8, u8, u8))>; 4] {
+/// Trunk-merge seam with AETHERCSSWIDECOLORCONTROLSDARK (SR1031): the theme colour is the caller's `frame` (the
+/// scheme's `ua_colours(..).frame`: #767676 light, #858585 dark) instead of a #767676 literal.
+pub fn pending_frame(pending: Option<[Option<((u8, u8, u8), bool)>; 4]>, ink: (u8, u8, u8), frame: (u8, u8, u8)) -> [Option<(f32, (u8, u8, u8))>; 4] {
     let p = pending.unwrap_or([None; 4]);
-    let mut sides = [Some((1.0, (118, 118, 118))); 4];
+    let mut sides = [Some((1.0, frame)); 4];
     for (i, side) in sides.iter_mut().enumerate() {
         if let Some((c, cc)) = p[i] {
             *side = Some((1.0, if cc { ink } else { c }));
