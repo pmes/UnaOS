@@ -1809,7 +1809,7 @@ fn nle5dexportaudiooptions_unknown_audio_refused_by_name() {
     assert!(face.verb(&format!("export {} png flac", root.display())));
     assert!(face.last_error.take().is_some_and(|e| e.starts_with("export: unknown audio flac; the words are export "))); // NLE5DEXPORTMESSAGEAUDIO (SR756)
     assert!(face.verb(&format!("export {} png aac:x", root.display())));
-    assert!(face.last_error.take().is_some_and(|e| e.starts_with("export: unknown audio aac:x; the words are export "))); // NLE5DEXPORTMESSAGEAUDIO (SR756)
+    assert!(face.last_error.take().is_some_and(|e| e.starts_with("export: aac rate \"x\": aac:KBPS takes a whole number of kb/s above 0; the words are export "))); // NLE5DEXPORTMESSAGEAUDIO (SR756); STRIAEXPORTAACBITRATE (SR887): a bad rate refused by name
     assert!(!face.exporting() && !root.exists(), "a refused audio word makes nothing");
     println!("nle5dexportaudiooptions: refused flac and aac:x by name");
 }
@@ -6127,4 +6127,55 @@ fn striaexportqueue_full_queue_is_busy() {
     assert!(!over.exists() && !nlefaceexport_dir("full-0").exists(), "nothing queued ran");
     let _ = std::fs::remove_dir_all(&a);
     println!("striaexportqueue: {} queued, one more busy", stria::nle_face::EXPORT_QUEUE_MAX);
+}
+
+// ---- STRIAEXPORTAACBITRATE (LEDGER SR887): the face's `aac:KBPS` export word, its bad rate refused by name (named tail block) ----
+
+#[test]
+fn striaexportaacbitrate_face_h264_aac96_movie() {
+    use gneiss_pal::dsp::demux::{Codec, Demuxer, TrackKind};
+    let dir = nlefaceexport_dir("aacbitrate-h264");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(face.verb(&format!("export {} h264 aac:96", dir.display())));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.wait_export());
+    let line = face.last_error.take().expect("the message line");
+    assert!(line.starts_with("export: 35 frames, ") && nle5dexportmessageduration_unwalled(&line).ends_with(&format!(" bytes, h264 + aac:96 -> {}", dir.display())), "{line}");
+    let d = Demuxer::open(std::fs::read(dir.join("movie.mp4")).unwrap()).unwrap();
+    let a = d.tracks().iter().find(|t| t.kind == TrackKind::Audio).expect("an audio track");
+    assert_eq!(a.codec, Codec::Aac, "AAC-LC");
+    assert_eq!(a.btrt.map(|(_, _, avg)| avg), Some(96_000), "the word's 96 kb/s is the track's avgBitrate");
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("striaexportaacbitrate: {line}");
+}
+
+#[test]
+fn striaexportaacbitrate_bad_rate_refused_by_name() {
+    let root = nlefaceexport_dir("aacbitrate-refused");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    for (w, k) in [("aac:0", "0"), ("aac:x", "x"), ("aac:", "")] {
+        for v in [format!("export {} png {w}", root.display()), format!("export {} {w}", root.display())] {
+            assert!(face.verb(&v));
+            let e = face.last_error.take().expect("the refusal");
+            assert!(e.starts_with(&format!("export: aac rate \"{k}\": aac:KBPS takes a whole number of kb/s above 0; the words are export ")), "{v}: {e}");
+            assert!(e.contains("aac[:KBPS]"), "{e}");
+            assert!(!face.exporting() && !root.exists(), "{v}: a refused rate makes nothing");
+        }
+    }
+    assert!(face.verb(&format!("export {} png flac", root.display())));
+    assert!(face.last_error.take().is_some_and(|e| e.starts_with("export: unknown audio flac; the words are export ")), "another word keeps its refusal");
+    println!("striaexportaacbitrate: aac:0 aac:x aac: refused by name in the 2- and 3-word forms");
+}
+
+#[test]
+fn striaexportaacbitrate_usage_names_the_form() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(face.verb("export a b c d"));
+    let u = face.last_error.take().expect("the usage refusal");
+    assert!(u.starts_with("export: usage: export [--all] [<dir>] [") && u.contains("aac[:KBPS]"), "{u}");
+    assert!(!face.exporting());
+    println!("striaexportaacbitrate: {u}");
 }
