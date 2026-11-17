@@ -6625,7 +6625,7 @@ mod tests {
     #[test]
     fn cssom_direction_column_report_width() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 40); // SR1036 fold: unicode-bidi (SR1008) is column 21, SR1036 appends white-space-collapse / text-wrap-mode / text-decoration-color as 22-24 (SR1096: nine box-side columns appended, 34; SR1103: three border side style columns appended, 37; SR1104: three border side colour columns, 40)
+        assert_eq!(crate::css::REPORT_COLS, 45); // SR1036 fold: unicode-bidi (SR1008) is column 21, SR1036 appends white-space-collapse / text-wrap-mode / text-decoration-color as 22-24 (SR1096: nine box-side columns appended, 34; SR1103: three border side style columns appended, 37; SR1104: three border side colour columns, 40); SR1108: five text-decoration / caret columns, 45
         assert_eq!(crate::css::REPORT_PROPS[20], "direction");
         assert_eq!((crate::css::REPORT_PROPS[0], crate::css::REPORT_PROPS[12]), ("display", "visibility"));
     }
@@ -7833,7 +7833,7 @@ b</div>
     #[test]
     fn cssom_unicode_bidi_report_width() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 40); // SR1036 fold: three columns after unicode-bidi (SR1096: nine box-side columns appended, 34; SR1103: three border side style columns, 37; SR1104: three border side colour columns, 40)
+        assert_eq!(crate::css::REPORT_COLS, 45); // SR1036 fold: three columns after unicode-bidi (SR1096: nine box-side columns appended, 34; SR1103: three border side style columns, 37; SR1104: three border side colour columns, 40); SR1108: five text-decoration / caret columns, 45
         assert_eq!(crate::css::REPORT_PROPS[21], "unicode-bidi");
         assert_eq!(crate::css::REPORT_PROPS[20], "direction");
     }
@@ -8669,11 +8669,11 @@ b</div>
     #[test]
     fn cssom_columns_rest_report_width() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 40); // SR1036 fold: unicode-bidi (SR1008) sits at 21 before the three (SR1096: nine box-side columns appended, 34; SR1103: three border side style columns, 37; SR1104: three border side colour columns, 40)
+        assert_eq!(crate::css::REPORT_COLS, 45); // SR1036 fold: unicode-bidi (SR1008) sits at 21 before the three (SR1096: nine box-side columns appended, 34; SR1103: three border side style columns, 37; SR1104: three border side colour columns, 40); SR1108: five text-decoration / caret columns, 45
         assert_eq!(crate::css::REPORT_PROPS[20], "direction");
         assert_eq!(&crate::css::REPORT_PROPS[22..25], &["white-space-collapse", "text-wrap-mode", "text-decoration-color"]); // SR1096: the nine box-side columns follow at 25..34
         let mut e = cssom_columns_rest_engine();
-        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('wn')).length)"), "40"); // SR1036 fold: 25 columns with unicode-bidi (SR1096: 34 with the nine box-side columns; SR1103: 37 with the three border side style columns)
+        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('wn')).length)"), "45"); // SR1036 fold: 25 columns with unicode-bidi (SR1096: 34 with the nine box-side columns; SR1103: 37 with the three border side style columns); SR1108: five text-decoration / caret columns, 45
         assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('wn')).item(24)"), "text-decoration-color"); // SR1096: still column 24 (the box-side columns append after it)
     }
 
@@ -11467,14 +11467,14 @@ b</div>
     #[test]
     fn box_side_columns_report_width() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 40); // SR1103: three border side style columns appended after the nine; SR1104: three border side colour columns, 40
+        assert_eq!(crate::css::REPORT_COLS, 45); // SR1103: three border side style columns appended after the nine; SR1104: three border side colour columns, 40; SR1108: five text-decoration / caret columns, 45
         assert_eq!(crate::css::REPORT_PROPS[24], "text-decoration-color");
         assert_eq!(
             &crate::css::REPORT_PROPS[25..34], // SR1103: the nine stay at 25..34
             &["margin-right", "margin-bottom", "margin-left", "padding-right", "padding-bottom", "padding-left", "border-right-width", "border-bottom-width", "border-left-width"]
         );
         let mut e = box_side_engine();
-        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('d')).length)"), "40"); // SR1103
+        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('d')).length)"), "45"); // SR1103; SR1108: five text-decoration / caret columns, 45
         assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('d')).item(33)"), "border-left-width");
     }
 
@@ -11724,11 +11724,11 @@ b</div>
     #[test]
     fn border_side_style_columns_report_width() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 40); // SR1104: three border side colour columns, 40
+        assert_eq!(crate::css::REPORT_COLS, 45); // SR1104: three border side colour columns, 40; SR1108: five text-decoration / caret columns, 45
         assert_eq!(crate::css::REPORT_PROPS[15], "border-top-style");
         assert_eq!(&crate::css::REPORT_PROPS[34..37], &["border-right-style", "border-bottom-style", "border-left-style"]); // SR1104: the three colour columns follow at 37..40
         let mut e = border_side_style_engine();
-        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('dd')).length)"), "40");
+        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('dd')).length)"), "45"); // SR1108: five text-decoration / caret columns, 45
         assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('dd')).item(36)"), "border-left-style");
     }
 
@@ -11782,12 +11782,12 @@ b</div>
     #[test]
     fn border_side_color_columns_layout() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 40);
+        assert_eq!(crate::css::REPORT_COLS, 45); // SR1108: five text-decoration / caret columns, 45
         assert_eq!(crate::css::REPORT_PROPS[16], "border-left-color");
         assert_eq!(&crate::css::REPORT_PROPS[34..37], &["border-right-style", "border-bottom-style", "border-left-style"]);
-        assert_eq!(&crate::css::REPORT_PROPS[37..], &["border-top-color", "border-right-color", "border-bottom-color"]);
+        assert_eq!(&crate::css::REPORT_PROPS[37..40], &["border-top-color", "border-right-color", "border-bottom-color"]); // SR1108: five text-decoration / caret columns, 45
         let mut e = border_side_color_columns_engine();
-        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('nc')).length)"), "40");
+        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('nc')).length)"), "45"); // SR1108: five text-decoration / caret columns, 45
         assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('nc')).item(39)"), "border-bottom-color");
     }
 
@@ -11811,6 +11811,87 @@ b</div>
             ("nc", "borderLeftColor", "rgb(0, 0, 0)"),
         ] {
             assert_eq!(font_shorthand_cs(&mut e, id, prop), want, "{id} {prop}");
+        }
+    }
+
+    // ---- AETHERCSSOMTEXTDECORATIONCOLUMNS (LEDGER SR1108): report columns for text-decoration-style / -thickness, text-underline-offset / -position and caret-color (named tail block) ----
+
+    /// AETHERCSSOMTEXTDECORATIONCOLUMNS (SR1108): `#td` a wavy red 3px underline, offset 2px, under; `#uc` a span inside an
+    /// `under` div and `#ui` a span there with `text-underline-position: inherit`; `#ff` a from-font thickness; `#pd` a plain
+    /// div; `#cr` an input with caret-color red, `#ca` an auto-caret input in blue, `#ci` an input inside a green-caret div.
+    fn text_decoration_columns_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0">
+            <div id="td" style="text-decoration: underline wavy red; text-decoration-thickness: 3px; text-underline-offset: 2px; text-underline-position: under">a</div>
+            <div style="text-underline-position: under"><span id="uc">b</span><span id="ui" style="text-underline-position: inherit">c</span></div>
+            <div id="ff" style="text-decoration: underline; text-decoration-thickness: from-font">d</div>
+            <div id="pd">e</div>
+            <input id="cr" style="caret-color: red">
+            <input id="ca" style="color: blue">
+            <div style="caret-color: rgb(0, 128, 0)"><input id="ci"></div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        e
+    }
+
+    /// AETHERCSSOMTEXTDECORATIONCOLUMNS (SR1108): `getPropertyValue` on the computed declaration (text-underline-position has
+    /// no camel accessor: owed AETHER-CSSOM-TEXT-UNDERLINE-POSITION-ACCESSOR).
+    fn text_decoration_pv(e: &mut crate::AetherEngine, id: &str, prop: &str) -> String {
+        font_synth_eval(e, &format!("getComputedStyle(document.getElementById('{id}')).getPropertyValue('{prop}')"))
+    }
+
+    /// AETHERCSSOMTEXTDECORATIONCOLUMNS (SR1108): the five columns append after SR1104's three (no earlier index moves) and
+    /// the computed declaration enumerates all 45.
+    #[test]
+    fn text_decoration_columns_layout() {
+        assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
+        assert_eq!(crate::css::REPORT_COLS, 45);
+        assert_eq!(&crate::css::REPORT_PROPS[37..40], &["border-top-color", "border-right-color", "border-bottom-color"]);
+        assert_eq!(
+            &crate::css::REPORT_PROPS[40..],
+            &["text-decoration-style", "text-decoration-thickness", "text-underline-offset", "text-underline-position", "caret-color"]
+        );
+        let mut e = text_decoration_columns_engine();
+        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('pd')).length)"), "45");
+        assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('pd')).item(44)"), "caret-color");
+    }
+
+    /// AETHERCSSOMTEXTDECORATIONCOLUMNS (SR1108): style / thickness / offset read the element's own paint (before SR1108 they
+    /// had no column, so a wavy underline never read `wavy` from the paint); the position reads the inherited value (a child
+    /// and an explicit `inherit` read the parent's `under`); from-font is stored as auto and reads `auto` (owed
+    /// AETHER-CSS-TEXT-DECORATION-FROM-FONT); a plain div reads the initials.
+    #[test]
+    fn text_decoration_columns_read() {
+        let mut e = text_decoration_columns_engine();
+        for (id, prop, want) in [
+            ("td", "text-decoration-style", "wavy"),
+            ("td", "text-decoration-thickness", "3px"),
+            ("td", "text-underline-offset", "2px"),
+            ("td", "text-underline-position", "under"),
+            ("uc", "text-underline-position", "under"),
+            ("ui", "text-underline-position", "under"),
+            ("ff", "text-decoration-thickness", "auto"),
+            ("pd", "text-decoration-style", "solid"),
+            ("pd", "text-decoration-thickness", "auto"),
+            ("pd", "text-underline-offset", "auto"),
+            ("pd", "text-underline-position", "auto"),
+        ] {
+            assert_eq!(text_decoration_pv(&mut e, id, prop), want, "{id} {prop}");
+        }
+        assert_eq!(font_shorthand_cs(&mut e, "td", "textDecorationStyle"), "wavy", "the camel accessor reads the column");
+        assert_eq!(font_shorthand_cs(&mut e, "td", "textDecorationThickness"), "3px");
+        assert_eq!(font_shorthand_cs(&mut e, "td", "textUnderlineOffset"), "2px");
+    }
+
+    /// AETHERCSSOMTEXTDECORATIONCOLUMNS (SR1108): caret-color reads what `caret_ink` paints: a declared colour as rgb (no
+    /// alpha: owed AETHER-CSSOM-CARET-COLOR-ALPHA), auto the element's color, and the value inherits (`caret_inherit`).
+    #[test]
+    fn text_decoration_columns_caret() {
+        let mut e = text_decoration_columns_engine();
+        for (id, want) in [("cr", "rgb(255, 0, 0)"), ("ca", "rgb(0, 0, 255)"), ("ci", "rgb(0, 128, 0)"), ("pd", "rgb(0, 0, 0)")] {
+            assert_eq!(font_shorthand_cs(&mut e, id, "caretColor"), want, "{id} caretColor");
         }
     }
 }

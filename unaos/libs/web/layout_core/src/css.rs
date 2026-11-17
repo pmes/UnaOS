@@ -4819,6 +4819,17 @@ fn text_align_last_code<H: Host>(value: &str) -> Option<u8> {
     }
 }
 
+// ---- AETHERCSSOMTEXTDECORATIONCOLUMNS (LEDGER SR1108): the text-decoration-style and text-underline-position codes back to their keywords (named tail block) ----
+
+/// AETHERCSSOMTEXTDECORATIONCOLUMNS (SR1108): the inverse of [`deco_style_code`] (0 solid 1 double 2 dotted 3 dashed 4 wavy).
+pub fn text_decoration_style_word(code: u8) -> &'static str {
+    ["solid", "double", "dotted", "dashed", "wavy"].get(code as usize).copied().unwrap_or("solid")
+}
+
+/// AETHERCSSOMTEXTDECORATIONCOLUMNS (SR1108): the inverse of [`underline_position_code`] (0 auto 1 from-font 2 under).
+pub fn underline_position_word(code: u8) -> &'static str {
+    ["auto", "from-font", "under"].get(code as usize).copied().unwrap_or("auto")
+}
 
 // ---- AETHERCSSBORDERCOLORSTORED (LEDGER SR1058): a pending per-side border colour; border-color alone builds no frame (named tail block) ----
 
