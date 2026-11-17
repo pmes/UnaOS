@@ -84,6 +84,8 @@ pub struct Source {
     pub duration: i64,
     /// NLESIZEPOLICY (SR394): how a frame of another size than the reel's first fills it ([`SizePolicy::Letterbox`] by default).
     pub size_policy: SizePolicy,
+    /// STRIATITLECLIP (SR828): a generated title card's one line of text (`None`: a media reel); `edl` keeps it as `* UNA TITLE`.
+    pub title: Option<String>,
 }
 
 /// One event: source ticks `src_in..src_out` (exclusive end) shown from timeline tick `at`.
@@ -422,7 +424,7 @@ impl Timeline {
     /// Add a source (builder); its id is its index.
     pub fn add_source(&mut self, reel: &str, duration: i64) -> SourceId {
         let id = SourceId(self.sources.len() as u32);
-        self.sources.push(Source { id, reel: String::from(reel), duration, size_policy: SizePolicy::Letterbox });
+        self.sources.push(Source { id, reel: String::from(reel), duration, size_policy: SizePolicy::Letterbox, title: None });
         id
     }
     /// Add an empty track (builder); returns its index.
