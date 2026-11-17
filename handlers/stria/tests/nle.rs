@@ -3739,3 +3739,72 @@ fn striapasteinsert_face_refusals_name_the_error() {
     assert_eq!(face.last_error.take(), Some(format!("paste-over: {}", EditError::Kind)));
     assert_eq!(face.state.timeline, tl);
 }
+
+// ---- STRIAPASTEKEYS (LEDGER SR921): the clipboard chords through KEYS (named tail block) ----
+
+/// The eight chord rows: each name bound once, each action a VERBS word with a HELP phrase that is not the word, and the
+/// help row of each action lists its Ctrl and Meta chords.
+#[test]
+fn striapastekeys_rows_and_help() {
+    let chords = [("Ctrl+c", "Meta+c", "copy"), ("Ctrl+x", "Meta+x", "cut"), ("Ctrl+v", "Meta+v", "paste"), ("Ctrl+Shift+V", "Meta+Shift+V", "paste-insert")];
+    let rows = help_rows();
+    for (c, m, w) in chords {
+        assert!(KEYS.contains(&(c, w)) && KEYS.contains(&(m, w)), "{w}");
+        assert_eq!(KEYS.iter().filter(|(k, _)| *k == c || *k == m).count(), 2, "{w}: a chord bound twice");
+        assert!(VERBS.contains(&w), "{w}");
+        assert!(HELP.iter().any(|(a, p)| *a == w && *p != w), "{w}: a phrase, not the word");
+        let row = rows.iter().find(|r| r.1 == help_phrase(w)).expect("a help row");
+        assert!(row.0.split(" / ").any(|k| k == c) && row.0.split(" / ").any(|k| k == m), "{:?}", row.0);
+    }
+    println!("striapastekeys: help rows={} keys={}", rows.len(), KEYS.len());
+}
+
+/// What the surfaces send: `BrowserCopy` copies (no edit), `BrowserPaste` (its text ignored) pastes at the playhead as
+/// ONE undo step, `Ctrl+x` lifts, `Ctrl+Shift+V` pastes rippling the track (SR896's numbers).
+#[test]
+fn striapastekeys_surface_messages_reach_the_words() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    let (a, b) = (SourceId(0), SourceId(1));
+    face.state.select(0, 1).unwrap();
+    assert!(face.on(&bandy::SMessage::BrowserCopy));
+    assert_eq!((face.dirty(), face.state.clipboard.len()), (false, 1));
+    face.state.seek(35);
+    assert!(face.on(&bandy::SMessage::BrowserPaste("anything".into())));
+    assert_eq!(face.state.timeline.tracks[0].clips[3], Clip::new(b, 0, 10, 35));
+    assert_eq!((face.state.undo_depth(), face.last_error.clone()), (1, None));
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.timeline, tl);
+    face.state.select(0, 1).unwrap();
+    assert!(face.on(&bandy::SMessage::BrowserKey("Ctrl+x".into())));
+    assert_eq!(face.state.timeline, tl.lift(0, 1).unwrap());
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.timeline, tl);
+    face.state.select(0, 1).unwrap();
+    assert!(face.on(&bandy::SMessage::BrowserCopy));
+    face.state.seek(12);
+    assert!(face.on(&bandy::SMessage::BrowserKey("Ctrl+Shift+V".into())));
+    assert_eq!(face.state.timeline.tracks[0].clips, vec![Clip::new(a, 13, 23, 0), Clip::new(b, 0, 2, 10), Clip::new(b, 0, 10, 12), Clip::new(b, 2, 10, 22), Clip::new(a, 23, 33, 35)]);
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    println!("striapastekeys: copy / paste at 35, cut, paste-insert at 12 through the surface messages");
+}
+
+/// While the help shows, `BrowserCopy` / `BrowserPaste` only dismiss it (nothing copied, nothing pasted); with an empty
+/// clipboard `BrowserPaste` lands `paste: <NoClip>` on the message line and the timeline stays.
+#[test]
+fn striapastekeys_help_dismiss_and_refusal() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    face.state.select(0, 1).unwrap();
+    assert!(face.verb("help") && face.help_shown());
+    assert!(face.on(&bandy::SMessage::BrowserCopy));
+    assert!(!face.help_shown());
+    assert!(face.state.clipboard.is_empty(), "the dismiss is not applied");
+    assert!(face.verb("help"));
+    assert!(face.on(&bandy::SMessage::BrowserPaste(String::new())));
+    assert!(!face.help_shown());
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.on(&bandy::SMessage::BrowserPaste(String::new())));
+    assert_eq!(face.last_error.take(), Some(format!("paste: {}", EditError::NoClip)));
+    assert_eq!(face.state.timeline, tl);
+}
