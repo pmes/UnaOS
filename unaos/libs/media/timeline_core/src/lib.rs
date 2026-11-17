@@ -899,7 +899,7 @@ impl Timeline {
     /// colour: Stria's `Sources::open_report(id).colour`, the kernel's EDL reel's opened `Track::colour`.
     pub fn reels_colour(&self, colour: impl Fn(SourceId) -> Option<demux_core::colour::Colour>) -> (u8, u8) {
         let mut pair = None;
-        for c in self.tracks.iter().filter(|t| t.kind == Kind::Video).flat_map(|t| t.clips.iter()) {
+        for c in self.tracks.iter().filter(|t| t.kind == Kind::Video).flat_map(|t| t.clips.iter()).filter(|c| self.source(c.src).map_or(true, |s| s.title.is_none())) { // STRIAKTITLESTYLE (LEDGER SR9100): a generated title states no colour and contributes none
             let Some(p) = colour(c.src).map(|k| (k.primaries, k.transfer)) else { return (2, 2) };
             if *pair.get_or_insert(p) != p {
                 return (2, 2);
