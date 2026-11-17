@@ -1787,3 +1787,153 @@ fn conceal_main10_grey_fill_is_512() {
     assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![1]);
     assert_frame16(&f[0], &Img::new(|_, _| 512, |_, _| 512, |_, _| 512), "P from the 10-bit grey generated reference");
 }
+
+// ---- HEVCCONCEALMAIN10HIGHPRECISION (LEDGER SR1035): the concealment's weighted roads under high_precision_offsets_enabled_flag at 10 bits (named tail block) ----
+
+/// SR1035: sps_range_extension() carrying only high_precision_offsets_enabled_flag (the kit's `SpsCfg.range_ext` in syntax
+/// order: index 6, ps.rs reads it as such).
+const HIGH_PRECISION: [bool; 9] = [false, false, false, false, false, false, true, false, false];
+
+/// SR1035: [`headers10`] with the SPS range extension written when `high` (high_precision_offsets_enabled_flag 1);
+/// `headers10_hp(pi, false)` is [`headers10`]'s bytes (asserted in `conceal_main10_high_precision_offset_unshifted`).
+fn headers10_hp(pi: &PpsInter, high: bool) -> Vec<u8> {
+    let mut s = vps(false);
+    s.extend(nal(33, &sps_rbsp_ext(&SpsCfg { bit_depth: 10, pcm: Some((10, 10, 3, 4, true)), range_ext: high.then_some(HIGH_PRECISION), ..sps_cfg() }, &inter_sps(false))));
+    s.extend(nal(34, &pps_rbsp_ext(&PpsCfg { init_qp: 26, deblocking_disabled: true, ..Default::default() }, pi)));
+    s
+}
+
+/// SR1035: [`conceal_main10_weighted_offset_scales_by_bd`] with the flag off and on. luma_offset 10 under unit weight
+/// (64, denom 6): WpOffsetBdShiftY is BitDepthY - 8 = 2 without the flag (+ 40, SR1027's numbers: the armed contrast) and
+/// 0 with it (inter.rs `explicit_weight_of` `off_shift`), so with the flag P2 is the moved gradient + 10 and the concealed
+/// POC 3 (P4, its copy) is P2 advanced by (4, 2) + 10, clipped at 1023 (a fetch sample sits in 1014..1022: the clamp is
+/// armed), equal to P5 (the decoder's own weighted MC of P2 at (16, 8), which reads the same flag at ctu.rs `predict_pu`).
+#[test]
+fn conceal_main10_high_precision_offset_unshifted() {
+    let pi = PpsInter { weighted_pred: true, ..Default::default() };
+    assert_eq!(headers10_hp(&pi, false), headers10(&pi), "the flag-off head is SR1027's head byte for byte");
+    let i0 = gradient10();
+    let off = |r: &Img, o: u32| Img { y: r.y.iter().map(|&v| (v as u32 + o).min(1023) as u16).collect(), cb: r.cb.clone(), cr: r.cr.clone() };
+    let mut p4s = Vec::new();
+    for high in [false, true] {
+        let lift = Some((6, vec![Some((0, 10))]));
+        let mut s = headers10_hp(&pi, high);
+        s.extend(idr10(&i0));
+        s.extend(picture(&SliceCfg { weights: lift.clone(), ..p_slice(2, vec![(-2, true)]) }, |e| amvp_then_merge(e, [32, 16])));
+        s.extend(picture(&SliceCfg { weights: Some((6, vec![None])), ..p_slice(4, vec![(-1, true), (-2, false)]) }, skip_picture));
+        s.extend(picture(&SliceCfg { weights: lift, ..p_slice(5, vec![(-3, true)]) }, |e| amvp_then_merge(e, [16, 8])));
+        let mut d = Decoder::new();
+        d.decode_annexb(&s).expect("decode past the lost picture");
+        d.flush();
+        assert_eq!(d.take_generated_refs(), vec![3], "high {high}");
+        assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 0, forward_blocks: 16 }], "high {high}");
+        let f = d.take_frames();
+        assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 2, 4, 5], "high {high}");
+        let o = if high { 10 } else { 40 };
+        assert_frame16(by_poc(&f, 2), &off(&shifted(&i0, 8, 4), o), &format!("high {high}: P2, the gradient moved by (8, 4) + {o}"));
+        let fetch = shifted(&img16_of(by_poc(&f, 2)), 4, 2);
+        assert!(fetch.y.iter().any(|&v| v < 1023 && v as u32 + o > 1023), "high {high}: the fixture reaches the clamp at (1 << 10) - 1");
+        assert_frame16(by_poc(&f, 4), &img16_of(by_poc(&f, 5)), &format!("high {high}: P from the concealed picture equals the decoder's own weighted MC of P2 at (16, 8)"));
+        assert_frame16(by_poc(&f, 4), &off(&fetch, o), &format!("high {high}: P from the concealed picture adds {o} and clips at 1023"));
+        p4s.push(img16_of(by_poc(&f, 4)).y);
+    }
+    assert_ne!(p4s[0], p4s[1], "the flag changes the concealed picture: + 10, not + 40");
+}
+
+/// SR1035: the chroma offset of 7-56 under the flag at 10 bits. P2 and P5 carry unit luma (no luma entry) and chroma
+/// weights with ChromaLog2WeightDenom 6: Cb ChromaWeight 32 (delta -32), delta_chroma_offset 600; Cr ChromaWeight 64,
+/// delta_chroma_offset -300. With the flag WpOffsetHalfRangeC is 512 and the shift 0: Cb Clip3(-512, 511, 512 + 600 - 256)
+/// = +511 (the upper edge), Cr -300 (outside the flag-off range); without it the half range is 128 and the shift 2: Cb
+/// 127 << 2 = 508, Cr -128 << 2 = -512 (the lower edge -half << shift is -512 at both flag values, so it carries no
+/// contrast). Whole-sample vectors at log2WD 6 + 4 = 10 read Cb ((v + 1) >> 1) + o, Cr v + o, clipped to 0..1023. The
+/// concealed POC 3 (P4, its copy) equals P5 (the decoder's own MC) and the hand equation on P2 advanced by (4, 2).
+#[test]
+fn conceal_main10_high_precision_chroma_half_range() {
+    let i0 = gradient10();
+    let pi = PpsInter { weighted_pred: true, ..Default::default() };
+    let chroma = Some((0, vec![Some([(-32, 600), (0, -300)])]));
+    let mut p4s = Vec::new();
+    for high in [false, true] {
+        let (ocb, ocr) = if high { (511, -300) } else { (508, -512) };
+        let weighted = |r: &Img| Img {
+            y: r.y.clone(),
+            cb: r.cb.iter().map(|&v| (((v as i32 + 1) >> 1) + ocb).clamp(0, 1023) as u16).collect(),
+            cr: r.cr.iter().map(|&v| (v as i32 + ocr).clamp(0, 1023) as u16).collect(),
+        };
+        let mut s = headers10_hp(&pi, high);
+        s.extend(idr10(&i0));
+        s.extend(picture(&SliceCfg { weights: Some((6, vec![None])), chroma_weights: chroma.clone(), ..p_slice(2, vec![(-2, true)]) }, |e| amvp_then_merge(e, [32, 16])));
+        s.extend(picture(&SliceCfg { weights: Some((6, vec![None])), ..p_slice(4, vec![(-1, true), (-2, false)]) }, skip_picture));
+        s.extend(picture(&SliceCfg { weights: Some((6, vec![None])), chroma_weights: chroma.clone(), ..p_slice(5, vec![(-3, true)]) }, |e| amvp_then_merge(e, [16, 8])));
+        let mut d = Decoder::new();
+        d.decode_annexb(&s).expect("decode past the lost picture");
+        d.flush();
+        assert_eq!(d.take_generated_refs(), vec![3], "high {high}");
+        assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 0, forward_blocks: 16 }], "high {high}");
+        let f = d.take_frames();
+        assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 2, 4, 5], "high {high}");
+        assert_frame16(by_poc(&f, 2), &weighted(&shifted(&i0, 8, 4)), &format!("high {high}: P2, Cb (32, {ocb}), Cr (64, {ocr})"));
+        let p2 = img16_of(by_poc(&f, 2));
+        assert_frame16(by_poc(&f, 4), &img16_of(by_poc(&f, 5)), &format!("high {high}: P from the concealed picture equals the decoder's own weighted MC on every plane"));
+        assert_frame16(by_poc(&f, 4), &weighted(&shifted(&p2, 4, 2)), &format!("high {high}: P from the concealed picture follows 7-56 / 8.5.3.3.4.3"));
+        p4s.push(img16_of(by_poc(&f, 4)));
+    }
+    assert_ne!(p4s[0].cb, p4s[1].cb, "Cb: + 511 with the flag, not + 508");
+    assert_ne!(p4s[0].cr, p4s[1].cr, "Cr: - 300 with the flag, not - 512");
+}
+
+/// SR1035: [`conceal_weighted_bi_mixed_lists_use_one_log2wd`] (SR768's stream: B2's mixed table, P6 skip, B7) at 10 bits
+/// with the flag off and on. 8.5.3.3.4.3 bi with p = s << 4 and log2WD 6 + 4 = 10: L0 (48, 5), L1 (16, -3) give
+/// (768a + 256b + ((o0 + o1 + 1) << 10)) >> 11, which is (3a + b + 12) >> 3 with the flag (offsets unshifted) and
+/// (3a + b + 36) >> 3 without it (offsets 20 / -12); chroma (default weights, offset 0 at both) (a + b + 1) >> 1. P6 (the
+/// concealed POC 3's copy) is B7 (the decoder's own weighted bi MC of B2) and the equation on B2's two projections.
+#[test]
+fn conceal_main10_high_precision_bidir() {
+    let i0 = gradient10();
+    let (w0, w1) = bi_mixed_weights();
+    let pi = PpsInter { weighted_bipred: true, ..Default::default() };
+    let mut p6s = Vec::new();
+    for high in [false, true] {
+        let r = if high { 12 } else { 36 };
+        let blend = |p: &Img, q: &Img| {
+            let luma = p.y.iter().zip(q.y.iter()).map(|(&a, &b)| ((3 * a as u32 + b as u32 + r) >> 3) as u16).collect();
+            let avg = |a: &[u16], b: &[u16]| a.iter().zip(b.iter()).map(|(&x, &y)| ((x as u32 + y as u32 + 1) >> 1) as u16).collect::<Vec<u16>>();
+            Img { y: luma, cb: avg(&p.cb, &q.cb), cr: avg(&p.cr, &q.cr) }
+        };
+        let mut s = headers10_hp(&pi, high);
+        s.extend(idr10(&i0));
+        s.extend(picture(&p_slice(4, vec![(-4, true)]), skip_picture));
+        let b2 = SliceCfg {
+            nal_type: 1,
+            slice_type: 0,
+            poc_lsb: 2,
+            neg: vec![(-2, true)],
+            pos: vec![(2, true)],
+            num_ref: Some((2, 2)),
+            weights: w0.clone(),
+            weights_l1: w1.clone(),
+            five_minus_max_num_merge_cand: 4,
+            deblocking_disabled: true,
+            ..Default::default()
+        };
+        s.extend(picture(&b2, |e| bi_body(e, 2, [32, 16], [-64, 0])));
+        s.extend(picture(&p_slice(6, vec![(-3, true), (-4, false)]), skip_picture));
+        let b7 = SliceCfg { poc_lsb: 7, neg: vec![(-5, true)], pos: vec![], num_ref: Some((1, 1)), weights: Some((6, vec![Some((-16, 5))])), weights_l1: Some(vec![Some((-48, -3))]), ..b2.clone() };
+        s.extend(picture(&b7, |e| bi_body(e, 1, [16, 8], [32, 0])));
+        let mut d = Decoder::new();
+        d.decode_annexb(&s).expect("decode past the lost picture");
+        d.flush();
+        assert_eq!(d.take_generated_refs(), vec![3], "high {high}");
+        assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 16, forward_blocks: 16 }], "high {high}");
+        let f = d.take_frames();
+        assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 4, 2, 6, 7], "high {high}: output in decoding order");
+        assert_frame16(by_poc(&f, 2), &blend(&shifted(&i0, 8, 4), &shifted(&i0, -16, 0)), &format!("high {high}: B2, L0 (48, 5), L1 (16, -3)"));
+        let src = img16_of(by_poc(&f, 2));
+        let (p, q) = (shifted(&src, 4, 2), shifted(&src, 8, 0));
+        assert_ne!(p.y, q.y, "the fixture's two projections must differ");
+        assert_frame16(by_poc(&f, 6), &img16_of(by_poc(&f, 7)), &format!("high {high}: P from the concealed picture equals the decoder's own weighted bi MC of B2"));
+        assert_frame16(by_poc(&f, 6), &blend(&p, &q), &format!("high {high}: P from the concealed picture follows 8.5.3.3.4.3 with each list's weights"));
+        p6s.push(img16_of(by_poc(&f, 6)).y);
+    }
+    assert_ne!(p6s[0], p6s[1], "the flag changes the weighted bi concealment: + 12 rounding, not + 36");
+}
