@@ -122,7 +122,7 @@ fn font_wide(kw: &str) -> SpecifiedStyle<TH> {
 
 /// AETHERFONTSHORTHANDINHERIT (SR810): the fields `font` resets, for a field-by-field comparison.
 #[allow(clippy::type_complexity)]
-fn font_fields(s: &SpecifiedStyle<TH>) -> (Option<bool>, Option<FontWeight>, Option<u16>, Option<bool>, Option<f32>, Option<f32>, Option<(u8, f32)>, Option<u16>) {
+fn font_fields(s: &SpecifiedStyle<TH>) -> (Option<bool>, Option<FontWeight>, Option<u16>, Option<layout_core::paint::Caps>, Option<f32>, Option<f32>, Option<(u8, f32)>, Option<u16>) {
     let p = &s.paint;
     (p.italic, p.weight, p.stretch, p.small_caps, p.line_height, p.font_size, p.font_size_rel, p.family)
 }
