@@ -1018,7 +1018,7 @@ fn inherit_element(inherited: &mut Inherited, tag: &str, spec: &crate::layout::P
     if let Some(ws) = spec.word_spacing {
         inherited.word_spacing = ws;
     }
-    inherited.rtl = spec.rtl.unwrap_or_else(|| layout_core::paint::or_tag(Some(spec), layout_core::paint::INHERIT_DIRECTION, inherited.rtl, |r| crate::layout::default_rtl(dom_node, r))); inherited.bidi_ovr = bidi_override_of(inherited.bidi_ovr, inherited.rtl, unicode_bidi_of(tag, spec, dom_node));
+    inherited.rtl = spec.rtl.unwrap_or_else(|| layout_core::paint::or_tag(Some(spec), layout_core::paint::INHERIT_DIRECTION, inherited.rtl, |r| crate::layout::default_rtl(dom_node, r))); inherited.bidi_ovr = bidi_override_of(inherited.bidi_ovr, inherited.rtl, unicode_bidi_of(tag, spec, dom_node)); inherited.rtl = layout_core::plaintext_rtl(dom_node, unicode_bidi_of(tag, spec, dom_node), inherited.rtl);
     inherited.family = spec
         .family
         .unwrap_or_else(|| layout_core::paint::or_tag(Some(spec), layout_core::paint::INHERIT_FAMILY, inherited.family, |f| crate::layout::default_family(tag, f)));
@@ -4645,20 +4645,10 @@ fn deco_ink(inherited: &mut Inherited, tag: &str, spec: &crate::layout::PaintSty
 /// its own declared value, else Blink's UA defaults: html.css `bdo { unicode-bidi: isolate-override }` (4), `bdi, output
 /// { unicode-bidi: isolate }` (2), and the `dir` presentation attribute on any other element (HTMLElement::
 /// CollectStyleForPresentationAttribute: isolate, `dir=auto` on pre / textarea plaintext 5); else normal (0). Not
-/// inherited. ONE fn for the painter (`inherit_element`) and `css::computed_report`.
+/// inherited. ONE fn for the painter (`inherit_element`) and `css::computed_report`. AETHERBIDIPLAINTEXT (SR1160): the road
+/// moved to `layout_core::unicode_bidi_tag` so layout pass 1 reads it too.
 pub(crate) fn unicode_bidi_of(tag: &str, spec: &crate::layout::PaintStyle, dom_node: &crate::dom::NodeRef) -> u8 {
-    if let Some(u) = spec.unicode_bidi {
-        return u;
-    }
-    match tag {
-        "bdo" => 4,
-        "bdi" | "output" => 2,
-        _ => match layout_core::DomNode::attr(dom_node, "dir").map(|d| d.trim().to_ascii_lowercase()) {
-            Some(d) if d == "auto" && matches!(tag, "pre" | "textarea") => 5,
-            Some(_) => 2,
-            None => 0,
-        },
-    }
+    layout_core::unicode_bidi_tag(tag, spec.unicode_bidi, dom_node)
 }
 
 /// AETHERCSSOMUNICODEBIDI (SR1008): the override in effect inside an element (0 none, 1 LRO, 2 RLO; the shaper's

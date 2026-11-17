@@ -1892,7 +1892,7 @@ fn prepass<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F) -> P
                 if let Some(st) = paint.and_then(|p| p.stretch) {
                     size.stretch = st;
                 }
-                size.mode.rtl = paint.and_then(|p| p.rtl).unwrap_or_else(|| crate::paint::or_tag(paint, crate::paint::INHERIT_DIRECTION, inherited.mode.rtl, |r| default_rtl(dom_node, r)));
+                size.mode.rtl = paint.and_then(|p| p.rtl).unwrap_or_else(|| crate::paint::or_tag(paint, crate::paint::INHERIT_DIRECTION, inherited.mode.rtl, |r| default_rtl(dom_node, r))); size.mode.rtl = plaintext_rtl(dom_node, unicode_bidi_tag(tag, paint.and_then(|p| p.unicode_bidi), dom_node), size.mode.rtl);
                 if let Some(tt) = paint.and_then(|p| p.text_transform) {
                     size.text_transform = tt;
                 }
@@ -4046,4 +4046,67 @@ pub fn font_units<F: Fonts + ?Sized>(fonts: &F, sel: FontSel, fs: f32, root_fs: 
     let ex = fonts.x_height(sel, fs);
     let ch = fonts.measure("0", &Adv::new(sel, fs, 0.0));
     (fs, root_fs, if ex > 0.0 { ex } else { fs * 0.5 }, ch)
+}
+
+// ---- AETHERBIDIPLAINTEXT (LEDGER SR1160): unicode-bidi: plaintext takes its paragraph direction from the first strong character (named tail block) ----
+
+/// AETHERBIDIPLAINTEXT (SR1160): the `unicode-bidi` code an element takes (`css::unicode_bidi_code`'s codes): its own
+/// declared value `own`, else Blink's UA defaults: html.css `bdo { unicode-bidi: isolate-override }` (4), `bdi, output
+/// { unicode-bidi: isolate }` (2), and the `dir` presentation attribute on any other element (HTMLElement::
+/// CollectStyleForPresentationAttribute: isolate, `dir=auto` on pre / textarea plaintext 5); else normal (0). Not
+/// inherited. Moved from render's `unicode_bidi_of` (SR1008) so pass 1 and the painter read ONE road.
+pub fn unicode_bidi_tag<N: DomNode>(tag: &str, own: Option<u8>, node: &N) -> u8 {
+    if let Some(u) = own {
+        return u;
+    }
+    match tag {
+        "bdo" => 4,
+        "bdi" | "output" => 2,
+        _ => match node.attr("dir").map(|d| d.trim().to_ascii_lowercase()) {
+            Some(d) if d == "auto" && matches!(tag, "pre" | "textarea") => 5,
+            Some(_) => 2,
+            None => 0,
+        },
+    }
+}
+
+/// AETHERBIDIPLAINTEXT (SR1160): the paragraph direction inside an element whose `unicode-bidi` code is `ub`, given its
+/// direction `rtl` (css-writing-modes-3 §2.2, UAX #9 P2-P3): under plaintext (5) the first strong character of its
+/// content ([`first_strong_rtl`]), else `rtl`; every other code returns `rtl` without scanning. Read where the direction
+/// is decided: pass 1's `mode.rtl` (the inline formatter's `align_code` and the measurer) and render's `inherited.rtl`
+/// (the painter's shaper), so measure and paint agree. The computed `direction` is not changed. Per BLOCK: the first
+/// strong character of the whole content decides every line (AETHER-BIDI-PLAINTEXT-PER-LINE owed).
+pub fn plaintext_rtl<N: DomNode>(node: &N, ub: u8, rtl: bool) -> bool {
+    if ub != 5 {
+        return rtl;
+    }
+    first_strong_rtl(node).unwrap_or(rtl)
+}
+
+/// AETHERBIDIPLAINTEXT (SR1160): UAX #9 P2 over the DOM: the first character of Bidi_Class L (Some(false)) or R / AL
+/// (Some(true)) among `node`'s text descendants in tree order, stopping there; None when there is none. Descendants the
+/// UA tag road makes isolates (bdi, output, bdo, any `dir=`: [`unicode_bidi_tag`] 2 / 4 / 5 with no author value) are
+/// skipped as P2 skips isolate content, and so are script / style. Bidi_Class is font_core's UCD table.
+pub fn first_strong_rtl<N: DomNode>(node: &N) -> Option<bool> {
+    use font_core::bidi::BidiClass;
+    for c in node.children() {
+        if c.is_text() {
+            for ch in c.text().chars() {
+                match font_core::bidi::bidi_class(ch) {
+                    BidiClass::L => return Some(false),
+                    BidiClass::R | BidiClass::AL => return Some(true),
+                    _ => {}
+                }
+            }
+        } else if c.is_element() {
+            let tag = c.tag().unwrap_or_default().to_ascii_lowercase();
+            if matches!(tag.as_str(), "script" | "style") || matches!(unicode_bidi_tag(&tag, None, &c), 2 | 4 | 5) {
+                continue;
+            }
+            if let Some(r) = first_strong_rtl(&c) {
+                return Some(r);
+            }
+        }
+    }
+    None
 }
