@@ -565,6 +565,7 @@ fn transport() -> TetraNode {
         button("xfade-curve", "Curve"), button("proxy-off", "Proxy Off"), button("proxy-all", "Proxy All"), // STRIAPROXYBUTTONS (SR930): detach the selected clip's source's proxy / build or reuse one for every reel with a path
         button("export-list", "Export Queue"), // STRIAEXPORTQUEUELIST (SR932): the waiting export requests on the message row
         button("scale-", "Scale -"), button("scale+", "Scale +"), // STRIAXFORMPRESETS (SR938): the selected clip's placement scale stepped about its centre
+        button("preset", "Preset"), // STRIAEXPORTPRESETSMORE (SR948): steps the export preset a bare `export` takes (THE `preset` word)
         button("help", "?"), // STRIAUNDOHISTORY (SR876): the undo history on the message line; NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`); STRIAAUDIOCROSSFADE (SR860): Xfade puts / takes the selected audio clip's head crossfade; STRIAXFADECURVEBUTTON (SR925): Curve swaps its curve linear / equal
     ])
 }
@@ -2440,5 +2441,36 @@ mod strianudgemore_tests {
         }
         assert_eq!(face.state.selected().map(|c| c.at), Some(33));
         println!("stria-view strianudgemore witness: nudge+ / nudge+10 / nudge:-3 -> at 33, three commits");
+    }
+}
+
+// ---- STRIAEXPORTPRESETSMORE (LEDGER SR948): the `Preset` transport button picks the face's export preset (named tail block) ----
+
+#[cfg(test)]
+mod striaexportpresetsmore_tests {
+    use super::*;
+
+    /// The button just before `?` is `preset` labelled `Preset`, firing the face's `preset` word; driving it (the `--do`
+    /// road the click takes) steps THE table in order and back to none, each step a note on the message line, no error.
+    #[test]
+    fn striaexportpresetsmore_button_picks_the_preset() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let Some(TetraNode::Button { id, label, action }) = row.iter().rev().nth(1) else { panic!("no button before help") };
+        assert_eq!((id.as_str(), label.as_str()), ("preset", "Preset"));
+        let SMessage::Input { target, text } = action else { panic!("not an Input") };
+        assert_eq!((target.as_str(), text.as_str()), (SURFACE, "preset"));
+        let (tl, src) = nle_face::synth_fixture();
+        let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert_eq!(f.export_preset(), None);
+        for want in ["web", "archive", "proxy"] {
+            let errors = drive(&mut f, text);
+            assert!(errors.is_empty(), "{errors:?}");
+            assert_eq!(f.export_preset().map(|p| p.name), Some(want));
+            assert!(f.message_text().is_some_and(|m| m.starts_with(&format!("preset {want}: "))), "{:?}", f.message_text());
+        }
+        let errors = drive(&mut f, text);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!((f.export_preset(), f.message_text().as_deref()), (None, Some("preset none: export's own words")));
+        println!("striaexportpresetsmore witness: button {id} {label:?} steps web, archive, proxy, none");
     }
 }

@@ -9911,3 +9911,80 @@ fn strianudgemore_free_count_reads_the_at() {
     assert_eq!(f.state.timeline, tl1);
     println!("strianudgemore: nudge 5 25 -> 30 in one commit, nudge -1000 refused by name");
 }
+
+// ---- STRIAEXPORTPRESETSMORE (LEDGER SR948): the face's picked export preset, the `preset` word and its bare export (named tail block) ----
+
+#[test]
+fn striaexportpresetsmore_word_steps_the_table_as_a_note() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    assert!(VERBS.contains(&"preset"));
+    assert_eq!(VERBS.last(), Some(&"help"));
+    assert_eq!(face.export_preset(), None);
+    for want in ["web: h264 + aac crf=23 aq=10 scenecut=40", "archive: png + wav", "proxy: h264 + aac:64 crf=32"] {
+        assert!(face.verb("preset"));
+        assert_eq!(face.last_error, None, "a pick is a note, not an error");
+        assert_eq!(face.message_text(), Some(format!("preset {want}")));
+        assert_eq!(face.export_preset().map(|p| p.words()), Some(want.to_string()));
+    }
+    assert!(face.verb("preset"));
+    assert_eq!((face.export_preset(), face.message_text()), (None, Some("preset none: export's own words".to_string())));
+    assert!(face.verb("preset archive"));
+    assert_eq!(face.export_preset().map(|p| p.name), Some("archive"));
+    assert!(face.verb("preset none"));
+    assert_eq!(face.export_preset(), None);
+    assert_eq!(face.state.timeline, tl, "a view-only word leaves the document");
+    assert!(!face.dirty());
+    // The next taken input clears the note.
+    assert!(face.verb("preset web"));
+    face.on(&bandy::SMessage::BrowserMouseMove(1.0, 1.0, 0));
+    assert_eq!(face.message_text().filter(|m| m.starts_with("preset ")), None);
+    println!("striaexportpresetsmore: preset steps web, archive, proxy, none");
+}
+
+#[test]
+fn striaexportpresetsmore_unknown_name_refused_pick_kept() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(face.verb("preset proxy"));
+    assert!(face.verb("preset gif"));
+    assert_eq!(face.last_error.take(), Some("preset: unknown preset gif (web|archive|proxy)".to_string()));
+    assert!(face.verb("preset web archive"));
+    assert_eq!(face.last_error.take(), Some("preset: usage: preset [none|web|archive|proxy]".to_string()));
+    assert_eq!(face.export_preset().map(|p| p.name), Some("proxy"), "a refusal keeps the pick");
+}
+
+#[test]
+fn striaexportpresetsmore_bare_export_takes_the_pick() {
+    let (picked, named) = (nlefaceexport_dir("picked-proxy"), nlefaceexport_dir("picked-proxy-named"));
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(face.verb("preset proxy"));
+    assert!(face.verb(&format!("export {}", picked.display())));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.wait_export());
+    let line = face.last_error.take().expect("the result line");
+    assert!(line.starts_with("export: 35 frames, ") && line.contains(" h264 + aac:64 in "), "{line}");
+    assert!(face.verb(&format!("export {} --preset proxy", named.display())));
+    assert!(face.wait_export());
+    assert!(face.last_error.take().is_some_and(|l| l.contains(" h264 + aac:64 in ")));
+    assert_eq!(std::fs::read(picked.join("movie.mp4")).unwrap(), std::fs::read(named.join("movie.mp4")).unwrap(), "the pick is SR871's --preset, byte-exact");
+    println!("striaexportpresetsmore: picked proxy {line}");
+}
+
+#[test]
+fn striaexportpresetsmore_explicit_words_win() {
+    let (over, words) = (nlefaceexport_dir("picked-over"), nlefaceexport_dir("picked-over-words"));
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(face.verb("preset web"));
+    assert!(face.verb(&format!("export {} png wav", over.display())));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.wait_export());
+    let line = face.last_error.take().expect("the result line");
+    assert!(line.contains(" png + wav in "), "explicit words beat the pick: {line}");
+    assert!(face.verb(&format!("export {} --preset archive", words.display())));
+    assert!(face.wait_export());
+    assert!(face.last_error.take().is_some_and(|l| l.contains(" png + wav in ")), "an explicit --preset beats the pick");
+    assert_eq!(face.export_preset().map(|p| p.name), Some("web"), "an export leaves the pick");
+}
