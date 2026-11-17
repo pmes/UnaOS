@@ -131,8 +131,8 @@ pub struct Picture {
     pub chroma: ChromaFormat,
     /// HEVCREXT (SR334): BitDepthC (to_frame narrows the chroma planes by it; the hash SEI reads it).
     pub bit_depth_c: u32,
-    /// HEVCCONCEALWEIGHTED (SR741): the first independent segment's pred_weight_table and high_precision_offsets_enabled_flag (dpb.rs `keep_weights`), read when this picture is a concealment source.
-    pub weights: Option<(crate::slice::PredWeights, bool)>,
+    /// HEVCCONCEALWEIGHTED (SR741): each independent segment's pred_weight_table (None when it carries none) and high_precision_offsets_enabled_flag, one entry per `slices` entry (dpb.rs `keep_weights`; HEVCCONCEALWEIGHTEDSLICES SR1067), read per block by [`Picture::slice_weights`] when this picture is a concealment source.
+    pub weights: Vec<Option<(crate::slice::PredWeights, bool)>>,
 }
 
 impl Picture {
@@ -170,7 +170,7 @@ impl Picture {
             bit_depth: 8,
             chroma,
             bit_depth_c: 8,
-            weights: None,
+            weights: Vec::new(),
         }
     }
 
@@ -263,5 +263,23 @@ impl Picture {
     /// block copy included) writes `motion` with predFlagL0 / L1 set; intra, pcm and palette coding units keep `pred` 0.
     pub fn is_intra_at(&self, x: usize, y: usize) -> bool {
         self.motion[self.idx4(x, y)].pred == 0
+    }
+}
+
+// ---- HEVCCONCEALWEIGHTEDSLICES (LEDGER SR1067): the kept pred_weight_table of the slice that coded a block (named tail block) ----
+impl Picture {
+    /// HEVCCONCEALWEIGHTEDSLICES (SR1067): the kept table (`weights`, one entry per `slices` entry) of the slice whose CTB holds
+    /// luma sample (x, y), through the CTB slice map `ctb_slice` (no Geometry: the CTB side in 4x4 units is the k in {4, 8, 16}
+    /// with (w4 / k) x (h4 / k) == ctb_slice.len(), since w4 / h4 cover whole CTBs (ps.rs `Geometry`); w4 h4 / k^2 strictly
+    /// decreases in k, so a match is unique). None, never a panic, when no k matches, the CTB is undecoded (a generated
+    /// picture), or its slice carried no pred_weight_table. HEVC-PICTURE-LOG2CTB owed.
+    pub fn slice_weights(&self, x: usize, y: usize) -> Option<&(crate::slice::PredWeights, bool)> {
+        let n = self.ctb_slice.len();
+        let k = [4usize, 8, 16].into_iter().find(|&k| self.w4 % k == 0 && self.h4 % k == 0 && (self.w4 / k) * (self.h4 / k) == n)?;
+        let s = *self.ctb_slice.get((y >> 2) / k * (self.w4 / k) + (x >> 2) / k)?;
+        if s == NO_SLICE {
+            return None;
+        }
+        self.weights.get(s as usize)?.as_ref()
     }
 }
