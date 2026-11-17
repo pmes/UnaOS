@@ -2523,3 +2523,59 @@ fn strianudgemore_nudge_words_is_the_one_parser() {
     }
     println!("strianudgemore: nudge_words takes `nudge <d>` only");
 }
+
+// ---- STRIAOPACITYMORE (LEDGER SR958): each clip of a set from its own opacity; the label names its percent (named tail block) ----
+
+/// A set at 50 % / 100 %: `opacity-` steps each from its own value (40 / 90) as ONE undo step; `opacity+` twice reads
+/// 60 / 100 then 70 / 100 (the opaque one clamps); undo restores; a set all opaque commits nothing on `opacity+`.
+#[test]
+fn striaopacitymore_mixed_set_steps_each_from_its_own() {
+    use timeline_core::editor::EditorState;
+    let (tl, _, _) = base();
+    let tl = tl.set_opacity(&[(0, 0)], 50).unwrap();
+    let mut st = EditorState::new(tl.clone());
+    st.select_all();
+    let both = |st: &EditorState| (st.timeline.tracks[0].clips[0].opacity, st.timeline.tracks[0].clips[1].opacity);
+    assert_eq!(st.verb("opacity-"), Some(Ok(())));
+    assert_eq!((both(&st), st.undo_depth()), ((40, 90), 1));
+    assert_eq!(st.verb("opacity+"), Some(Ok(())));
+    assert_eq!((both(&st), st.undo_depth()), ((50, 100), 2));
+    assert_eq!(st.verb("opacity+"), Some(Ok(())));
+    assert_eq!((both(&st), st.undo_depth()), ((60, 100), 3));
+    assert_eq!(st.verb("opacity+"), Some(Ok(())));
+    assert_eq!(both(&st), (70, 100));
+    assert!(st.undo());
+    assert_eq!(both(&st), (60, 100));
+    let mut op = EditorState::new(tl.set_opacity(&[(0, 0)], timeline_core::OPAQUE).unwrap());
+    op.select_all();
+    assert_eq!(op.verb("opacity+"), Some(Ok(())));
+    assert_eq!((both(&op), op.undo_depth()), ((100, 100), 0), "all opaque: nothing commits");
+    let mut none = EditorState::new(tl);
+    assert_eq!(none.step_opacity_each(-10), Err(EditError::NoClip));
+    println!("striaopacitymore: mixed set 50/100 -> 40/90 (1 undo), +3 -> 70/100");
+}
+
+/// The clip label: an opaque clip reads its reel (`A`), at 50 % `A 50%`, set back to opaque `A` again.
+#[test]
+fn striaopacitymore_label_names_the_percent() {
+    use timeline_core::editor::EditorState;
+    use timeline_core::view::{self, Canvas, Order, Text, opacity_label};
+    struct Rec(Vec<String>);
+    impl Text for Rec {
+        fn text(&mut self, _: &mut Canvas, s: &str, _: f32, _: f32, _: (i32, i32)) {
+            self.0.push(String::from(s));
+        }
+    }
+    let (tl, _, _) = base();
+    let first = |tl: &Timeline| {
+        let mut rec = Rec(Vec::new());
+        view::paint(&EditorState::new(tl.clone()), 320, 160, Order::Rgba, Some(&mut rec as &mut dyn Text), None);
+        rec.0.into_iter().find(|s| s.starts_with('A')).expect("the A clip's label")
+    };
+    let half = tl.set_opacity(&[(0, 0)], 50).unwrap();
+    let got = [first(&tl), first(&half), first(&half.set_opacity(&[(0, 0)], timeline_core::OPAQUE).unwrap())];
+    assert_eq!(got, ["A", "A 50%", "A"]);
+    assert_eq!(opacity_label(String::from("A"), 0), "A 0%");
+    assert_eq!(opacity_label(String::from("A"), timeline_core::OPAQUE), "A");
+    println!("striaopacitymore: labels {got:?}");
+}

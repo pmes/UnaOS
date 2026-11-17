@@ -1737,7 +1737,7 @@ impl EditorState {
     }
     /// The `opacity` word of [`EditorState::verb`]; `None` when `v` is not an `opacity` verb.
     fn opacity_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        if let Some(d) = opacity_step(v) { return Some(self.step_opacity(d)); } let mut w = v.split_ascii_whitespace(); // STRIAOPACITYFACE (SR898): the `opacity-` / `opacity+` step words (file tail)
+        if let Some(d) = opacity_step(v) { return Some(self.step_opacity_each(d)); } let mut w = v.split_ascii_whitespace(); // STRIAOPACITYFACE (SR898): the `opacity-` / `opacity+` step words (file tail); STRIAOPACITYMORE (SR958): each clip of the set from its own value (file tail)
         if w.next() != Some("opacity") {
             return None;
         }
@@ -3059,4 +3059,27 @@ fn dur_count(s: &str, fps: Option<u32>) -> Result<i64, ()> {
         return Ok(n);
     }
     fps.and_then(|f| edl::parse_tc(s, f, 0).ok()).ok_or(())
+}
+
+// ---- STRIAOPACITYMORE (LEDGER SR958): each clip of a set stepped from its own opacity (named tail block) ----
+// `opacity-` / `opacity+` step EVERY selected clip from its OWN percent by `d` (clamped to 0..=[`crate::OPAQUE`]), folding
+// SR868's `Timeline::set_opacity` over the set into ONE timeline and ONE commit (nothing commits when no clip moves).
+// Refused by name: no selection `EditError::NoClip`; an audio clip stepped below opaque `EditError::Opacity` (validate).
+impl EditorState {
+    /// STRIAOPACITYMORE: every selected clip at its own opacity + `d` (percent, clamped), one commit.
+    pub fn step_opacity_each(&mut self, d: i16) -> Result<(), EditError> {
+        if self.set.is_empty() {
+            return Err(EditError::NoClip);
+        }
+        let mut tl = self.timeline.clone();
+        for &(track, idx) in &self.set {
+            let own = tl.tracks.get(track).and_then(|t| t.clips.get(idx)).ok_or(EditError::NoClip)?.opacity;
+            let pct = (own as i16 + d).clamp(0, crate::OPAQUE as i16) as u8;
+            tl = tl.set_opacity(&[(track, idx)], pct)?;
+        }
+        if tl != self.timeline {
+            self.commit(tl);
+        }
+        Ok(())
+    }
 }

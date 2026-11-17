@@ -331,7 +331,7 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
             if let Some(p) = peaks.filter(|_| track.kind == Kind::Video) { paint_head(&mut c, (x0 + 1, y0 + 2, x1 - 1, y1 - 2), clip, p); } // STRIATHUMBNAILS (SR839): the clip's src_in frame at its body's left (file tail) // STRIAOPACITYFACE (SR898): the body at its opacity (file tail) pan_tick(&mut c, track.kind, clip, x0, x1, y0); // STRIAPANFACE (SR897): the audio clip's pan tick, nothing at centre (file tail) paint_crop_badge(&mut c, clip.crop, x0, x1, y0); // STRIACROPFACE (SR900): a cropped clip's badge (file tail)
             if let (Some(text), Some(src)) = (labels.as_mut(), tl.source(clip.src)) {
                 let label = if src.size_policy == crate::SizePolicy::Letterbox { src.reel.clone() } else { alloc::format!("{} {}", src.reel, src.size_policy.name()) }; // NLESIZEPOLICYUI (SR402): the reel's policy as a token
-                text.text(&mut c, &label, x0 as f32 + 4.0, y0 as f32 + 15.0, ((x0 + 1) as i32, (x1 - 1) as i32));
+                text.text(&mut c, &opacity_label(label, clip.opacity), x0 as f32 + 4.0, y0 as f32 + 15.0, ((x0 + 1) as i32, (x1 - 1) as i32)); // STRIAOPACITYMORE (SR958): the label names a non-opaque clip's percent (file tail)
             }
             paint_gain_fades(&mut c, &l, (x0 + 1, y0 + 2, x1 - 1, y1 - 2), clip); // STRIACLIPGAINFACE (SR838): the gain line and fade ramps over the body (file tail)
         }
@@ -3076,4 +3076,16 @@ mod striabinscroll_tests {
         }
         assert_eq!(paint_bin_from(&tl, w, h, 9, Order::Bgra, None), paint_bin_from(&tl, w, h, 2, Order::Bgra, None));
     }
+}
+
+// ---- STRIAOPACITYMORE (LEDGER SR958): the clip label names its opacity (named tail block) ----
+// A clip below [`crate::OPAQUE`] is labelled `<label> <pct>%`; an opaque clip's label is unchanged, so every labelled
+// golden (all opaque) records the same strings. Both faces label through `paint_in`'s `Text` hook.
+
+/// STRIAOPACITYMORE: `label` with ` <pct>%` appended below [`crate::OPAQUE`]; `label` itself at or above it.
+pub fn opacity_label(label: alloc::string::String, pct: u8) -> alloc::string::String {
+    if pct >= crate::OPAQUE {
+        return label;
+    }
+    alloc::format!("{label} {pct}%")
 }

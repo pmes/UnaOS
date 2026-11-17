@@ -435,6 +435,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Meta+i", "info"),
     ("n", "snap"), // STRIASNAPMORE (SR952): n flips the drag snap default through the snap word (text key)
     ("1", "bright-"), ("2", "bright+"), ("3", "contrast-"), ("4", "contrast+"), ("5", "sat-"), ("6", "sat+"), // STRIAGRADEMORE (SR957): the digits step the selected clip's grade (SR899's VERBS words, text keys)
+    ("8", "opacity-"), ("9", "opacity+"), // STRIAOPACITYMORE (SR958): 8 / 9 (text keys) step the selection's opacity through the VERBS words
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
     ("E", "export-skip"), // STRIAEXPORTQUEUELIST (SR932): Shift+e (text, both faces) skips the running export through the `export-skip` word; STRIAUNDOJUMP (SR934): `h` lists the undo history
 ];
@@ -2674,6 +2675,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("history", "list the last undo steps"), ("info", "name the selected clip's source for 5 seconds"), // STRIASOURCEINFOKEY (SR942): the Ctrl+i / Meta+i row
     ("snap", "drag snap on / off (Alt: this drag only)"), // STRIASNAPMORE (SR952)
     ("bright-", "brightness down one step"), ("bright+", "brightness up one step"), ("contrast-", "contrast down one step"), ("contrast+", "contrast up one step"), ("sat-", "saturation down one step"), ("sat+", "saturation up one step"), // STRIAGRADEMORE (SR957): the grade keys' phrases
+    ("opacity-", "selection 10 % more transparent"), ("opacity+", "selection 10 % more opaque"), // STRIAOPACITYMORE (SR958)
     ("help", "show / hide this help"),
     ("export-skip", "skip the running export (the next waiting one starts)"), // STRIAEXPORTQUEUELIST (SR932): the `E` row // STRIAUNDOJUMP (SR934)
 ];
