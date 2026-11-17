@@ -3756,3 +3756,52 @@ fn striaripplemore_a_straddler_reads_on_the_message_row() {
     assert_eq!((&face.state.timeline, face.state.undo_depth()), (&tl, 0));
     println!("striaripplemore: rtrim-all out 1 over A1's 25..35 -> {}", EditError::Overlap);
 }
+
+// ---- STRIARIPPLETHREE (LEDGER SR9034): the ripple-all tool — a ripple drag across every track (named tail block) ----
+
+use stria::nle_face::RIPPLE_ALL_NOTE;
+
+/// Rule: `ripple-all` is a transport word before `help` and the key `A`; it toggles the tool with no undo step and no
+/// dirty document; while on the message line names the tool; again turns it off.
+#[test]
+fn striaripplethree_the_word_toggles_the_tool() {
+    let (mut face, tl) = striarippletrim_face(0);
+    assert_eq!(VERBS[VERBS.len() - 2], "ripple-all");
+    assert!(KEYS.contains(&("A", "ripple-all")));
+    assert!(!face.ripple_all());
+    assert!(face.verb("ripple-all"));
+    assert!(face.ripple_all());
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!(face.message_text().as_deref(), Some(RIPPLE_ALL_NOTE));
+    assert_eq!((&face.state.timeline, face.state.undo_depth(), face.dirty()), (&tl, 0, false));
+    assert!(nle5drangekeys_press(&mut face, "A"));
+    assert!(!face.ripple_all());
+    assert_ne!(face.message_text().as_deref(), Some(RIPPLE_ALL_NOTE));
+    println!("striaripplethree: ripple-all on -> \"{RIPPLE_ALL_NOTE}\", A -> off");
+}
+
+/// Rule: with the tool on, SR850's Shift-drag of V1 clip 0's out handle 3 ticks left is the all-tracks ripple: the face
+/// equals `ripple_all_out(0, 0, 20)` (A1's twin trims, A1's later clips follow), ONE undo step restores; with the tool
+/// off the same drag ripples V1 only (SR850's).
+#[test]
+fn striaripplethree_tool_on_shift_drag_ripples_every_track() {
+    let (mut face, tl) = striarippletrim_face(0);
+    assert!(face.verb("ripple-all"));
+    let l = face.layout();
+    let (x, y) = (l.x_of(10) as f64 - 2.0, l.point(0, 5).1);
+    let dx = -3.0 * l.zoom as f64;
+    face.on(&nle3eslipdrag_btn(true, x, y, bandy::MOD_SHIFT | bandy::MOD_ALT));
+    assert_eq!(face.dragging().map(|d| (d.kind, d.ripple, d.ripple_all)), Some((DragKind::TrimOut, true, true)));
+    face.on(&bandy::SMessage::BrowserMouseMove(x + dx, y, 0));
+    face.on(&nle3eslipdrag_btn(false, x + dx, y, bandy::MOD_SHIFT | bandy::MOD_ALT));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!(face.state.timeline, tl.ripple_all_out(0, 0, 20).unwrap());
+    assert_eq!(face.state.undo_depth(), 1);
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.timeline, tl);
+    let (mut face, tl) = striarippletrim_face(0);
+    nle3eslipdrag_drag(&mut face, x, y, dx, bandy::MOD_SHIFT | bandy::MOD_ALT);
+    assert_eq!(face.state.timeline, tl.ripple_trim_out(0, 0, 20).unwrap());
+    assert_eq!(face.state.timeline.tracks[1], tl.tracks[1], "tool off: A1 does not move");
+    println!("striaripplethree: tool on, Shift-drag -3 = ripple_all_out; tool off = ripple_trim_out");
+}

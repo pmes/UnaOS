@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 26] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail)
+pub const VERBS: [&str; 27] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "ripple-all", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIARIPPLETHREE (SR9034): the ripple-all tool on / off (file tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -194,13 +194,14 @@ pub struct Face {
     /// NLE5DKEYSHELP (SR744): the keys help overlay is shown over the timeline band ([`Face::paint_help`]).
     help: bool,
     hover_ticks: Option<((usize, usize), u16)>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
+    ripple_all: bool, // STRIARIPPLETHREE (SR9034): a ripple drag runs on every track (file tail)
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, ripple_all: false }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -235,7 +236,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
+        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.ripple_all_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -386,6 +387,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Meta+Shift+less", "slide-10"),
     ("Ctrl+Shift+greater", "slide+10"),
     ("Meta+Shift+greater", "slide+10"),
+    ("A", "ripple-all"), // STRIARIPPLETHREE (SR9034): A (Shift+a, text) turns the ripple-all tool on / off (file tail)
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
@@ -426,7 +428,7 @@ impl Face {
         let dropped = self.drag.take().is_some();
         let (sel, set, ph) = (self.state.selection, self.state.set.clone(), self.state.playhead);
         let (shift, nosnap) = (mods & bandy::MOD_SHIFT != 0, mods & bandy::MOD_ALT != 0);
-        self.drag = Drag::begin_with(&mut self.state, l, x, y, shift, nosnap, mods & (bandy::MOD_CONTROL | bandy::MOD_SUPER) != 0);
+        self.drag = Drag::begin_with(&mut self.state, l, x, y, shift, nosnap, mods & (bandy::MOD_CONTROL | bandy::MOD_SUPER) != 0).map(|d| d.synced(self.ripple_all)); // STRIARIPPLETHREE (SR9034): the ripple-all tool turns a ripple drag into the all-tracks ripple
         if let Some(d) = self.drag.filter(|d| d.kind == DragKind::Scrub) {
             self.state.seek(d.origin_tick);
         }
@@ -2360,7 +2362,7 @@ impl Face {
     }
     /// The face's message line: the last error while one stands, else [`Face::reel_line`].
     pub fn message_text(&self) -> Option<String> {
-        self.last_error.clone().or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.reel_line())
+        self.last_error.clone().or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.ripple_all_note()).or_else(|| self.reel_line()) // STRIARIPPLETHREE (SR9034): the tool's line while it is on
     }
     /// The message over a painted canvas: one line at x 4, baseline the message row's foot - 4, clipped to the canvas width, through
     /// [`Labels`]; unchanged with labels off, on the tracks Surface, or a band under [`MESSAGE_H`].
@@ -2602,6 +2604,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("slip+10", "slip the clip 10 frames on"),
     ("slide-10", "slide the clip 10 frames earlier"),
     ("slide+10", "slide the clip 10 frames later"),
+    ("ripple-all", "ripple all tracks on / off: shift-drag a clip edge to ripple every track"), // STRIARIPPLETHREE (SR9034)
     ("help", "show / hide this help"),
 ];
 /// NLE5DKEYSHELP (SR744): the help's inset from the band's top and left (px).
@@ -3095,5 +3098,36 @@ impl Face {
             return None;
         }
         stall_since(j.rate_at.0.elapsed(), j.rate_ema)
+    }
+}
+
+// ---- STRIARIPPLETHREE (LEDGER SR9034): the ripple-all tool — a face mode that makes a ripple drag run on every track (named tail block) ----
+// Every modifier on the selected clip's edge zone is taken (SR850), so the all-tracks ripple drag (NLE-RIPPLE-ALL-DRAG) is
+// a face TOOL in the roll tool's shape: `ripple-all` (VERBS, the Ripple All button, the key `A`) turns it on / off, a
+// view-only toggle (no undo step, the document stays clean). While it is on, `press` maps the begun drag through
+// timeline_core's `Drag::synced`: a shift-drag on the selected clip's trim handle (SR850's ripple) commits as SR953's ONE
+// `EditorState::ripple_trim_all` (every track's twin trims, every track's later material follows, one undo step); every
+// other drag is unchanged. `message_text` names the tool after the export line. Default off: every golden is unchanged.
+// Owed: NLE-RIPPLE-ALL-KERNEL (the Player's tool needs a new EDIT_KEYS byte), NLE-RIPPLE-ALL-PAINT (a cue on the band).
+
+/// STRIARIPPLETHREE (SR9034): the message line while the ripple-all tool is on.
+pub const RIPPLE_ALL_NOTE: &str = "ripple all: a shift-drag on a clip edge ripples every track";
+
+impl Face {
+    /// STRIARIPPLETHREE: the ripple-all tool is on.
+    pub fn ripple_all(&self) -> bool {
+        self.ripple_all
+    }
+    /// The `ripple-all` word of [`Face::verb`]: the tool on / off (no commit); `None`: not this word.
+    fn ripple_all_verb(&mut self, v: &str) -> Option<bool> {
+        if v != "ripple-all" {
+            return None;
+        }
+        self.ripple_all = !self.ripple_all;
+        Some(true)
+    }
+    /// The tool's line for [`Face::message_text`] while it is on.
+    fn ripple_all_note(&self) -> Option<String> {
+        self.ripple_all.then(|| RIPPLE_ALL_NOTE.to_string())
     }
 }
