@@ -154,8 +154,8 @@ pub struct PaintStyle<H: Host> {
     pub font_rel: Option<Vec<(String, String)>>,
     /// font-stretch in percent (css-fonts-4 §2.3).
     pub stretch: Option<u16>,
-    /// AETHERFONTSYNTHESISPROPERTY (SR750): css-fonts-4 §6 font-synthesis-weight / -style, Some(true) = auto.
-    pub synth_weight: Option<bool>, pub synth_style: Option<bool>,
+    /// AETHERFONTSYNTHESISPROPERTY (SR750): css-fonts-4 §6 font-synthesis-weight / -style / -small-caps (SR772), Some(true) = auto.
+    pub synth_weight: Option<bool>, pub synth_style: Option<bool>, pub synth_small_caps: Option<bool>,
     /// word-spacing in px (css-text-3 §7.1).
     pub word_spacing: Option<f32>,
     /// direction: rtl (true) / ltr (false) (css-writing-modes-4 §2.1; `dir` maps onto it).
@@ -313,7 +313,7 @@ impl<H: Host> Default for PaintStyle<H> {
             font_size_rel: None,
             used_font_size: None,
             font_rel: None,
-            stretch: None, synth_weight: None, synth_style: None,
+            stretch: None, synth_weight: None, synth_style: None, synth_small_caps: None,
             word_spacing: None,
             rtl: None,
             text_shadows: None,
