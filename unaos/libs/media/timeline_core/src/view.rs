@@ -595,6 +595,7 @@ pub enum DragKind {
     Slip,
     /// NLE3ESLIPDRAG (SR760): the slip modifier on the selected clip's trim handle (`EditorState::slide_selected`).
     Slide,
+    GainEnv, // STRIAGAINENVDRAG (SR9082): a point of the selected audio clip's gain envelope (Drag::begin_gain_env, file tail)
 }
 
 /// One pointer drag: begun by a press, updated by moves, committed ONCE on release ([`Drag::finish`]). It reads the
@@ -704,7 +705,7 @@ impl Drag {
             DragKind::Marquee => {
                 (self.at.0 - self.origin.0).abs() >= MARQUEE_MIN || (self.at.1 - self.origin.1).abs() >= MARQUEE_MIN
             }
-            _ => self.delta != 0 || self.to_track != self.track,
+            DragKind::GainEnv => true, _ => self.delta != 0 || self.to_track != self.track, // STRIAGAINENVDRAG (SR9082): an envelope press always changes or is the same-envelope no-op (file tail)
         }
     }
     /// THE commit of the gesture: one `trim`, `move_selected` / `move_set` or marquee selection (a scrub commits nothing).
@@ -715,7 +716,7 @@ impl Drag {
                 st.select_many(&self.layout.crossing(&st.timeline, x0, y0, x1, y1), self.additive);
                 return Ok(());
             }
-            DragKind::Scrub => return Ok(()), DragKind::TransitionIn | DragKind::TransitionOut => return self.finish_transition(st),
+            DragKind::Scrub => return Ok(()), DragKind::TransitionIn | DragKind::TransitionOut => return self.finish_transition(st), DragKind::GainEnv => return self.finish_gain_env(st), // STRIAGAINENVDRAG (SR9082): the envelope's ONE commit (file tail)
             _ => {}
         }
         if st.selection != Some((self.track, self.idx)) {
@@ -795,7 +796,7 @@ impl Drag {
         let one = [(self.track, self.idx)];
         let slide_ex: Vec<(usize, usize)>;
         let (edges, exclude, playhead): (Vec<i64>, &[(usize, usize)], bool) = match self.kind {
-            DragKind::Marquee | DragKind::Slip => return, DragKind::TransitionIn | DragKind::TransitionOut => return self.snap_transition(st, x),
+            DragKind::Marquee | DragKind::Slip | DragKind::GainEnv => return, DragKind::TransitionIn | DragKind::TransitionOut => return self.snap_transition(st, x),
             DragKind::Scrub => {
                 if let Some(t) = snap_to(&l, &snap_targets(st, &[], false), x) {
                     self.delta = t - self.origin_tick;
@@ -1548,7 +1549,7 @@ pub fn paint_gain_env(c: &mut Canvas, l: &Layout, st: &EditorState) {
     }
     let y0 = l.row_y(row);
     let (x0, y1, x1) = (l.x_of(clip.at) + 1, y0 + ROW_H as i64 - 2, l.x_of(clip.end()) - 1);
-    let (top, bottom) = (y0 + 2, y1 - 1);
+    let (top, bottom) = gain_env_rows(l, row); debug_assert_eq!(bottom, y1 - 1); // STRIAGAINENVDRAG (SR9082): the ONE body-row rule the hit shares (file tail)
     if x1 - x0 < 2 || bottom - top < 2 {
         return;
     }
@@ -1613,5 +1614,238 @@ mod striagainenvelope_tests {
         assert!(!lo.is_empty() && !hi.is_empty());
         assert!(hi[0] < lo[0], "0 dB sits higher than -12 dB: {hi:?} {lo:?}");
         assert!(rows(l2.x_of(4) - 1).len() >= 3, "the dot at source tick 4");
+    }
+}
+
+// ---- STRIAGAINENVDRAG (LEDGER SR9082): drag a gain envelope point, a press on the line adds one (named tail block) ----
+// A press (the host face's, no Shift / Ctrl / Cmd; begun BEFORE `begin_with`, the `begin_transition_edge` shape, so the
+// kernel Player, which calls only `begin_with`, never begins one) on the SELECTED audio clip's painted envelope begins
+// `DragKind::GainEnv`: on a point's dot (within [`ENV_GRAB`] px in x and y; the nearest in x) that point, elsewhere within
+// [`ENV_GRAB`] px of the line (outside the two trim-handle zones) the line at the pressed source tick. The release is ONE
+// `EditorState::set_selected_gain_env`: the point (or a new one) lands at the grabbed tick + the tick delta (never snapped),
+// clamped into the clip's source window and strictly between its neighbours, at the grabbed tick's own offset while the
+// pointer's y is unchanged, else at the dB under the moved row ([`gain_cdb_at`], [`gain_y`]'s inverse). So a click on the
+// line adds a point at the line's own value (the sound unchanged) and a click on a point commits nothing.
+
+/// STRIAGAINENVDRAG (SR9082): how near (px, in x and in y) a press must come to a point's dot or the line to grab it.
+pub const ENV_GRAB: f64 = 3.0;
+
+/// STRIAGAINENVDRAG (SR9082): the envelope's body rows `(top, bottom)` on track row `row` (the painter's and the hit's).
+pub fn gain_env_rows(l: &Layout, row: usize) -> (i64, i64) {
+    let y0 = l.row_y(row);
+    (y0 + 2, y0 + ROW_H as i64 - 3)
+}
+
+/// STRIAGAINENVDRAG (SR9082): [`gain_y`]'s inverse: the centi-dB of row `y` (clamped into `top..=bottom`): above mid-height
+/// linear up to `GAIN_MAX_CDB` at the top, below it linear down to `GAIN_MIN_CDB` at the bottom (truncating toward zero).
+pub fn gain_cdb_at(y: i64, top: i64, bottom: i64) -> i32 {
+    let mid = (top + bottom) / 2;
+    let y = y.max(top).min(bottom);
+    if y <= mid {
+        if mid == top {
+            return 0;
+        }
+        (crate::GAIN_MAX_CDB as i64 * (mid - y) / (mid - top)) as i32
+    } else {
+        (crate::GAIN_MIN_CDB as i64 * (y - mid) / (bottom - mid)) as i32
+    }
+}
+
+/// STRIAGAINENVDRAG (SR9082): what a press at `(x, y)` grabs of `clip`'s envelope on row `row`: `(source tick, an existing
+/// point)`; `None` for an empty envelope or a press off the dots and the line (or on the line inside a trim-handle zone).
+pub fn env_grab(l: &Layout, row: usize, clip: &crate::Clip, x: f64, y: f64) -> Option<(i64, bool)> {
+    if clip.gain_env.is_empty() {
+        return None;
+    }
+    let (top, bottom) = gain_env_rows(l, row);
+    let y_at = |s: i64| gain_y(clip.gain_cdb.saturating_add(clip.gain_env.at(s)), top, bottom) as f64;
+    let mut best: Option<(f64, i64)> = None;
+    for &(s, _) in clip.gain_env.points().iter().filter(|p| clip.src_in <= p.0 && p.0 < clip.src_out) {
+        let dx = (l.x_of(clip.at + (s - clip.src_in)) as f64 - x).abs();
+        if dx <= ENV_GRAB && (y_at(s) - y).abs() <= ENV_GRAB && best.is_none_or(|(bd, _)| dx < bd) {
+            best = Some((dx, s));
+        }
+    }
+    if let Some((_, s)) = best {
+        return Some((s, true));
+    }
+    let (x0, x1, hw) = (l.x_of(clip.at) as f64, l.x_of(clip.end()) as f64, HANDLE_W as f64);
+    if x < x0 + hw || x >= x1 - hw {
+        return None;
+    }
+    let s = clip.src_tick(l.tick_at(x));
+    if (y_at(s) - y).abs() > ENV_GRAB {
+        return None;
+    }
+    Some((s, clip.gain_env.points().iter().any(|p| p.0 == s)))
+}
+
+impl Drag {
+    /// STRIAGAINENVDRAG (SR9082): a press on the selected audio clip's painted envelope: the envelope drag (no snap);
+    /// `None` anywhere else (see the block comment).
+    pub fn begin_gain_env(st: &EditorState, l: Layout, x: f64, y: f64) -> Option<Drag> {
+        let (row, idx) = st.selection?;
+        let clip = st.selected()?;
+        if st.timeline.tracks.get(row)?.kind != Kind::Audio {
+            return None;
+        }
+        let y0 = l.row_y(row) as f64;
+        if y < y0 || y >= y0 + ROW_H as f64 {
+            return None;
+        }
+        env_grab(&l, row, &clip, x, y)?;
+        Some(Drag {
+            kind: DragKind::GainEnv,
+            track: row,
+            idx,
+            origin_tick: l.tick_at(x),
+            layout: l,
+            delta: 0,
+            to_track: row,
+            origin: (x, y),
+            at: (x, y),
+            snap: false,
+            additive: false,
+            guide: None,
+        })
+    }
+    /// STRIAGAINENVDRAG (SR9082): the envelope the release commits and where its point lands: `(envelope, source tick,
+    /// offset)` (read before the commit; the face's note names the point).
+    pub fn gain_env_landing(&self, st: &EditorState) -> Result<(crate::GainEnv, i64, i32), EditError> {
+        let c = *st.timeline.tracks.get(self.track).and_then(|t| t.clips.get(self.idx)).ok_or(EditError::NoClip)?;
+        let l = self.layout;
+        let (s0, existing) = env_grab(&l, self.track, &c, self.origin.0, self.origin.1).ok_or(EditError::Gain)?;
+        let cur = c.gain_env.at(s0);
+        let dy = (self.at.1 - self.origin.1) as i64;
+        let v = if dy == 0 {
+            cur
+        } else {
+            let (top, bottom) = gain_env_rows(&l, self.track);
+            let heard = gain_cdb_at(gain_y(c.gain_cdb.saturating_add(cur), top, bottom) + dy, top, bottom);
+            heard.saturating_sub(c.gain_cdb).max(crate::GAIN_MIN_CDB).min(crate::GAIN_MAX_CDB)
+        };
+        let base = if existing { c.gain_env.without(s0)? } else { c.gain_env };
+        let lo = base.points().iter().map(|p| p.0).filter(|&t| t < s0).max().map_or(c.src_in, |t| (t + 1).max(c.src_in));
+        let hi = base.points().iter().map(|p| p.0).filter(|&t| t > s0).min().map_or(c.src_out - 1, |t| (t - 1).min(c.src_out - 1));
+        let s1 = (s0 + self.delta).max(lo).min(hi);
+        Ok((base.with(s1, v)?, s1, v))
+    }
+    /// STRIAGAINENVDRAG (SR9082): the envelope drag's ONE commit: the clip `(track, idx)` selected, then
+    /// `set_selected_gain_env` of [`Drag::gain_env_landing`] (the same envelope commits nothing).
+    fn finish_gain_env(&self, st: &mut EditorState) -> Result<(), EditError> {
+        if st.selection != Some((self.track, self.idx)) {
+            st.select(self.track, self.idx)?;
+        }
+        let (env, _, _) = self.gain_env_landing(st)?;
+        st.set_selected_gain_env(env)
+    }
+}
+
+#[cfg(test)]
+mod striagainenvdrag_tests {
+    extern crate std;
+    use super::*;
+    use crate::{Clip, GainEnv};
+
+    /// One track of `kind`, `clip` on it (selected when `select`), the tracks band of a 320x56 canvas.
+    fn st(kind: Kind, clip: Clip, select: bool) -> (EditorState, Layout) {
+        let mut tl = Timeline::new(25);
+        tl.add_source("A", 50);
+        tl.add_track(kind);
+        tl.tracks[0].clips = alloc::vec![clip];
+        let mut st = EditorState::new(tl);
+        if select {
+            st.select(0, 0).unwrap();
+        }
+        let l = Layout::of_role(Role::Tracks, 320, 56, &st);
+        (st, l)
+    }
+
+    /// A 0..20 at 0 with points (4, -12 dB) and (16, 0 dB).
+    fn ramp() -> Clip {
+        let e = GainEnv::EMPTY.with(4, -1200).unwrap().with(16, 0).unwrap();
+        Clip { gain_env: e, ..Clip::new(crate::SourceId(0), 0, 20, 0) }
+    }
+
+    /// The press point over source tick `s` of `clip`'s line (row 0).
+    fn on_line(l: &Layout, clip: &Clip, s: i64) -> (f64, f64) {
+        let (top, bottom) = gain_env_rows(l, 0);
+        (l.x_of(clip.at + s - clip.src_in) as f64 + 0.5, gain_y(clip.gain_cdb + clip.gain_env.at(s), top, bottom) as f64 + 0.5)
+    }
+
+    /// M3: gain_cdb_at is gain_y's inverse on every body row; mid 0, top MAX, bottom MIN; the rows are the painter's.
+    #[test]
+    fn striagainenvdrag_y_round_trip() {
+        for (top, bottom) in [(18i64, 53i64), (2, 37), (100, 135)] {
+            for y in top..=bottom {
+                assert_eq!(gain_y(gain_cdb_at(y, top, bottom), top, bottom), y, "row {y} of {top}..={bottom}");
+            }
+            assert_eq!(gain_cdb_at((top + bottom) / 2, top, bottom), 0);
+            assert_eq!(gain_cdb_at(top - 5, top, bottom), crate::GAIN_MAX_CDB);
+            assert_eq!(gain_cdb_at(bottom + 5, top, bottom), crate::GAIN_MIN_CDB);
+        }
+        let (_, l) = st(Kind::Audio, ramp(), true);
+        assert_eq!(gain_env_rows(&l, 0), (18, 53));
+    }
+
+    /// M3: a point dragged +2 ticks and 4 px up lands at tick 6 at the row's dB, ONE undo step; dragged far right it stops
+    /// one tick short of its neighbour; a click on the line adds a point at the line's value; a click on a point commits
+    /// nothing; undo restores.
+    #[test]
+    fn striagainenvdrag_point_and_line() {
+        let c = ramp();
+        let (mut s, l) = st(Kind::Audio, c, true);
+        let tl0 = s.timeline.clone();
+        let z = l.zoom as f64;
+        let (x, y) = on_line(&l, &c, 4);
+        let mut d = Drag::begin_gain_env(&s, l, x, y).unwrap();
+        assert_eq!((d.kind, d.track, d.idx, d.snap), (DragKind::GainEnv, 0, 0, false));
+        d.update(&s, x + 2.0 * z, y - 4.0);
+        assert_eq!(d.delta, 2);
+        let (top, bottom) = gain_env_rows(&l, 0);
+        let v = gain_cdb_at(gain_y(-1200, top, bottom) - 4, top, bottom);
+        assert!(v > -1200);
+        assert!(d.moved() && d.shown(&s).is_some(), "the preview");
+        d.finish(&mut s).unwrap();
+        assert_eq!((s.timeline.tracks[0].clips[0].gain_env.points(), s.undo_depth()), (&[(6, v), (16, 0)][..], 1));
+        s.undo();
+        assert_eq!(s.timeline, tl0);
+        let mut d = Drag::begin_gain_env(&s, l, x, y).unwrap();
+        d.update(&s, x + 12.0 * z, y);
+        d.finish(&mut s).unwrap();
+        assert_eq!(s.timeline.tracks[0].clips[0].gain_env.points(), &[(15, -1200), (16, 0)], "clamped short of the neighbour");
+        s.undo();
+        let (lx, ly) = on_line(&l, &c, 10);
+        let mut d = Drag::begin_gain_env(&s, l, lx, ly).unwrap();
+        d.update(&s, lx, ly);
+        assert!(d.moved(), "an unmoved line press is still the add");
+        d.finish(&mut s).unwrap();
+        assert_eq!((s.timeline.tracks[0].clips[0].gain_env.points(), s.undo_depth()), (&[(4, -1200), (10, -600), (16, 0)][..], 1));
+        s.undo();
+        let mut d = Drag::begin_gain_env(&s, l, x, y).unwrap();
+        d.update(&s, x, y);
+        d.finish(&mut s).unwrap();
+        assert_eq!((&s.timeline, s.undo_depth()), (&tl0, 0), "an unmoved point commits nothing");
+        std::println!("striagainenvdrag: point (4, -1200) -> (6, {v}); clamp -> 15; line click at 10 -> -600");
+    }
+
+    /// M3: no envelope drag for an unselected clip, a video clip, an empty envelope, a press off the line, or the line
+    /// inside a trim-handle zone; begin_with on the same off-line spot is still the Move.
+    #[test]
+    fn striagainenvdrag_no_grab() {
+        let c = ramp();
+        let (s, l) = st(Kind::Audio, c, false);
+        let (x, y) = on_line(&l, &c, 10);
+        assert!(Drag::begin_gain_env(&s, l, x, y).is_none(), "unselected");
+        let (s, l) = st(Kind::Video, c, true);
+        assert!(Drag::begin_gain_env(&s, l, x, y).is_none(), "video");
+        let plain = Clip::new(crate::SourceId(0), 0, 20, 0);
+        let (s, l) = st(Kind::Audio, plain, true);
+        assert!(Drag::begin_gain_env(&s, l, x, l.row_y(0) as f64 + 20.0).is_none(), "empty envelope");
+        let (mut s, l) = st(Kind::Audio, c, true);
+        assert!(Drag::begin_gain_env(&s, l, x, y + 10.0).is_none(), "off the line");
+        let (hx, hy) = on_line(&l, &c, 0);
+        assert!(Drag::begin_gain_env(&s, l, hx, hy).is_none(), "the in handle's zone");
+        assert_eq!(Drag::begin_with(&mut s, l, x, y + 10.0, false, false, false).map(|d| d.kind), Some(DragKind::Move));
     }
 }

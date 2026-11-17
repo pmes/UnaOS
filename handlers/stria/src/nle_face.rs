@@ -388,6 +388,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Ctrl+Shift+greater", "slide+10"),
     ("Meta+Shift+greater", "slide+10"),
     ("v", "gain-"), ("V", "gain+"), (":", "track-gain-"), ("\"", "track-gain+"), ("Q", "mute"), ("S", "solo"), // STRIATRACKGAINKEYS (SR926): text keys for the audio words (Face::verb: the buttons' commit and message line; the natural - / = / m / s are taken)
+    ("Alt+e", "env"), ("Alt+Shift+E", "env-del"), ("Alt+Down", "env-"), ("Alt+Up", "env+"), // STRIAGAINENVDRAG (SR9082): chords for the env words (GTK order Ctrl, Alt, Shift, Meta; Face::verb: the note)
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
@@ -423,7 +424,7 @@ impl Face {
     fn press(&mut self, x: f64, y: f64, mods: u8) -> bool {
         self.buttons = true;
         self.pointer = Some((x, y));
-        if let Some(r) = self.press_transition_edge(x, y, mods) { return r; } if let Some(r) = self.pick_transition(x, y) { return r; }
+        if let Some(r) = self.press_transition_edge(x, y, mods) { return r; } if let Some(r) = self.pick_transition(x, y) { return r; } if let Some(r) = self.press_gain_env(x, y, mods) { return r; } // STRIAGAINENVDRAG (SR9082): the selected audio clip's envelope point or line (file tail)
         let l = self.layout();
         let dropped = self.drag.take().is_some();
         let (sel, set, ph) = (self.state.selection, self.state.set.clone(), self.state.playhead);
@@ -446,7 +447,7 @@ impl Face {
             self.state.seek(d.origin_tick + d.delta);
             return true;
         }
-        if let Err(e) = d.finish(&mut self.state) {
+        let land = self.gain_env_land(&d); if let Err(e) = d.finish(&mut self.state).inspect(|_| self.gain_env_drag_note(land)) { // STRIAGAINENVDRAG (SR9082): an envelope drag's note (file tail)
             self.last_error = Some(format!("drag: {e}"));
         }
         true
@@ -458,7 +459,7 @@ impl Face {
         let before = (d.delta, d.to_track, d.at, d.guide);
         d.update(&self.state, x, y);
         let changed = match d.kind {
-            DragKind::Marquee => d.at != before.2,
+            DragKind::Marquee | DragKind::GainEnv => d.at != before.2, // STRIAGAINENVDRAG (SR9082): a vertical envelope drag repaints
             _ => (d.delta, d.to_track, d.guide) != (before.0, before.1, before.3),
         };
         if d.kind == DragKind::Scrub {
@@ -2605,6 +2606,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("slide-10", "slide the clip 10 frames earlier"),
     ("slide+10", "slide the clip 10 frames later"),
     ("gain-", "clip gain down one step"), ("gain+", "clip gain up one step"), ("track-gain-", "track gain down 1 dB"), ("track-gain+", "track gain up 1 dB"), ("mute", "mute / unmute the clip's track"), ("solo", "solo / unsolo the clip's track"), // STRIATRACKGAINKEYS (SR926)
+    ("env", "gain point at the playhead"), ("env-del", "remove the gain point at the playhead"), ("env-", "gain point down one step"), ("env+", "gain point up one step"), // STRIAGAINENVDRAG (SR9082)
     ("help", "show / hide this help"),
 ];
 /// NLE5DKEYSHELP (SR744): the help's inset from the band's top and left (px).
@@ -3212,5 +3214,34 @@ impl Face {
             None => return None,
         }
         Some(true)
+    }
+}
+
+// ---- STRIAGAINENVDRAG (LEDGER SR9082): the envelope drag's press and its note (named tail block) ----
+// A press with no Shift / Ctrl / Cmd on the selected audio clip's painted envelope begins timeline_core's envelope drag
+// (`Drag::begin_gain_env`, before `begin_with`, as the transition edge); the release's generic `Drag::finish` is its ONE
+// `set_selected_gain_env`, `Drag::shown` its preview. After the commit the NOTE reads `env: <db_words> at <tick>, <n> points`
+// (the landed point's offset and timeline tick, the point count); a refusal stays `drag: <EditError>` on `last_error`.
+impl Face {
+    /// The press began an envelope drag (`Some(true)`); `None`: a modifier held, or not on the envelope.
+    fn press_gain_env(&mut self, x: f64, y: f64, mods: u8) -> Option<bool> {
+        if mods & (bandy::MOD_SHIFT | bandy::MOD_CONTROL | bandy::MOD_SUPER) != 0 {
+            return None;
+        }
+        let d = Drag::begin_gain_env(&self.state, self.layout(), x, y)?;
+        self.drag = Some(d);
+        Some(true)
+    }
+    /// Where an envelope drag's point lands `(source tick, offset)`, read before its commit; `None` for any other drag.
+    fn gain_env_land(&self, d: &Drag) -> Option<(i64, i32)> {
+        if d.kind != DragKind::GainEnv {
+            return None;
+        }
+        d.gain_env_landing(&self.state).ok().map(|(_, s, v)| (s, v))
+    }
+    /// The note after an envelope drag's commit.
+    fn gain_env_drag_note(&mut self, land: Option<(i64, i32)>) {
+        let (Some((s, v)), Some(c)) = (land, self.state.selected()) else { return };
+        self.note = Some(format!("env: {} at {}, {} points", db_words(v), c.at + (s - c.src_in), c.gain_env.points().len()));
     }
 }
