@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 29] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "close-all", "gap", "close-gaps", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAGAPCLOSE (SR857): `close-gaps` closes every gap on the selected track (timeline_core `EditorState::verb`; `gap <n>` an argument word, no button); STRIAGAPSBLACK (SR909): bare `gap` opens one second at the playhead (before `close-gaps`; timeline_core `EditorState::verb`); STRIAGAPSMORE (SR969): `close-all` the Close All button's word for `close-gaps all` (before `gap`; file tail)
+pub const VERBS: [&str; 30] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "close-sync", "close-all", "gap", "close-gaps", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAGAPCLOSE (SR857): `close-gaps` closes every gap on the selected track (timeline_core `EditorState::verb`; `gap <n>` an argument word, no button); STRIAGAPSBLACK (SR909): bare `gap` opens one second at the playhead (before `close-gaps`; timeline_core `EditorState::verb`); STRIAGAPSMORE (SR969): `close-all` the Close All button's word for `close-gaps all` (before `gap`; file tail); STRIAGAPSTHREE (SR9028): `close-sync` the Close Sync button's word for `close-gaps sync` (before `close-all`; file tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -193,6 +193,7 @@ pub struct Face {
     export: Option<ExportJob>,
     /// NLE5DKEYSHELP (SR744): the keys help overlay is shown over the timeline band ([`Face::paint_help`]).
     help: bool,
+    pub note: Option<String>, // STRIAGAPSTHREE (SR9028): a success line on the message row, read after last_error, cleared by the next acting input (SR990's shape; file tail)
     hover_ticks: Option<((usize, usize), u16)>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
 }
 
@@ -200,7 +201,7 @@ impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, note: None }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -208,7 +209,7 @@ impl Face {
     }
     /// One message from the surface or the buttons; true when the canvas must be repainted.
     pub fn on(&mut self, msg: &SMessage) -> bool {
-        if !self.takes(msg) { return false; } if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's
+        if !self.takes(msg) { return false; } self.clear_note(msg); if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's
         match msg {
             SMessage::Input { target, text } if target == SURFACE => self.verb(text),
             SMessage::BrowserClick(x, y, _) if !self.buttons => self.click(*x, *y),
@@ -2360,7 +2361,7 @@ impl Face {
     }
     /// The face's message line: the last error while one stands, else [`Face::reel_line`].
     pub fn message_text(&self) -> Option<String> {
-        self.last_error.clone().or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.reel_line())
+        self.last_error.clone().or_else(|| self.note.clone()).or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.reel_line()) // STRIAGAPSTHREE (SR9028): the face note after the error (file tail)
     }
     /// The message over a painted canvas: one line at x 4, baseline the message row's foot - 4, clipped to the canvas width, through
     /// [`Labels`]; unchanged with labels off, on the tracks Surface, or a band under [`MESSAGE_H`].
@@ -3105,7 +3106,7 @@ impl Face {
 impl Face {
     /// The `close-gaps` word with its note; `None` for any other word.
     fn gaps_note_verb(&mut self, v: &str) -> Option<bool> {
-        if let Some(r) = self.gaps_more_note_verb(v) { return Some(r); } if let Some(r) = self.gaps_all_note_verb(v) { return Some(r); } if v != "close-gaps" { // STRIAGAPSALLTRACKS (SR929): `close-gaps all` and its note (file tail); STRIAGAPSMORE (SR969): `close-all` and `close-gaps sync` (file tail)
+        if let Some(r) = self.gaps_three_note_verb(v) { return Some(r); } if let Some(r) = self.gaps_more_note_verb(v) { return Some(r); } if let Some(r) = self.gaps_all_note_verb(v) { return Some(r); } if v != "close-gaps" { // STRIAGAPSALLTRACKS (SR929): `close-gaps all` and its note (file tail); STRIAGAPSMORE (SR969): `close-all` and `close-gaps sync` (file tail); STRIAGAPSTHREE (SR9028): `close-sync` and `close-gaps keep` (file tail)
             return None;
         }
         let track = self.state.selection.map(|(t, _)| t);
@@ -3117,7 +3118,7 @@ impl Face {
                 let gone = fades.saturating_sub(count(&self.state.timeline, track));
                 if gone > 0 {
                     let s = |n: usize| if n == 1 { "" } else { "s" };
-                    self.last_error = Some(format!("{v}: closed {gaps} gap{}, removed {gone} fade{}", s(gaps), s(gone)));
+                    self.note = Some(format!("{v}: closed {gaps} gap{}, removed {gone} fade{}", s(gaps), s(gone))); // STRIAGAPSTHREE (SR9028): a success line is a note
                 }
             }
             None => return Some(false),
@@ -3156,7 +3157,7 @@ impl Face {
                 let gone = before.saturating_sub(fades(&self.state.timeline));
                 if gone > 0 {
                     let s = |n: usize| if n == 1 { "" } else { "s" };
-                    self.last_error = Some(format!("close-gaps all: closed {gaps} gap{}, removed {gone} fade{}", s(gaps), s(gone)));
+                    self.note = Some(format!("close-gaps all: closed {gaps} gap{}, removed {gone} fade{}", s(gaps), s(gone))); // STRIAGAPSTHREE (SR9028): a success line is a note
                 }
             }
             None => return Some(false),
@@ -3186,7 +3187,54 @@ impl Face {
                 let gone = before.saturating_sub(fades(&self.state.timeline));
                 if gone > 0 {
                     let s = |n: usize| if n == 1 { "" } else { "s" };
-                    self.last_error = Some(format!("close-gaps sync: closed {gaps} gap{}, removed {gone} fade{}", s(gaps), s(gone)));
+                    self.note = Some(format!("close-gaps sync: closed {gaps} gap{}, removed {gone} fade{}", s(gaps), s(gone))); // STRIAGAPSTHREE (SR9028): a success line is a note
+                }
+            }
+            None => return Some(false),
+        }
+        Some(true)
+    }
+}
+
+// ---- STRIAGAPSTHREE (LEDGER SR9028): the face note, the Close Sync button word, the `close-gaps keep` note (named tail block) ----
+// `Face.note` (SR990's settled shape) is read by `message_text` after `last_error` (an error wins) and before the export and
+// reel lines; `serve` and the witness never take it, so a gap success line stands across repaints until the next acting input
+// clears it. `close-sync` (VERBS, the Close Sync button) is the one argument word `close-gaps sync`; `close-gaps keep` rides
+// timeline_core's ONE verb dispatch (one commit): a refusal is `close-gaps keep: <why>` on last_error, and the note
+// `close-gaps keep: closed 1 gap, kept 1` stands only when a faded gap stayed open.
+impl Face {
+    /// Clear the note on an acting input: a typed word, a click, a press, select-all, a named key, a one-char text
+    /// key. A move, a release, the wheel, a zoom and a resize keep it.
+    fn clear_note(&mut self, msg: &SMessage) {
+        let acts = match msg {
+            SMessage::Input { .. } | SMessage::BrowserClick(..) | SMessage::BrowserButton { down: true, .. } | SMessage::BrowserSelectAll => true,
+            SMessage::BrowserKey(k) => k.chars().count() > 1,
+            SMessage::BrowserText(t) => t.chars().count() == 1,
+            _ => false,
+        };
+        if acts {
+            self.note = None;
+        }
+    }
+
+    /// The `close-sync` / `close-gaps keep` words with their notes; `None` for any other word.
+    fn gaps_three_note_verb(&mut self, v: &str) -> Option<bool> {
+        if v == "close-sync" {
+            return self.gaps_more_note_verb("close-gaps sync");
+        }
+        if !v.split_ascii_whitespace().eq(["close-gaps", "keep"]) {
+            return None;
+        }
+        let track = self.state.selection.map(|(t, _)| t);
+        let gaps = |tl: &Timeline| track.map_or(0, |t| tl.gap_count(t));
+        let before = gaps(&self.state.timeline);
+        match self.state.verb(v) {
+            Some(Err(e)) => self.last_error = Some(format!("close-gaps keep: {e}")),
+            Some(Ok(())) => {
+                let kept = gaps(&self.state.timeline);
+                if kept > 0 {
+                    let closed = before.saturating_sub(kept);
+                    self.note = Some(format!("close-gaps keep: closed {closed} gap{}, kept {kept}", if closed == 1 { "" } else { "s" }));
                 }
             }
             None => return Some(false),

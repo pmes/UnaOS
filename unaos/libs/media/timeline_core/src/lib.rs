@@ -1549,15 +1549,7 @@ impl Timeline {
     /// end (0 for the first) moves back to it with everything after it. No gap: an equal value.
     pub fn close_gaps(&self, track: usize) -> Result<Timeline, EditError> {
         let mut tl = self.clone();
-        let n = tl.tracks.get(track).ok_or(EditError::NoTrack)?.clips.len();
-        let mut end = 0;
-        for i in 0..n {
-            let at = tl.tracks[track].clips[i].at;
-            if at > end { if i > 0 { tl.drop_gap_blacks(track, end, at); } // STRIAGAPSBLACK (SR909): the closed gap's black fades go in the same value (file tail)
-                tl.shift_from(track, at, end - at, None);
-            }
-            end = tl.tracks[track].clips[i].end();
-        }
+        tl.close_gaps_on(track, false)?; // STRIAGAPSTHREE (SR9028): SR857's loop (with SR909's black rule) is the one body `close_gaps_on` (file tail)
         tl.validate()?;
         Ok(tl)
     }
@@ -1591,7 +1583,7 @@ impl Timeline {
     /// STRIAGAPSBLACK: drop `track`'s to-black at `start` and from-black at `end` (the gap `start..end` is closing).
     fn drop_gap_blacks(&mut self, track: usize, start: i64, end: i64) {
         if let Some(t) = self.tracks.get_mut(track) {
-            t.transitions.retain(|x| !((x.to_black && x.at == start) || (x.from_black && x.at == end)));
+            t.transitions.retain(|x| !gap_black(x, start, end)); // STRIAGAPSTHREE (SR9028): the one black predicate (file tail)
         }
     }
 
@@ -1621,7 +1613,7 @@ impl Timeline {
     /// STRIAGAPSALLTRACKS: close every gap on every track (each the leading one included). Refused: `(track, why)` for the
     /// first track `close_gaps` refuses, or an audio track that would lose a crossfade paired with a video transition.
     pub fn close_gaps_all(&self) -> Result<Timeline, (usize, EditError)> {
-        let mut tl = self.clone();
+        let mut tl = self.close_gaps_all_once().unwrap_or_else(|| self.clone()); // STRIAGAPSTHREE (SR9028): the finished value validated once; refused, the chain below names the track (file tail)
         for t in 0..tl.tracks.len() {
             tl = tl.close_gaps(t).map_err(|e| (t, e))?;
         }
@@ -1685,4 +1677,55 @@ impl Timeline {
         tl.validate()?;
         Ok(tl)
     }
+}
+
+// ---- STRIAGAPSTHREE (LEDGER SR9028): one close-gaps body, keep a faded gap open, the all-tracks close validated once (named tail block) ----
+// SR857's per-track loop (with SR909's black rule folded on its `if at > end` line) is the ONE body `close_gaps_on`: the plain
+// close, the keep close and the all-tracks fast path call it; it neither clones nor validates. `keep` leaves open an inner gap
+// carrying a to-black at its start or a from-black at its end (`gap_black`, the one predicate `drop_gap_blacks` reads too), so
+// the fade stays with its gap. `close_gaps_all_once` closes every track raw and validates the finished value ONCE (a
+// coincidental half-closed pairing no longer refuses); `None` when that refuses, and SR929's chain then names the track.
+impl Timeline {
+    /// STRIAGAPSTHREE: close the gaps of `track` in place (the leading one included); with `keep`, an inner gap carrying a
+    /// black fade stays open with it. No validate: the caller validates. Refused: a bad track (`NoTrack`).
+    fn close_gaps_on(&mut self, track: usize, keep: bool) -> Result<(), EditError> {
+        let n = self.tracks.get(track).ok_or(EditError::NoTrack)?.clips.len();
+        let mut end = 0;
+        for i in 0..n {
+            let at = self.tracks[track].clips[i].at;
+            if at > end && !(keep && i > 0 && self.tracks[track].transitions.iter().any(|x| gap_black(x, end, at))) {
+                if i > 0 {
+                    self.drop_gap_blacks(track, end, at);
+                }
+                self.shift_from(track, at, end - at, None);
+            }
+            end = self.tracks[track].clips[i].end();
+        }
+        Ok(())
+    }
+
+    /// STRIAGAPSTHREE: close every gap on `track` but an inner gap carrying a black fade (to-black at its start, from-black
+    /// at its end), which stays open with its fade. Nothing to close: an equal value.
+    pub fn close_gaps_keep(&self, track: usize) -> Result<Timeline, EditError> {
+        let mut tl = self.clone();
+        tl.close_gaps_on(track, true)?;
+        tl.validate()?;
+        Ok(tl)
+    }
+
+    /// STRIAGAPSTHREE: every track closed raw ([`Timeline::close_gaps_on`]), the finished value validated ONCE; `None`
+    /// when that validate refuses.
+    fn close_gaps_all_once(&self) -> Option<Timeline> {
+        let mut tl = self.clone();
+        for t in 0..tl.tracks.len() {
+            tl.close_gaps_on(t, false).ok()?;
+        }
+        tl.validate().ok()?;
+        Some(tl)
+    }
+}
+
+/// STRIAGAPSTHREE: `x` is a black fade of the gap `start..end`: a to-black at its start or a from-black at its end.
+fn gap_black(x: &Transition, start: i64, end: i64) -> bool {
+    (x.to_black && x.at == start) || (x.from_black && x.at == end)
 }

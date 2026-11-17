@@ -3693,7 +3693,7 @@ fn striagapsblack_face_names_the_removed_fades() {
     let mut face = nlefaceexport_face(tl.clone(), src);
     face.state.select(0, 1).unwrap();
     assert!(face.verb("close-gaps"));
-    assert_eq!(face.last_error.take().as_deref(), Some("close-gaps: closed 1 gap, removed 1 fade"));
+    assert_eq!(face.note.take().as_deref(), Some("close-gaps: closed 1 gap, removed 1 fade")); // STRIAGAPSTHREE (SR9028): the success line is a face note, not an error
     assert_eq!(face.state.timeline, tl.close_gaps(0).unwrap());
     assert!(face.state.timeline.tracks[0].transitions.is_empty());
     assert_eq!(face.state.undo_depth(), 1);
@@ -3717,7 +3717,7 @@ fn striagapsalltracks_face_closes_every_track() {
     let tl = tl.add_transition_to_black(0, 20, timeline_core::TransitionKind::Dissolve, 3).unwrap();
     let mut face = nlefaceexport_face(tl.clone(), src);
     assert!(face.verb("close-gaps all"));
-    assert_eq!(face.last_error.take().as_deref(), Some("close-gaps all: closed 2 gaps, removed 1 fade"));
+    assert_eq!(face.note.take().as_deref(), Some("close-gaps all: closed 2 gaps, removed 1 fade")); // STRIAGAPSTHREE (SR9028): the success line is a face note, not an error
     assert_eq!(face.state.timeline, tl.close_gaps_all().unwrap());
     assert_eq!(face.state.undo_depth(), 1);
     let mut k = tl.clone();
@@ -3754,9 +3754,39 @@ fn striagapsmore_face_close_all_and_sync() {
     let mut face = nlefaceexport_face(tl.clone(), src);
     assert_eq!(tl.sync_gaps(), vec![(20, 25)]);
     assert!(face.verb("close-gaps sync"));
-    assert_eq!(face.last_error.take().as_deref(), Some("close-gaps sync: closed 1 gap, removed 2 fades"));
+    assert_eq!(face.note.take().as_deref(), Some("close-gaps sync: closed 1 gap, removed 2 fades")); // STRIAGAPSTHREE (SR9028): the success line is a face note, not an error
     assert_eq!(face.state.timeline, tl.close_gaps_sync().unwrap());
     assert_eq!((face.state.timeline.tracks[0].clips[2].at, face.state.timeline.tracks[1].clips[2].at), (20, 20));
     assert_eq!(face.state.undo_depth(), 1);
     println!("striagapsmore: V1 {:?} A1 {:?}", face.state.timeline.tracks[0].clips, face.state.timeline.tracks[1].clips);
+}
+
+// ---- STRIAGAPSTHREE (LEDGER SR9028): the gap notes on the face note, `close-gaps keep`, the Close Sync word (named tail block) ----
+
+/// `close-sync` sits right before `close-all` in VERBS. On the synth fixture with a to-black at 20 and a from-black at 25 on
+/// V1: `close-gaps keep` (V1 selected) keeps the faded 20..25 gap open (an equal value: no commit) and names it on the face
+/// note; a taken Input clears the note; `close-sync` is `close-gaps sync` (one commit) and its success line is a note, not an
+/// error, read by `message_text`.
+#[test]
+fn striagapsthree_note_keep_and_close_sync() {
+    let i = VERBS.iter().position(|&v| v == "close-sync").expect("close-sync in VERBS");
+    assert_eq!(VERBS[i + 1], "close-all");
+    let (tl, src) = synth_fixture();
+    let tl = tl.add_transition_to_black(0, 20, timeline_core::TransitionKind::Dissolve, 3).unwrap();
+    let tl = tl.add_transition_from_black(0, 25, timeline_core::TransitionKind::Dissolve, 3).unwrap();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    face.state.select(0, 1).unwrap();
+    assert!(face.verb("close-gaps keep"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!(face.note.as_deref(), Some("close-gaps keep: closed 0 gaps, kept 1"));
+    assert_eq!((face.state.timeline.clone(), face.state.undo_depth()), (tl.close_gaps_keep(0).unwrap(), 0));
+    assert_eq!(face.state.timeline, tl);
+    assert!(face.on(&bandy::SMessage::Input { target: stria::nle_face::SURFACE.into(), text: "zoom+".into() }));
+    assert_eq!(face.note, None, "a taken input clears the note");
+    assert!(face.verb("close-sync"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!(face.message_text().as_deref(), Some("close-gaps sync: closed 1 gap, removed 2 fades"));
+    assert_eq!(face.note.take().as_deref(), Some("close-gaps sync: closed 1 gap, removed 2 fades"));
+    assert_eq!((face.state.timeline.clone(), face.state.undo_depth()), (tl.close_gaps_sync().unwrap(), 1));
+    println!("striagapsthree: VERBS[{i}] = close-sync; V1 {:?}", face.state.timeline.tracks[0].clips);
 }
