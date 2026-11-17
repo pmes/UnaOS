@@ -231,6 +231,7 @@ pub fn axes_for(font: &Font, want: Style, size_px: Option<f32>) -> Vec<([u8; 4],
 /// ONE loaded-face cache, so two requests for the same weight share it and the raster caches (keyed on the id) see
 /// a distinct face per instance.
 /// The cache's contract is `faces_loaded`'s (one object per `face_key`, first loader wins, never evicted).
+/// Past [`INSTANCES_MAX`] instances of one (file, index, synthesis) a new coords tuple returns the nearest loaded one ([`snap_instance`], TEXTHOSTFACECACHEEVICTION SR1004).
 pub fn load_face_instance(info: &FaceInfo, bold: bool, oblique: bool, axes: &[([u8; 4], f32)]) -> Option<&'static Face> {
     let base = load_face_synth(info, bold, oblique)?;
     let font = base.font.with_variations(axes);
@@ -242,6 +243,7 @@ pub fn load_face_instance(info: &FaceInfo, bold: bool, oblique: bool, axes: &[([
     if let Some(f) = cache_get(&m, &info.path, info.index, bold, oblique, &coords[..font.coords().len()]) {
         return Some(f);
     }
+    if let Some(f) = snap_instance(&m, &info.path, info.index, bold, oblique, &coords[..font.coords().len()]) { return Some(f); } // TEXTHOST-FACE-CACHE-EVICTION (SR1004): a full family snaps, never grows
     let face: &'static Face = Box::leak(Box::new(Face {
         id: next_face_id(),
         font,
@@ -993,5 +995,90 @@ mod facecache_id_index_tests {
         for (id, key) in &m.by_id {
             assert_eq!(m.map.get(key).map(|f| f.id), Some(*id), "the index's key holds the face with its id");
         }
+    }
+}
+
+// ---- TEXTHOSTFACECACHEEVICTION (LEDGER SR1004): the instance bound and its snap (named tail block) ----
+
+/// TEXTHOSTFACECACHEEVICTION (SR1004): the most instances (non-empty coords) one (file, index, synthetic bold,
+/// synthetic oblique) family holds in the loaded-face cache (`faces_loaded`); past it [`load_face_instance`] returns
+/// the nearest loaded instance ([`snap_instance`]) instead of loading another. A BOUND, not an eviction (measured):
+/// every [`Face`] and its file bytes are `Box::leak`ed (nothing to free), and `&'static Face` / `Face.id` are held
+/// across frames (aether's `STACKS` / `FALLBACK` / `fallback_variant`, raster's `GLYPHS` / `HINTERS`), so dropping an
+/// entry would break the cache's contract; a snap inserts nothing, so the contract and `by_id` stand. A Face is its
+/// inline `Font` (borrowed tables, no owned buffer) plus a family String: <= 16 x ~2.2 KB per family.
+pub const INSTANCES_MAX: usize = 16;
+
+/// TEXTHOSTFACECACHEEVICTION (SR1004): the loaded instance a miss at `coords` snaps to once its family (`path`,
+/// `index`, `bold`, `oblique`, non-empty coords; the default instance is neither counted nor a target) holds
+/// [`INSTANCES_MAX`] entries: the least L1 distance over the F2Dot14 coords (a missing axis as 0), ties to the lower
+/// `Face.id` (the oldest). None while the family has room. The caller holds the guard; one scan, on a miss only.
+fn snap_instance(m: &LoadedMap, path: &std::path::Path, index: u32, bold: bool, oblique: bool, coords: &[i16]) -> Option<&'static Face> {
+    let family = move || m.iter().filter(move |(k, _)| !k.4.is_empty() && k.0.as_path() == path && k.1 == index && k.2 == bold && k.3 == oblique);
+    if family().count() < INSTANCES_MAX {
+        return None;
+    }
+    let l1 = |c: &[i16]| -> i32 {
+        (0..c.len().max(coords.len())).map(|i| (*c.get(i).unwrap_or(&0) as i32 - *coords.get(i).unwrap_or(&0) as i32).abs()).sum()
+    };
+    family().min_by_key(|(k, f)| (l1(&k.4), f.id)).map(|(_, f)| *f)
+}
+
+/// TEXTHOSTFACECACHEEVICTION (SR1004): how many faces the loaded-face cache holds (its map's len under the ONE lock),
+/// the witness metric (owed TEXTHOST-FACE-BYTES-WITNESS puts it on stria-view / aether's witness).
+pub fn faces_loaded_count() -> usize {
+    faces_loaded().lock().map(|m| m.map.len()).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod facecache_eviction_tests {
+    use super::*;
+
+    fn addr(f: &Face) -> usize {
+        f as *const Face as usize
+    }
+
+    /// The (path, index, no synthesis) instance family of `info` under the lock.
+    fn family_len(info: &FaceInfo) -> usize {
+        let m = faces_loaded().lock().unwrap();
+        m.keys().filter(|k| !k.4.is_empty() && k.0 == info.path && k.1 == info.index && !k.2 && !k.3).count()
+    }
+
+    /// Inter (a distinct `docs/..` path component, so every key is this test's alone) at 20 distinct weights 100, 140,
+    /// ... 860: the first 16 load 16 objects, the family stays at INSTANCES_MAX, 740..860 snap to the 700 object (the
+    /// nearest: the axis map is monotonic), 341 to the 340 object, 900 (far, the axis max) to 700 (pinned), 340 again
+    /// is a plain hit; a bold instance is a new family's object; the snap inserted nothing (`by_id` == map len);
+    /// `faces_loaded_count` brackets the lock's len; a Face's inline size is bounded.
+    #[test]
+    fn facecache_instance_bound_snap_kat() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/..").join("fonts/inter/InterVariable.ttf");
+        let inter = db::faces_in_file(&p).into_iter().next().expect("the tree's Inter face");
+        let at = |w: f32| load_face_instance(&inter, false, false, &[(*b"wght", w)]).expect("Inter instances");
+        let weights: Vec<f32> = (0..20).map(|i| 100.0 + 40.0 * i as f32).collect();
+        let faces: Vec<&'static Face> = weights.iter().map(|&w| at(w)).collect();
+        let first: std::collections::HashSet<usize> = faces[..16].iter().map(|f| addr(f)).collect();
+        assert_eq!(first.len(), 16, "the first INSTANCES_MAX load distinct objects");
+        assert_eq!(family_len(&inter), INSTANCES_MAX, "the family is capped");
+        let w700 = faces[15];
+        assert_eq!(weights[15], 700.0);
+        for f in &faces[16..] {
+            assert!(std::ptr::eq(*f, w700), "740..860 snap to the nearest loaded instance, 700");
+        }
+        assert!(std::ptr::eq(at(341.0), faces[6]), "341 snaps to the 340 object");
+        assert_eq!(weights[6], 340.0);
+        assert!(std::ptr::eq(at(900.0), w700), "a far request still snaps (pinned)");
+        assert!(std::ptr::eq(at(340.0), faces[6]), "a loaded weight is a plain hit");
+        assert_eq!(family_len(&inter), INSTANCES_MAX, "snaps load nothing");
+        let bold = load_face_instance(&inter, true, false, &[(*b"wght", 900.0)]).expect("Inter instances bold");
+        assert!(bold.synth_bold && !faces.iter().any(|f| std::ptr::eq(*f, bold)), "the bound is per synthesis family");
+        {
+            let m = faces_loaded().lock().unwrap();
+            assert_eq!(m.by_id.len(), m.map.len(), "one index entry per map entry");
+        }
+        let a = faces_loaded_count();
+        let len = faces_loaded().lock().unwrap().map.len();
+        let b = faces_loaded_count();
+        assert!(a <= len && len <= b && a > 0, "the count is the lock's len (the map never shrinks): {a} {len} {b}");
+        assert!(std::mem::size_of::<Face>() <= 2048, "a Face is {} bytes inline", std::mem::size_of::<Face>());
     }
 }
