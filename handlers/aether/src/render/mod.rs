@@ -1020,7 +1020,7 @@ fn inherit_element(inherited: &mut Inherited, tag: &str, spec: &crate::layout::P
     if let Some(ws) = spec.word_spacing {
         inherited.word_spacing = ws;
     }
-    inherited.rtl = spec.rtl.unwrap_or_else(|| crate::layout::default_rtl(dom_node, inherited.rtl));
+    inherited.rtl = spec.rtl.unwrap_or_else(|| layout_core::paint::or_tag(Some(spec), layout_core::paint::INHERIT_DIRECTION, inherited.rtl, |r| crate::layout::default_rtl(dom_node, r)));
     inherited.family = spec
         .family
         .unwrap_or_else(|| layout_core::paint::or_tag(Some(spec), layout_core::paint::INHERIT_FAMILY, inherited.family, |f| crate::layout::default_family(tag, f)));
@@ -1042,7 +1042,7 @@ fn inherit_element(inherited: &mut Inherited, tag: &str, spec: &crate::layout::P
     }
     inherited.white_space = spec
         .white_space
-        .unwrap_or_else(|| crate::layout::default_white_space(tag, inherited.white_space));
+        .unwrap_or_else(|| layout_core::paint::or_tag(Some(spec), layout_core::paint::INHERIT_WHITE_SPACE, inherited.white_space, |w| crate::layout::default_white_space(tag, w)));
     if let Some(v) = spec.word_break { inherited.word_break = v; }
     if let Some(v) = spec.overflow_wrap { inherited.overflow_wrap = v; }
     if let Some(v) = spec.letter_spacing { inherited.letter_spacing = v; }
@@ -1051,7 +1051,7 @@ fn inherit_element(inherited: &mut Inherited, tag: &str, spec: &crate::layout::P
         .unwrap_or_else(|| crate::layout::default_line_through(tag, inherited.line_through));
     // html.css list styles: ul disc (circle one level down,
     // square deeper), ol decimal; inherited into the items.
-    match tag {
+    match layout_core::paint::or_tag(Some(spec), layout_core::paint::INHERIT_LIST_STYLE, "", |_| tag) {
         "ul" | "menu" | "dir" => {
             let depth = dom_node
                 .ancestors()
