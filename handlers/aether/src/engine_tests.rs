@@ -7442,4 +7442,31 @@ mod tests {
         assert!(css_wide_color_ink(&mut e, "gi", css_wide_red) > 100, "and paints the parent's red");
         assert_eq!(font_shorthand_cs(&mut e, "gi", "backgroundColor"), "rgb(255, 0, 0)", "getComputedStyle reads red");
     }
+
+    // ---- AETHERCSSSUPPORTSVALUE (LEDGER SR1048): @supports checks the whole declaration, the value through layout_core's parse road (named tail block) ----
+
+    /// AETHERCSSSUPPORTSVALUE (SR1048): a grid-or-fallback page: `@supports (display: grid)` makes `.x` red,
+    /// `@supports not (display: grid)` makes it green; Aether cannot lay grid out, so the fallback applies (before SR1048
+    /// the name-only check answered true and `.x` painted red). `@supports (display: flex)` makes `.y` red (armed: a
+    /// supported condition still applies its block).
+    #[test]
+    fn supports_value_engine_grid_fallback() {
+        let html = r#"<!doctype html><html><head><style>
+            @supports (display: grid) { .x { color: rgb(255, 0, 0) } }
+            @supports not (display: grid) { .x { color: green } }
+            @supports (display: flex) { .y { color: rgb(255, 0, 0) } }
+            </style></head><body style="margin:0;font:20px serif">
+            <div id="x" class="x">Hello</div>
+            <div id="y" class="y">Hello</div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 600));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        assert_eq!(font_shorthand_cs(&mut e, "y", "color"), "rgb(255, 0, 0)", "armed: @supports (display: flex) applies");
+        assert!(css_wide_color_ink(&mut e, "y", css_wide_red) > 3, "armed: #y paints red");
+        assert_eq!(font_shorthand_cs(&mut e, "x", "color"), "rgb(0, 128, 0)", "the not (display: grid) fallback wins");
+        assert!(css_wide_color_ink(&mut e, "x", css_wide_green) > 3, "#x paints green");
+        assert_eq!(css_wide_color_ink(&mut e, "x", css_wide_red), 0, "#x paints no red");
+    }
 }

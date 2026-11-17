@@ -4077,3 +4077,98 @@ pub fn vendor_alias_base(prop: &str) -> Option<&str> {
         None
     }
 }
+
+// ---- AETHERCSSSUPPORTSVALUE (LEDGER SR1048): @supports asks the parse road whether the VALUE parses (named tail block) ----
+
+/// AETHERCSSSUPPORTSVALUE (SR1048): where a [`ProbeHost`]'s coverage records go — the host's own per-thread flag
+/// (this crate is `no_std` and keeps no state: a process-global flag would race between threads).
+pub trait ProbeSink: Clone + core::fmt::Debug + Default + 'static {
+    /// Clears the flag before a probe.
+    fn reset();
+    /// A record arrived: the probed value was dropped.
+    fn mark();
+    /// Whether any record arrived since [`ProbeSink::reset`].
+    fn marked() -> bool;
+}
+
+/// AETHERCSSSUPPORTSVALUE (SR1048): the host `H` under a probe: every hook delegates to `H` (the probe parses exactly as
+/// the engine does) except `record_css`, which marks `S` and never reaches `H`'s ledger. A hook added to [`Host`] must be
+/// delegated here too, or the probe parses with the trait default.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProbeHost<H, S>(core::marker::PhantomData<(H, S)>);
+
+impl<H: Host, S: ProbeSink> Host for ProbeHost<H, S> {
+    type Node = H::Node;
+    type Gradient = H::Gradient;
+    type Shadow = H::Shadow;
+
+    fn record_css(_what: &str) {
+        S::mark();
+    }
+    fn parse_gradient(value: &str) -> Option<Self::Gradient> {
+        H::parse_gradient(value)
+    }
+    fn parse_box_shadow(value: &str) -> Vec<Self::Shadow> {
+        H::parse_box_shadow(value)
+    }
+    fn shadow_is_inset(s: &Self::Shadow) -> bool {
+        H::shadow_is_inset(s)
+    }
+    fn parse_color_alpha(value: &str) -> Option<((u8, u8, u8), f32)> {
+        H::parse_color_alpha(value)
+    }
+    fn intern_family_list(value: &str) -> Option<u16> {
+        H::intern_family_list(value)
+    }
+    fn control_family() -> u16 {
+        H::control_family()
+    }
+    fn parse_object_fit(value: &str) -> Option<u8> {
+        H::parse_object_fit(value)
+    }
+    fn custom_prop(name: &str) -> Option<String> {
+        H::custom_prop(name)
+    }
+    fn transform_text(text: &str, tt: u8) -> String {
+        H::transform_text(text, tt)
+    }
+    fn media_intrinsic(node: &Self::Node) -> Option<(f32, f32)> {
+        H::media_intrinsic(node)
+    }
+    fn img_intrinsic(node: &Self::Node) -> Option<(f32, f32)> {
+        H::img_intrinsic(node)
+    }
+    fn img_state(node: &Self::Node) -> crate::ImgState {
+        H::img_state(node)
+    }
+    fn option_selected(node: &Self::Node) -> Option<bool> {
+        H::option_selected(node)
+    }
+}
+
+/// AETHERCSSSUPPORTSVALUE (SR1048): the arms that record a coverage note for a VALID value (`clear` records
+/// `property:clear` after writing any value), answered by name: the record oracle would call them unsupported.
+pub const NAME_ONLY_PROPS: &[&str] = &["clear"];
+
+/// AETHERCSSSUPPORTSVALUE (SR1048): css-conditional-3 §6.1 `@supports (prop: value)` — does this engine parse the
+/// declaration? The parse road is the oracle: [`apply_declaration`] on a scratch style under [`ProbeHost`]; a dropped
+/// value records (`<prop>-value:`, `display:grid`, `property:<name>`, ...) and answers false. A CSS-wide keyword, a
+/// value carrying `var()` (css-variables-1 §3: valid at parse time) and a [`NAME_ONLY_PROPS`] name answer true; a value
+/// an arm drops without a record still answers true (AETHER-CSS-SUPPORTS-NAME-ONLY-AUDIT owed). The name gate is the
+/// caller's.
+pub fn declaration_parses<H: Host, S: ProbeSink>(prop: &str, value: &str, cx: &ParseCx) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    if ["inherit", "initial", "unset", "revert", "revert-layer"].iter().any(|k| value.eq_ignore_ascii_case(k))
+        || value.to_ascii_lowercase().contains("var(")
+        || NAME_ONLY_PROPS.contains(&prop)
+    {
+        return true;
+    }
+    S::reset();
+    let mut scratch = SpecifiedStyle::<ProbeHost<H, S>>::default();
+    apply_declaration(prop, value, &mut scratch, cx);
+    !S::marked()
+}
