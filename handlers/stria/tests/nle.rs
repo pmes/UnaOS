@@ -3811,3 +3811,26 @@ fn striamultiselectmore_set_drag_down_to_another_video_track_one_undo() {
     assert!(face.verb("undo"));
     assert_eq!(face.state.timeline, tl0);
 }
+
+// ---- STRIAMULTISELECTNEXT (LEDGER SR998): a shift-click on a set member keeps the user's primary (named tail block) ----
+#[test]
+fn striamultiselectnext_shift_click_member_keeps_primary() {
+    let (tl, src) = stria::nle_face::synth_fixture();
+    let mut face = stria::nle_face::Face::new(stria::nle_face::EditorState::new(tl), src, (320, 160), stria::nle_face::PixelOrder::Rgba, false);
+    let tl0 = face.state.timeline.clone();
+    let (x0, y0) = face.layout().point(0, 5); // V1's A@0
+    let (x1, y1) = face.layout().point(0, 15); // V1's B@10
+    let (x2, y2) = face.layout().point(0, 28); // V1's third clip@25
+    face.on(&nle3eslipdrag_btn(true, x0, y0, 0));
+    face.on(&nle3eslipdrag_btn(false, x0, y0, 0));
+    for (x, y) in [(x1, y1), (x2, y2)] {
+        face.on(&nle3eslipdrag_btn(true, x, y, bandy::MOD_SHIFT));
+        face.on(&nle3eslipdrag_btn(false, x, y, bandy::MOD_SHIFT));
+    }
+    assert_eq!((face.state.selection, face.state.set.clone()), (Some((0, 2)), vec![(0, 0), (0, 1), (0, 2)]));
+    face.on(&nle3eslipdrag_btn(true, x1, y1, bandy::MOD_SHIFT));
+    assert_eq!(face.state.selection, Some((0, 2)), "the press does not take the primary");
+    assert!(face.on(&nle3eslipdrag_btn(false, x1, y1, bandy::MOD_SHIFT)));
+    assert_eq!((face.state.selection, face.state.set.clone()), (Some((0, 2)), vec![(0, 0), (0, 2)]), "B out, the primary kept");
+    assert_eq!((&face.state.timeline, face.state.undo_depth()), (&tl0, 0), "view-only");
+}

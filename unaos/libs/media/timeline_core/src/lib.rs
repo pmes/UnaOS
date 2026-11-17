@@ -1532,7 +1532,7 @@ impl Timeline {
 // ---- STRIAMULTISELECTMORE (LEDGER SR950): a set moved to another track (named tail block) ----
 // `move_many`'s all-leave / all-land with every clip landing `dtrack` tracks away: `move_clip`'s rules per clip (a track
 // that does not exist is `NoTrack`, one of the other kind is `Kind`), then `move_clip`'s road (`retarget_transitions`,
-// `validate`): a transitioned cut whose clips leave their track is refused `Transition` by name, never carried.
+// `validate`): a transitioned cut whose clips ALL move is carried to their new track (STRIAMULTISELECTNEXT `carry_cuts`), one with a side left behind is refused `Transition` by name.
 
 impl Timeline {
     /// Move every clip in `picks` by `delta` ticks AND by `dtrack` tracks as ONE transaction (refused whole). `dtrack == 0`
@@ -1559,8 +1559,57 @@ impl Timeline {
         for t in &mut tl.tracks {
             sort(t);
         }
-        tl.retarget_transitions(self)?;
+        tl.retarget_transitions(&self.carry_cuts(picks, dtrack))?; // STRIAMULTISELECTNEXT (SR998): a fully picked cut is carried (file tail)
         tl.validate()?;
         Ok(tl)
+    }
+}
+
+// ---- STRIAMULTISELECTNEXT (LEDGER SR998): a set's transitioned cuts carried across tracks (named tail block) ----
+// `move_many_track` hands the ONE matcher (`retarget_transitions`) this `before` instead of `self`: the picked clips laid on
+// the track `dtrack` away at their OWN ticks, and every transition / explicit audio crossfade whose cut's clips (those
+// starting or ending at it) are ALL picked moved to that track with them. The matcher then finds the cut where the clips
+// went; a cut with an unpicked side stays behind and is refused `Transition`, as before. `validate` stays the one gate.
+impl Timeline {
+    /// The reference state a cross-track set move retargets against (see the block comment). Picks are already checked by
+    /// the caller; a pick whose track has no destination is left where it is.
+    fn carry_cuts(&self, picks: &[(usize, usize)], dtrack: isize) -> Timeline {
+        let to = |t: usize| t.checked_add_signed(dtrack).filter(|&u| u < self.tracks.len());
+        let whole = |t: usize, at: i64| {
+            let mut touch = self.tracks[t].clips.iter().enumerate().filter(|(_, c)| c.at == at || c.end() == at).map(|(i, _)| i).peekable();
+            touch.peek().is_some() && touch.all(|i| picks.contains(&(t, i)))
+        };
+        let mut pre = self.clone();
+        let mut order: Vec<(usize, usize)> = picks.to_vec();
+        order.sort_unstable_by(|a, b| b.cmp(a));
+        order.dedup();
+        for (t, i) in order {
+            let Some(u) = to(t) else { continue };
+            if i < pre.tracks[t].clips.len() {
+                let c = pre.tracks[t].clips.remove(i);
+                pre.tracks[u].clips.push(c);
+            }
+        }
+        let mut carried: Vec<(usize, Transition)> = Vec::new();
+        for (t, tr) in self.tracks.iter().enumerate() {
+            let Some(u) = to(t) else { continue };
+            pre.tracks[t].transitions = tr.transitions.iter().filter(|x| !whole(t, x.at)).copied().collect();
+            carried.extend(tr.transitions.iter().filter(|x| whole(t, x.at)).map(|x| (u, *x)));
+        }
+        for (u, x) in carried {
+            pre.tracks[u].transitions.push(x);
+        }
+        for tr in &mut pre.tracks {
+            sort(tr);
+            tr.transitions.sort_by_key(|x| x.at);
+        }
+        for x in &mut pre.audio_xfades {
+            let (t, at) = (x.track, x.at);
+            if let Some(u) = to(t).filter(|_| t < self.tracks.len() && whole(t, at)) {
+                x.track = u;
+            }
+        }
+        pre.audio_xfades.sort_by_key(|x| (x.track, x.at));
+        pre
     }
 }
