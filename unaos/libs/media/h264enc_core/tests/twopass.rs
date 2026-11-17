@@ -27,7 +27,7 @@
 //! the counts, a v1 text and a bad count refuse by name. Test f's tampered line keeps the v2 count token.
 
 use h264_core::Decoder;
-use h264enc_core::rc::{Pass2Opts, PicStat, QP_MAX, QP_MIN, QP_STEP, STATS_VERSION, StatsError, blur_complexity, exp_neg_q16, intra_keep_q16, pass2_qps, qpstep_clamp, qpstep_limit, read_stats, rescale_stats, step16, write_stats};
+use h264enc_core::rc::{Pass2Opts, PicStat, QP_MAX, QP_MIN, QP_STEP, STATS_VERSION, StatsError, blur_complexity, exp_neg_q16, intra_keep_q16, pass2_qps, qpstep_clamp, qpstep_limit, qpstep_seed, IP_QP_OFFSET, read_stats, rescale_stats, step16, write_stats};
 use h264enc_core::{Access, Config, Encoder, Error, Pic, RateControl, Yuv420};
 
 const W: usize = 128;
@@ -761,4 +761,48 @@ fn x_the_bucket_raise_wins_over_the_clamp() {
     assert!(held[16..].iter().all(|&q| q == QP_MAX), "the raise reaches QP_MAX under the clamp: {held:?}");
     assert_eq!(held[16..], free[16..], "the clamp never holds the raise back");
     assert_eq!(hb[16..], fb[16..]);
+}
+
+// ---- H264ENCTWOPASSQPSTEPFIRSTP (LEDGER SR804): the frame-0 seed of the runtime clamp (named tail block) ----
+
+#[test]
+fn y_qpstep_seed_rules() {
+    // The last coded picture of any type moved to the P level: an I + IP_QP_OFFSET, a P unchanged, a B less B_QP_OFFSET.
+    assert_eq!(qpstep_seed(Some((Pic::Idr, 28)), Pic::P), Some(28 + IP_QP_OFFSET));
+    assert_eq!(qpstep_seed(Some((Pic::P, 30)), Pic::P), Some(30));
+    assert_eq!(qpstep_seed(Some((Pic::B, 32)), Pic::P), Some(30));
+    // Nothing coded yet: no seed. Only the P is seeded (a B is never clamped; an I keeps the plan's I rule).
+    assert_eq!(qpstep_seed(None, Pic::P), None);
+    assert_eq!(qpstep_seed(Some((Pic::P, 30)), Pic::B), None);
+    assert_eq!(qpstep_seed(Some((Pic::P, 30)), Pic::Idr), None);
+    // The seed feeds SR769's clamp: an I at 28 holds a first P planned at 20 to 31 - 4.
+    assert_eq!(qpstep_clamp(20, qpstep_seed(Some((Pic::Idr, 28)), Pic::P), 4, (false, false)), 27);
+}
+
+/// A 30-picture record whose first P pictures are cheap: an IDR, P 1..=5 of `p` bits, P 6.. of `k` x p. The plan's backward
+/// qpstep ramp leaves P1 far below the GOP's mean P QP, where the I rule plants the I (mean - IP_QP_OFFSET).
+fn fp_plan(p: u64, k: u64) -> Vec<PicStat> {
+    (0..N).map(|i| if i == 0 { pic(Pic::Idr, 30 * p) } else if i <= 5 { pic(Pic::P, p) } else { pic(Pic::P, k * p) }).collect()
+}
+
+// (z) fixture, tuned and named: fp_plan(1, 10000) coded from scene() at 60 kbps, sharp. The plan: I 33, P1..5 19 23 27 31 35 (the
+// backward ramp), P6.. 39. Measured: qpstep 0 codes I 29 / P1 17 (seed 32: 15 away); qpstep 4 on the pre-SR804 tree coded I 32 /
+// P1 19 (seed 35: 16 away, SR769's clamp off for the first P); with the seed I 32 / P1 31. k 100 and 1000 did not bite (their
+// plans ramp 9 QP, `off` lifts P1 onto the seed).
+const FP_P: u64 = 1;
+const FP_K: u64 = 10000;
+const FP_KBPS: u32 = RT_KBPS;
+
+#[test]
+fn z_first_p_held_against_the_seed() {
+    let sharp = Pass2Opts { cplxblur: 0, qblur_q8: 0, ..Pass2Opts::default() };
+    let plan = fp_plan(FP_P, FP_K);
+    println!("twopassqpstepfirstp plan {:?}", pass2_qps(&plan, FP_KBPS as u64 * 1000 * N as u64 / FPS as u64, QP_MIN, &sharp));
+    let (_, free) = rt_encode(FP_KBPS, &plan, &Pass2Opts { qpstep: 0, ..sharp }, &scene);
+    let (_, held) = rt_encode(FP_KBPS, &plan, &sharp, &scene);
+    println!("twopassqpstepfirstp qpstep=0 seed={} {free:?}", free[0] + IP_QP_OFFSET);
+    println!("twopassqpstepfirstp qpstep=4 seed={} {held:?}", held[0] + IP_QP_OFFSET);
+    assert!((free[1] - (free[0] + IP_QP_OFFSET)).abs() > 2 * 4, "the premise: unclamped, the first P sits past 2 x qpstep from the seed: {free:?}");
+    assert!((held[1] - (held[0] + IP_QP_OFFSET)).abs() <= 2 * 4, "the first P within 2 x qpstep of the IDR's QP + IP_QP_OFFSET: {held:?}");
+    assert_ne!(held[1], free[1], "the seed moves the first P: {held:?} vs {free:?}");
 }

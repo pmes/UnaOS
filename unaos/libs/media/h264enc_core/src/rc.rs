@@ -613,7 +613,7 @@ impl Rc {
         let rb = (p.total - p.spent).clamp(rp / 2, 2 * rp).max(1);
         let share = (p.bits[p.n].max(1) as i128 * rb as i128 / rp as i128) as i64;
         let off = ((6 * (log2_q16(rp as u64) - log2_q16(rb as u64)) + (1 << 15)) >> 16).clamp(-PIC_STEP as i64, PIC_STEP as i64) as i32;
-        let mut qp = (p.qps[p.n] + off).clamp(self.floor, QP_MAX); qp = qpstep_clamp(qp, self.pass2_last(t), p.qpstep, (off < 0, off > 0 && p.n > 3)); // H264ENCTWOPASSQPSTEPRUNTIME (SR769): x264's lstep clamp before the bucket
+        let mut qp = (p.qps[p.n] + off).clamp(self.floor, QP_MAX); qp = qpstep_clamp(qp, self.pass2_last(t).or_else(|| qpstep_seed(p.n.checked_sub(1).map(|i| (p.kinds[i], self.last_qp)), p.kinds[p.n])), p.qpstep, (off < 0, off > 0 && p.n > 3)); // H264ENCTWOPASSQPSTEPRUNTIME (SR769): x264's lstep clamp before the bucket
         let room = (self.buf - self.full).max(self.r / 8);
         let m = self.types[t];
         while m.coded && qp < QP_MAX && m.predict(s, qp) > room as u128 {
@@ -1146,4 +1146,27 @@ impl Rc {
         let m = self.types[t];
         (m.coded && (t == 1 || (t == 0 && after_i))).then_some(m.qp)
     }
+}
+
+// ---- H264ENCTWOPASSQPSTEPFIRSTP (LEDGER SR804): the frame-0 seed of the runtime clamp (named tail block) ----
+// SR769's owed H264ENC-TWOPASS-QPSTEP-FIRSTP. x264's `ratecontrol_new` seeds `last_qscale_for[type]` at init (recalled:
+// qp2qscale(ABR_INIT_QP), 24 in 1-pass ABR), so its lstep clamp holds the stream's FIRST P too, against the seed. Here the first P
+// has no last coded P (`Rc::pass2_last` None: `types[1].coded` false), so `pass2_pick` holds it against [`qpstep_seed`]: the last
+// coded picture of any type (`Rc.last_qp`, its kind the plan's previous entry) moved to the P level, an I by [`IP_QP_OFFSET`]
+// (the plan's I rule read backward), a B by -`B_QP_OFFSET`. Only the P is seeded, the one x264 seed reachable under our rules: a B
+// is never clamped (x264's B path returns before lmin / lmax) and an I after a P keeps the plan's I rule (SR769). Departure,
+// named: the seed is the coded neighbour, not x264's constant 24 (a constant would drag a QP-40 planned stream's first P toward
+// 24). qpstep 0 = no clamp (qpstep_clamp's own rule). `types` is never reset, so a P after a scene-cut I is held against the last
+// P before the cut. Owed: H264ENC-TWOPASS-QPSTEP-SCENECUT.
+
+/// The QP the runtime clamp holds the first `want` picture against when its type has no last coded picture (H264ENCTWOPASSQPSTEPFIRSTP
+/// SR804): `last_any`'s QP moved to the P level (an I + [`IP_QP_OFFSET`], a P unchanged, a B - `B_QP_OFFSET`); None when
+/// `last_any` is None or `want` is not [`Pic::P`].
+pub fn qpstep_seed(last_any: Option<(Pic, i32)>, want: Pic) -> Option<i32> {
+    let (kind, qp) = last_any.filter(|_| want == Pic::P)?;
+    Some(match kind {
+        Pic::Idr => qp + IP_QP_OFFSET,
+        Pic::P => qp,
+        Pic::B => qp - B_QP_OFFSET,
+    })
 }
