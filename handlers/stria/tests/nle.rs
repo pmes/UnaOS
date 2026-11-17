@@ -9761,3 +9761,52 @@ fn striahelpsearchlive_paint_matches_the_word_form() {
     assert_eq!(plain.paint(), a, "labels off: no overlay");
     println!("striahelpsearchlive: typed slip fnv {:016x}", stria::nle_face::fnv1a(&want));
 }
+
+// ---- STRIASOURCEINFOKEY (LEDGER SR942): Ctrl / Cmd+I, and the info line's seconds in wall time (named tail block) ----
+/// Rule: `Ctrl+i` and `Meta+i` (BrowserKey) each stand the selected clip's reel line through the one `info` word: no undo
+/// step, not dirty; a bare `i` (text) is still `mark-in` and stands no info line.
+#[test]
+fn striasourceinfokey_ctrl_i_and_meta_i_stand_the_line() {
+    for chord in ["Ctrl+i", "Meta+i"] {
+        let mut face = striasourceinfo_face();
+        let (undo, tl) = (face.state.undo_depth(), face.state.timeline.clone());
+        assert!(face.on(&bandy::SMessage::BrowserKey(chord.to_string())), "{chord}");
+        assert!(face.last_error.is_none(), "{chord}: {:?}", face.last_error);
+        assert!(face.info_pending(), "{chord}");
+        assert!(face.message_text().is_some_and(|m| m.starts_with("info: B: ")), "{chord}: {:?}", face.message_text());
+        assert_eq!((face.state.undo_depth(), face.dirty(), face.state.timeline == tl), (undo, false, true), "{chord}");
+    }
+    let mut face = striasourceinfo_face();
+    let _ = face.on(&bandy::SMessage::BrowserText("i".to_string()));
+    let _ = face.last_error.take();
+    assert!(!face.info_pending(), "a bare i is mark-in, not info");
+    println!("striasourceinfokey: Ctrl+i / Meta+i stand the info line; i stays mark-in");
+}
+
+/// Rule: the help names the chords: the row whose phrase is `help_phrase("info")` lists `Ctrl+i` and `Meta+i`.
+#[test]
+fn striasourceinfokey_help_names_the_chords() {
+    assert!(KEYS.contains(&("Ctrl+i", "info")) && KEYS.contains(&("Meta+i", "info")));
+    let phrase = help_phrase("info");
+    assert!(!phrase.is_empty() && phrase != "info", "a phrase, not the word");
+    let rows = help_rows();
+    let row = rows.iter().find(|r| r.1 == phrase).expect("the info row");
+    assert!(row.0.split(" / ").any(|k| k == "Ctrl+i") && row.0.split(" / ").any(|k| k == "Meta+i"), "{:?}", row.0);
+    println!("striasourceinfokey: help row {row:?}");
+}
+
+/// Rule: the line ends at INFO_SECS of wall time even with face ticks left (the ticks `serve` drops under Skip no longer
+/// make it outstay): at +4 s it stands, at +5 s ONE tick ends it and asks a repaint.
+#[test]
+fn striasourceinfokey_wall_deadline_ends_it() {
+    let mut face = striasourceinfo_face();
+    assert!(face.verb("info"));
+    let t0 = std::time::Instant::now();
+    assert!(!face.info_tick_at(t0 + std::time::Duration::from_secs(4)));
+    assert!(face.info_pending());
+    assert!(face.message_text().is_some_and(|m| m.starts_with("info: B: ")), "{:?}", face.message_text());
+    assert!(face.info_tick_at(t0 + std::time::Duration::from_secs(stria::nle_face::INFO_SECS as u64)), "the deadline tick repaints");
+    assert!(!face.info_pending());
+    assert_eq!(face.info_text(), None);
+    println!("striasourceinfokey: standing at +4 s, ended at +{} s after 2 of {} ticks", stria::nle_face::INFO_SECS, stria::nle_face::INFO_SECS * 25);
+}

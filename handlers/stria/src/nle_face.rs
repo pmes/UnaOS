@@ -429,7 +429,9 @@ pub const KEYS: &[(&str, &str)] = &[
     ("c", "xfade"), // STRIAXFADECURVEBUTTON (SR925): c / C (Shift+c, text) put / take the crossfade and swap its curve (x is the kernel's delete, X the mark clear)
     ("C", "xfade-curve"),
     ("v", "gain-"), ("V", "gain+"), (":", "track-gain-"), ("\"", "track-gain+"), ("Q", "mute"), ("S", "solo"), // STRIATRACKGAINKEYS (SR926): text keys for the audio words (Face::verb: the buttons' commit and message line; the natural - / = / m / s are taken)
-    ("h", "history"), ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
+    ("h", "history"), ("Ctrl+i", "info"), // STRIASOURCEINFOKEY (SR942): Ctrl / Cmd+I (the platform's Get Info chord) stands the selected clip's reel line (`i` / `I` are the marks)
+    ("Meta+i", "info"),
+    ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
     ("E", "export-skip"), // STRIAEXPORTQUEUELIST (SR932): Shift+e (text, both faces) skips the running export through the `export-skip` word; STRIAUNDOJUMP (SR934): `h` lists the undo history
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
@@ -2664,7 +2666,8 @@ pub const HELP: &[(&str, &str)] = &[
     ("xfade", "put / take the selected audio clip's crossfade"), // STRIAXFADECURVEBUTTON (SR925)
     ("xfade-curve", "switch the crossfade's curve linear / equal"),
     ("gain-", "clip gain down one step"), ("gain+", "clip gain up one step"), ("track-gain-", "track gain down 1 dB"), ("track-gain+", "track gain up 1 dB"), ("mute", "mute / unmute the clip's track"), ("solo", "solo / unsolo the clip's track"), // STRIATRACKGAINKEYS (SR926)
-    ("history", "list the last undo steps"), ("help", "show / hide this help"),
+    ("history", "list the last undo steps"), ("info", "name the selected clip's source for 5 seconds"), // STRIASOURCEINFOKEY (SR942): the Ctrl+i / Meta+i row
+    ("help", "show / hide this help"),
     ("export-skip", "skip the running export (the next waiting one starts)"), // STRIAEXPORTQUEUELIST (SR932): the `E` row // STRIAUNDOJUMP (SR934)
 ];
 /// NLE5DKEYSHELP (SR744): the help's inset from the band's top and left (px).
@@ -3311,7 +3314,7 @@ impl Face {
             self.peaks.scans += 1;
         }
     }
-    /// STRIAWAVEFORM (SR827): the peak scans this face has made.
+/// STRIAWAVEFORM (SR827): the peak scans this face has made.
     pub fn wave_scans(&self) -> u32 {
         self.peaks.scans
     }
@@ -4573,9 +4576,9 @@ impl Face {
 // SR789 hover dwell is; `serve` runs its clock while `info_pending`), over the hover and export lines, under a fresh error,
 // ended by a selection change. View-only: no undo step, the document not dirtied. Owed: STRIA-SOURCE-INFO-KERNEL (the
 // kernel face's word), STRIA-SOURCE-INFO-BIN (a source bin's selection, not the clip's), STRIA-SOURCE-INFO-MS (the
-// seconds in timeline-rate face ticks, not wall ms), STRIA-SOURCE-INFO-KEY (no KEYS binding: `i` is `in`).
+// seconds in wall time) and STRIA-SOURCE-INFO-KEY (Ctrl+i / Meta+i) BUILT by SR942 (STRIASOURCEINFOKEY tail block).
 
-/// STRIASOURCEINFO (SR875): the seconds an `info` line stands (face ticks: this times the timeline's frame rate).
+/// STRIASOURCEINFO (SR875): the seconds an `info` line stands: wall time, or this times the timeline's frame rate in face ticks, whichever ends first (STRIASOURCEINFOKEY SR942).
 pub const INFO_SECS: u32 = 5;
 
 /// STRIASOURCEINFO (SR875): a standing `info` line: the selection it names, its text, the face ticks it has left.
@@ -4584,6 +4587,7 @@ struct SourceInfo {
     sel: (usize, usize),
     text: String,
     left: u32,
+    since: std::time::Instant, // STRIASOURCEINFOKEY (SR942): when the line was stood (the wall deadline is since + INFO_SECS)
 }
 
 impl Face {
@@ -4608,7 +4612,7 @@ impl Face {
         match self.clip_reel_line(c) {
             Some(line) => {
                 let left = INFO_SECS * self.state.timeline.fps().unwrap_or(25).max(1);
-                self.info = Some(SourceInfo { sel, text: format!("info: {line}"), left });
+                self.info = Some(SourceInfo { sel, text: format!("info: {line}"), left, since: std::time::Instant::now() }); // STRIASOURCEINFOKEY (SR942): the wall stamp
             }
             None => {
                 let name = self.state.timeline.source(c.src).map_or_else(|| c.src.0.to_string(), |x| x.reel.clone());
@@ -4623,19 +4627,34 @@ impl Face {
     }
     /// STRIASOURCEINFO (SR875): one face tick of a standing line: its count falls; at 0, or once the selection changed,
     /// it ends. True only on the tick it ends (the message repaints).
-    fn info_tick(&mut self) -> bool {
+    fn info_tick(&mut self) -> bool { self.info_tick_at(std::time::Instant::now()) } // STRIASOURCEINFOKEY (SR942): the wall read on the clock path, as export_tick's (file tail)
+    /// STRIASOURCEINFO (SR875): an `info` line stands: `serve` runs its clock.
+    pub fn info_pending(&self) -> bool {
+        self.info.is_some()
+    }
+}
+
+// ---- STRIASOURCEINFOKEY (LEDGER SR942): Ctrl / Cmd+I, and the line's seconds in wall time (named tail block) ----
+// `info` gains its keys: KEYS rows `Ctrl+i` / `Meta+i` (`i` is `mark-in`, `I` is `mark in`) reach `info_verb` through
+// `Face::key`'s VERBS road, with a HELP phrase. SR875 counted the line's INFO_SECS in face ticks only, and `serve`'s clock
+// drops the ticks it misses while the face thread is busy (`MissedTickBehavior::Skip`), so on a busy face the line outstayed
+// five seconds. The line now ends at the FIRST of INFO_SECS of wall time (stamped at the word, read on the clock path as
+// `export_tick` reads it, never in paint), INFO_SECS x fps face ticks (the witness's `tick:N` clock), or a selection change.
+// Owed: STRIA-SOURCE-INFO-KEY-MAC (the AppKit surface forwards only Cmd+C/A/S/O: `Meta+i` does not arrive there, as `Meta+z`).
+
+impl Face {
+    /// STRIASOURCEINFOKEY (SR942): one face tick of a standing `info` line at wall time `now`: its count falls; at 0, at
+    /// `since + INFO_SECS`, or once the selection changed, it ends. True only on the tick it ends (the message repaints).
+    pub fn info_tick_at(&mut self, now: std::time::Instant) -> bool {
         let Some(i) = self.info.as_mut() else { return false };
         i.left = i.left.saturating_sub(1);
-        if i.left == 0 || self.state.selection != Some(i.sel) {
+        if i.left == 0 || now >= i.since + Duration::from_secs(INFO_SECS as u64) || self.state.selection != Some(i.sel) {
             self.info = None;
             return true;
         }
         false
     }
-    /// STRIASOURCEINFO (SR875): an `info` line stands: `serve` runs its clock.
-    pub fn info_pending(&self) -> bool {
-        self.info.is_some()
-    }
+    
 }
 
 // ---- STRIAEXPORTQUEUE (LEDGER SR881): queued export requests run in order from export_tick (named tail block) ----
