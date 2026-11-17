@@ -1601,7 +1601,7 @@ impl Face {
             };
         }
         let still = if role == Role::Tracks { None } else { self.still.as_ref() };
-        let px = self.paint_message(paint_labelled(st, l, self.order, self.labels.as_ref().map(|s| Labels(s, Some(&self.lcache))), still), l, role); // STRIAINFOREEL (SR743): the message line at the preview band's foot (file tail); STRIAPERFLABELSHAPE (SR935): labels through the face's cache (file tail)
+        let px = self.paint_message(self.pcache.band(l, vo(self.order), still, self.playing || self.drag.is_some(), |s| paint_labelled(st, l, self.order, self.labels.as_ref().map(|s| Labels(s, Some(&self.lcache))), s)), l, role); // STRIAINFOREEL (SR743): the message line at the preview band's foot (file tail); STRIAPERFLABELSHAPE (SR935): labels through the face's cache (file tail); STRIAPERFTHREE (SR9037): the band's pixels kept by still (file tail)
         if role == Role::Preview {
             return paint_meters(px, l, self.order, &self.meter_levels());
         }
@@ -3118,6 +3118,7 @@ struct PreviewCache {
     key: Option<(Timeline, i64)>,
     renders: u64,
     played: Option<(Timeline, i64)>, // STRIAPERFMORE (SR974): the last played render's (timeline, playhead) when it rendered one tick (file tail)
+    band: std::sync::Mutex<Option<BandPx>>, // STRIAPERFTHREE (SR9037): the painted preview band kept by still (file tail)
     summaries: std::sync::Mutex<(Vec<(SourceId, Option<String>)>, u64)>,
 }
 
@@ -3545,5 +3546,126 @@ mod striaperfmore_tests {
         assert_eq!(g.preview_renders(), 1, "the seeded key is the timeline the tick read");
         let want = preview(&g.state.timeline, &g.sources, g.state.playhead).expect("renders");
         assert_eq!(g.still().cloned(), want);
+    }
+}
+
+// ---- STRIAPERFTHREE (LEDGER SR9037): the painted preview band kept by still (named tail block) ----
+// SR890 measured `paint_in` filling the preview band FIELD and nearest-scaling the still into it per output pixel on every
+// paint. Inside the one painter nothing else paints rows `0..preview_h` (the ruler, markers, rows and playhead start at
+// `ruler_y >= preview_h`; label glyphs rise at most 9 / 15 px over baselines `ry + 9` / `y0 + 15`), so the band's bytes are a
+// function of (the still, the width, min(preview_h, h), the byte order) alone. SR918's `PreviewCache` now keeps those bytes
+// from the paint that made them, keyed on the still's VALUE (the fold's slip pair and scrub stills are other values, so a
+// generation key would go stale); a repeat paint paints without the still and copies the kept band back: the same bytes,
+// no blit re-implemented. Bypassed while playing or dragging (a new still every paint). Overlays painted after `paint_in`
+// returns (the message row, meters, help, the siblings' outlines) stay outside `band`. Owed: NLE-PERF-DAMAGE.
+
+/// STRIAPERFTHREE (SR9037): the band's key (width, rows, byte order, the still), its bytes, and the hits made.
+struct BandPx {
+    w: u32,
+    rows: u32,
+    order: Order,
+    still: Still,
+    px: Vec<u8>,
+    hits: u64,
+}
+
+impl PreviewCache {
+    /// THE paint `paint` (timeline_core's `paint_in` with the face's labels) with the band rows `0..min(preview_h, h)` kept
+    /// by `still`: a hit paints with no still and copies the kept rows back; a miss paints with the still and keeps its rows.
+    /// No still, `moving` (playing / a drag) or an empty band: `paint(still)` as before.
+    fn band(&self, l: Layout, order: Order, still: Option<&Still>, moving: bool, paint: impl FnOnce(Option<&Still>) -> Vec<u8>) -> Vec<u8> {
+        let rows = l.preview_h.min(l.h);
+        let n = l.w as usize * rows as usize * 4;
+        let Some(s) = still.filter(|_| !moving && n > 0) else { return paint(still) };
+        let mut g = self.band.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(b) = g.as_mut().filter(|b| b.w == l.w && b.rows == rows && b.order == order && b.still == *s) {
+            let mut px = paint(None);
+            if px.len() >= n && b.px.len() == n {
+                px[..n].copy_from_slice(&b.px);
+                b.hits += 1;
+                return px;
+            }
+            return paint(Some(s));
+        }
+        let px = paint(Some(s));
+        if px.len() >= n {
+            let hits = g.as_ref().map_or(0, |b| b.hits);
+            *g = Some(BandPx { w: l.w, rows, order, still: s.clone(), px: px[..n].to_vec(), hits });
+        }
+        px
+    }
+}
+
+impl Face {
+    /// STRIAPERFTHREE (SR9037): how many paints copied the kept preview band instead of scaling the still.
+    pub fn band_hits(&self) -> u64 {
+        self.pcache.band.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |b| b.hits)
+    }
+}
+
+#[cfg(test)]
+mod striaperfthree_tests {
+    use super::*;
+
+    fn face(order: PixelOrder, labels: bool) -> Face {
+        let (tl, src) = synth_fixture();
+        let mut f = Face::new(EditorState::new(tl), src, (320, 240), order, labels);
+        f.state.playhead = 3;
+        f
+    }
+
+    fn pixels(blits: Vec<SMessage>) -> Vec<u8> {
+        match blits.into_iter().last() {
+            Some(SMessage::SurfaceBlit { pixels, .. }) => pixels,
+            _ => panic!("a blit"),
+        }
+    }
+
+    /// STRIAPERFTHREE M3: a repeat paint copies the kept band and paints the same bytes.
+    #[test]
+    fn striaperfthree_band_repaint_copies() {
+        let mut f = face(PixelOrder::Rgba, false);
+        let a = pixels(f.frames());
+        assert!(f.still().is_some(), "the synth reel gives a still at tick 3");
+        assert_eq!(f.band_hits(), 0);
+        let b = pixels(f.frames());
+        assert_eq!(f.band_hits(), 1);
+        assert_eq!(a, b);
+    }
+
+    /// STRIAPERFTHREE M3: a hit's bytes are a miss's bytes, in both byte orders, labels on.
+    #[test]
+    fn striaperfthree_band_bytes_identical() {
+        for order in [PixelOrder::Rgba, PixelOrder::Bgra] {
+            let mut a = face(order, true);
+            a.frames();
+            let hit = pixels(a.frames());
+            assert_eq!(a.band_hits(), 1);
+            let mut b = face(order, true);
+            assert_eq!(hit, pixels(b.frames()), "{order:?}");
+        }
+    }
+
+    /// STRIAPERFTHREE M3: a new still misses and paints what a fresh face paints; playing bypasses the band.
+    #[test]
+    fn striaperfthree_band_key_and_motion() {
+        let mut f = face(PixelOrder::Rgba, false);
+        f.frames();
+        f.state.playhead = 10;
+        let got = pixels(f.frames());
+        assert_eq!(f.band_hits(), 0, "a new still is a miss");
+        let mut fresh = face(PixelOrder::Rgba, false);
+        fresh.state.playhead = 10;
+        assert_eq!(got, pixels(fresh.frames()));
+        f.frames();
+        assert_eq!(f.band_hits(), 1);
+        f.playing = true;
+        f.frames();
+        assert_eq!(f.band_hits(), 1, "playing: the band is not read");
+        f.playing = false;
+        let none = PreviewCache::default();
+        let l = view::Layout::of(320, 240, &f.state);
+        let px = none.band(l, Order::Rgba, None, false, |s| { assert!(s.is_none()); vec![7; 4] });
+        assert_eq!(px, vec![7; 4], "no still: the paint as before");
     }
 }

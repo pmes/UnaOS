@@ -117,10 +117,7 @@ impl core::fmt::Display for EdlError {
 
 /// `HH:MM:SS:FF` for tick `t` at `fps`.
 pub fn timecode(t: i64, fps: u32) -> String {
-    let fps = fps.max(1) as i64;
-    let t = t.max(0);
-    let (ff, s) = (t % fps, t / fps);
-    format!("{:02}:{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60, ff)
+    let mut out = String::new(); timecode_in(&mut out, t, fps); out // STRIAPERFTHREE (SR9037): the one grammar is `timecode_in` (file tail)
 }
 
 /// Ticks for `HH:MM:SS:FF` at `fps`.
@@ -624,4 +621,17 @@ fn mark_line(tl: &Timeline) -> String {
         (None, None) => String::new(),
         (a, b) => format!("* UNA MARK {} {}\n", word(a), word(b)),
     }
+}
+
+// ---- STRIAPERFTHREE (LEDGER SR9037): the timecode written into a caller's buffer (named tail block) ----
+/// `HH:MM:SS:FF` for `t` at `fps` written into `out` (cleared first), returned as a str: THE timecode grammar ([`timecode`]
+/// wraps it), so the ruler's paint reuses one buffer for every second mark instead of a String each.
+pub fn timecode_in(out: &mut String, t: i64, fps: u32) -> &str {
+    use core::fmt::Write;
+    let fps = fps.max(1) as i64;
+    let t = t.max(0);
+    let (ff, s) = (t % fps, t / fps);
+    out.clear();
+    let _ = write!(out, "{:02}:{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60, ff);
+    out.as_str()
 }

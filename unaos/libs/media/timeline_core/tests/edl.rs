@@ -392,3 +392,18 @@ fn nle5drangesave_the_editors_mark_words_commit_and_write() {
     assert_eq!(st.verb("mark sideways"), None, "not a mark word");
     assert_eq!(edl::write(&st.timeline, "CUT ONE").unwrap(), CUT);
 }
+
+// ---- STRIAPERFTHREE (LEDGER SR9037): timecode_in is timecode into a reused buffer (named tail block) ----
+#[test]
+fn striaperfthree_timecode_in_matches() {
+    let mut buf = String::new();
+    for fps in [0u32, 24, 25, 30] {
+        for t in [-5i64, 0, 24, 25, 90_125, 10_000_000] {
+            let want = edl::timecode(t, fps);
+            assert_eq!(edl::timecode_in(&mut buf, t, fps), want, "t {t} fps {fps}");
+        }
+    }
+    let cap = buf.capacity();
+    assert_eq!(edl::timecode_in(&mut buf, 0, 25), "00:00:00:00");
+    assert_eq!(buf.capacity(), cap, "the buffer is reused");
+}

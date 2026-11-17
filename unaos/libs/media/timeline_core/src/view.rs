@@ -306,7 +306,7 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
     }
     // The ruler: a short mark per tick when they are 4 px apart, a long one per second.
     let fps = tl.fps().unwrap_or(25).max(1) as i64;
-    let (ry, ty) = (l.ruler_y as i64, l.tracks_y as i64);
+    let (ry, ty) = (l.ruler_y as i64, l.tracks_y as i64); let mut tc = alloc::string::String::new(); // STRIAPERFTHREE (SR9037): one ruler timecode buffer (edl.rs tail)
     c.rect(0, ry, w as i64, ty, RULER);
     let t_end = l.tick_at(w as f64) + 1;
     for t in l.t0..=t_end {
@@ -314,7 +314,7 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
         if t % fps == 0 {
             c.rect(x, ry + RULER_H as i64 / 2, x + 1, ty, TICK);
             if let Some(text) = labels.as_mut().filter(|_| l.zoom as i64 * fps >= 60) {
-                text.text(&mut c, &edl::timecode(t, fps as u32), x as f32 + 2.0, ry as f32 + 9.0, (x as i32, w as i32));
+                text.text(&mut c, edl::timecode_in(&mut tc, t, fps as u32), x as f32 + 2.0, ry as f32 + 9.0, (x as i32, w as i32));
             }
         } else if l.zoom >= 4 {
             c.rect(x, ty - 3, x + 1, ty, TICK);
