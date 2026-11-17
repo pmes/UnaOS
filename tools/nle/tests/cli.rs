@@ -380,7 +380,7 @@ fn cli_export_preset_proxy_is_its_knobs() {
     let (dir, edl, srcs) = fixture("preset");
     let (code, preset, err) = export(&edl, &srcs, &dir.join("preset"), &["--preset", "proxy"]);
     assert_eq!(code, 0, "{err}");
-    let (code, knobs, err) = export(&edl, &srcs, &dir.join("knobs"), &["--video", "h264", "--crf", "32", "--audio", "aac:64"]);
+    let (code, knobs, err) = export(&edl, &srcs, &dir.join("knobs"), &["--video", "h264", "--crf", "32", "--audio", "aac:64", "--scale", "2"]); // STRIAEXPORTPRESETSNEXT (SR989): proxy halves the frame
     assert_eq!(code, 0, "{err}");
     assert_eq!(preset, knobs, "the preset is its knobs, byte-exact");
     assert!(preset.starts_with("{\"codec\":\"h264\",\"frames\":35,"), "{preset}");
@@ -424,4 +424,31 @@ fn cli_export_explicit_crf_bitrate_still_exclusive() {
     let (code, stdout, err) = export(&edl, &srcs, &out, &["--preset", "web", "--crf", "20", "--bitrate", "800"]);
     assert_eq!((code, err.as_str(), stdout.as_str()), (1, "nle: --bitrate and --crf are exclusive\n", ""));
     assert!(!out.exists(), "refused before the output dir is made");
+}
+
+// ---- STRIAEXPORTPRESETSNEXT (LEDGER SR989): `nle export --scale N`, the knob a preset's scale assigns (named tail block) ----
+#[test]
+fn striaexportpresetsnext_cli_scale_one_is_the_bare_export() {
+    let (dir, edl, srcs) = fixture("scale-one");
+    let (code, bare, err) = export(&edl, &srcs, &dir.join("bare"), &["--video", "h264"]);
+    assert_eq!(code, 0, "{err}");
+    let (code, one, err) = export(&edl, &srcs, &dir.join("one"), &["--video", "h264", "--scale", "1"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(bare, one, "--scale 1 is no scale");
+    assert_eq!(std::fs::read(dir.join("bare/video.mp4")).unwrap(), std::fs::read(dir.join("one/video.mp4")).unwrap(), "byte-identical");
+}
+
+#[test]
+fn striaexportpresetsnext_cli_preset_scale_then_knob_wins() {
+    let (dir, edl, srcs) = fixture("scale-over");
+    let (code, half, err) = export(&edl, &srcs, &dir.join("half"), &["--preset", "proxy"]);
+    assert_eq!(code, 0, "{err}");
+    let (code, full, err) = export(&edl, &srcs, &dir.join("full"), &["--preset", "proxy", "--scale", "1"]);
+    assert_eq!(code, 0, "{err}");
+    let (code, knobs, err) = export(&edl, &srcs, &dir.join("knobs"), &["--video", "h264", "--crf", "32", "--audio", "aac:64"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(full, knobs, "a --scale after the preset wins (the last flag written)");
+    assert_ne!(std::fs::read(dir.join("half/movie.mp4")).unwrap(), std::fs::read(dir.join("full/movie.mp4")).unwrap(), "proxy's own scale halves the frame");
+    assert!(usage_text().lines().nth(2).unwrap().contains("[--scale N]"), "the usage names --scale");
+    println!("striaexportpresetsnext cli: {half}");
 }

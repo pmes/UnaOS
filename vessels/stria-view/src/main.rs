@@ -922,7 +922,7 @@ mod striaexportpresets_tests {
     #[test]
     fn striaexportpresets_lists_the_table() {
         let t = presets_text();
-        assert_eq!(t, "web: h264 + aac crf=23 aq=10 scenecut=40\narchive: png + wav\nproxy: h264 + aac:64 crf=32\n");
+        assert_eq!(t, "web: h264 + aac crf=23 aq=10 scenecut=40\narchive: png + wav\nproxy: h264 + aac:64 crf=32 scale=1/2\n"); // STRIAEXPORTPRESETSNEXT (SR989): proxy names its scale
         assert_eq!(t.lines().count(), stria::nle_export::PRESETS.len());
         assert!(USAGE.contains("[--presets]"), "{USAGE}");
     }
@@ -956,5 +956,29 @@ mod striaexportpresetsmore_tests {
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!((f.export_preset(), f.message_text().as_deref()), (None, Some("preset none: export's own words")));
         println!("striaexportpresetsmore witness: button {id} {label:?} steps web, archive, proxy, none");
+    }
+}
+
+// ---- STRIAEXPORTPRESETSNEXT (LEDGER SR989): the picked preset stays named on the message line (named tail block) ----
+
+#[cfg(test)]
+mod striaexportpresetsnext_tests {
+    use super::*;
+
+    /// Three presses of the `Preset` button (the `--do` road) pick proxy; once the next input clears the note, the message
+    /// line still names the pick (its last fallback); the listing names proxy's scale.
+    #[test]
+    fn striaexportpresetsnext_pick_stays_on_the_message_line() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        for _ in 0..3 {
+            let errors = drive(&mut f, "preset");
+            assert!(errors.is_empty(), "{errors:?}");
+        }
+        assert_eq!(f.export_preset().map(|p| p.name), Some("proxy"));
+        f.on(&SMessage::BrowserMouseMove(1.0, 1.0, 0));
+        assert_eq!(f.message_text().as_deref(), Some("export preset proxy"));
+        assert!(presets_text().contains("proxy: h264 + aac:64 crf=32 scale=1/2"));
+        println!("striaexportpresetsnext witness: {:?}", f.message_text());
     }
 }

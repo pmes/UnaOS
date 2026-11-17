@@ -104,6 +104,7 @@ pub trait VideoEncoder {
     }
     /// H264ENCHRDMP4 (SR720): read at `finish`: Some((bufferSizeDB, maxBitrate)) = the MP4 sample entry carries a `btrt` (avg from the coded bytes); (0, 0) = no bucket (max = avg, buffer 0, ffmpeg's CRF form).
     fn bitrate_hint(&self) -> Option<(u32, u32)> { None }
+    fn coded_size(&self, width: u32, height: u32) -> (u32, u32) { (width, height) } // STRIAEXPORTPRESETSNEXT (SR989): the size the stream is coded at for a handed `width x height` frame (identity; [`Scaled`] halves it), read by the sink's track header and video.json (file tail)
 }
 
 /// A PNG per frame through pixel_core's writer (lossless RGBA, colour type 6).
@@ -366,7 +367,7 @@ impl ExportSink {
         for &b in rgba {
             self.report.fnv = (self.report.fnv ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
         }
-        self.size = (w, h);
+        self.size = self.video.coded_size(w, h); // STRIAEXPORTPRESETSNEXT (SR989): the coded size, not the handed one (file tail)
         if self.report.frames == 0 { self.colour = self.video.colour(self.reels); } // H264ENCCOLOURHOST (SR377): the file colour, fixed at the first frame
         let units = self.video.encode(w, h, rgba)?;
         self.store(units)?;
@@ -1051,14 +1052,15 @@ pub struct ExportPreset {
     pub scenecut: Option<u8>,
     /// [`H264Opts::aq`].
     pub aq: Option<u8>,
+    pub scale: u8, // STRIAEXPORTPRESETSNEXT (SR989): the frame's width / height divisor (1 = the timeline's size), applied by [`scaled`] (file tail)
 }
 
 /// THE preset table: `web` (H.264 at CRF 23 with AQ and scene cuts, AAC-LC 128), `archive` (the lossless PNG sequence and
 /// PCM16 WAV), `proxy` (H.264 at CRF 32, AAC-LC 64).
 pub const PRESETS: [ExportPreset; 3] = [
-    ExportPreset { name: "web", video: "h264", audio: "aac", qp: 26, crf: Some(23), scenecut: Some(40), aq: Some(10) },
-    ExportPreset { name: "archive", video: "png", audio: "wav", qp: 26, crf: None, scenecut: None, aq: None },
-    ExportPreset { name: "proxy", video: "h264", audio: "aac:64", qp: 26, crf: Some(32), scenecut: None, aq: None },
+    ExportPreset { name: "web", video: "h264", audio: "aac", qp: 26, crf: Some(23), scenecut: Some(40), aq: Some(10), scale: 1 },
+    ExportPreset { name: "archive", video: "png", audio: "wav", qp: 26, crf: None, scenecut: None, aq: None, scale: 1 },
+    ExportPreset { name: "proxy", video: "h264", audio: "aac:64", qp: 26, crf: Some(32), scenecut: None, aq: None, scale: 2 },
 ];
 
 /// The preset named `word`; None for any other word.
@@ -1079,6 +1081,58 @@ impl ExportPreset {
     /// The preset's one listing line: `<name>: <video> + <audio>` then ` crf=N` / ` aq=N` / ` scenecut=N` for each set knob.
     pub fn words(&self) -> String {
         let knobs: String = [("crf", self.crf), ("aq", self.aq), ("scenecut", self.scenecut)].iter().filter_map(|(k, v)| v.map(|v| format!(" {k}={v}"))).collect();
-        format!("{}: {} + {}{knobs}", self.name, self.video, self.audio)
+        format!("{}: {} + {}{knobs}{}", self.name, self.video, self.audio, if self.scale > 1 { format!(" scale=1/{}", self.scale) } else { String::new() }) // STRIAEXPORTPRESETSNEXT (SR989): a scaled preset names its divisor
+    }
+}
+
+// ---- STRIAEXPORTPRESETSNEXT (LEDGER SR989): a preset's scale, the export frame through THE one scaler (named tail block) ----
+/// An encoder over a reduced frame ([`ExportPreset::scale`], `proxy` = 2): each handed frame is sampled through THE one
+/// scaler (timeline_core's `Canvas::blit_policy`, yuv_core::scale's `nearest_rows`, `SizePolicy::Stretch`) into
+/// [`scaled_size`] and handed to `inner`; every other call is `inner`'s, and [`VideoEncoder::coded_size`] states the
+/// reduced size so the track header and video.json name it.
+pub struct Scaled {
+    inner: Box<dyn VideoEncoder>,
+    div: u32,
+}
+
+/// `inner` over frames divided by `div`; `div` 0 or 1 hands `inner` back itself (the export byte-identical).
+pub fn scaled(inner: Box<dyn VideoEncoder>, div: u8) -> Box<dyn VideoEncoder> {
+    if div <= 1 {
+        return inner;
+    }
+    Box::new(Scaled { inner, div: div as u32 })
+}
+
+/// The coded size of a `w x h` frame divided by `div`: each side divided, rounded down to even (4:2:0), at least 2.
+pub fn scaled_size(w: u32, h: u32, div: u32) -> (u32, u32) {
+    let d = div.max(1);
+    (((w / d) & !1).max(2), ((h / d) & !1).max(2))
+}
+
+impl VideoEncoder for Scaled {
+    fn encode(&mut self, width: u32, height: u32, rgba: &[u8]) -> Result<Vec<Access>, ExportError> {
+        let (dw, dh) = scaled_size(width, height, self.div);
+        let still = timeline_core::view::Still { width, height, rgba: rgba.to_vec() };
+        let mut c = timeline_core::view::Canvas::new(dw, dh, timeline_core::view::Order::Rgba);
+        c.blit_policy(&still, 0, 0, dw, dh, timeline_core::SizePolicy::Stretch);
+        self.inner.encode(dw, dh, &c.px)
+    }
+    fn flush(&mut self) -> Result<Vec<Access>, ExportError> {
+        self.inner.flush()
+    }
+    fn config(&self) -> VideoConfig {
+        self.inner.config()
+    }
+    fn layout(&self) -> Layout {
+        self.inner.layout()
+    }
+    fn colour(&mut self, reels: (u8, u8)) -> Option<Colour> {
+        self.inner.colour(reels)
+    }
+    fn bitrate_hint(&self) -> Option<(u32, u32)> {
+        self.inner.bitrate_hint()
+    }
+    fn coded_size(&self, width: u32, height: u32) -> (u32, u32) {
+        scaled_size(width, height, self.div)
     }
 }
