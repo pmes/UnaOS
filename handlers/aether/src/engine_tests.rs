@@ -9887,4 +9887,86 @@ b</div>
         assert_eq!(font_shorthand_cs(&mut e, "w", "width"), "200px");
         assert_eq!(font_shorthand_cs(&mut e, "td", "textDecoration"), "underline solid rgb(255, 0, 0)");
     }
+
+    // ---- AETHERFONTSGENERICRESOLVENAMEDSERIF (LEDGER SR1120): a family NAMED serif falls through to the next family (named tail block) ----
+
+    /// AETHERFONTSGENERICRESOLVENAMEDSERIF (SR1120): `font-family: 'serif', monospace` paints at the monospace advance (no
+    /// installed family is named serif; it painted with fontconfig's serif alias), and getComputedStyle reads the list kept.
+    #[test]
+    fn named_serif_paints_monospace_engine() {
+        if crate::fonts::db::db().faces.is_empty() {
+            return;
+        }
+        let html = r#"<!doctype html><html><body style="margin:0;font-size:20px">
+            <div><span id="n" style="font-family: 'serif', monospace">iiiiiiiiii</span></div>
+            <div><span id="m" style="font-family: monospace">iiiiiiiiii</span></div>
+            <div><span id="s" style="font-family: serif">iiiiiiiiii</span></div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 400));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        let (n, m, s) = (imgalt_rect(&mut e, "n").2, imgalt_rect(&mut e, "m").2, imgalt_rect(&mut e, "s").2);
+        assert_eq!(font_shorthand_cs(&mut e, "n", "fontFamily"), r#""serif", monospace"#, "the list reads back kept");
+        if (m - s).abs() <= 0.5 {
+            return; // the host's monospace and serif faces share an advance: nothing to tell apart
+        }
+        assert!((n - m).abs() <= 0.5, "armed: the named serif paints at the monospace advance {m}, not the serif {s}: {n}");
+    }
+
+    // ---- AETHERCSSWIDECOLUMNGAPNORMALFLEX (LEDGER SR1077): `normal` on the flex / grid gaps writes an explicit zero (named tail block) ----
+
+    /// AETHERCSSWIDECOLUMNGAPNORMALFLEX (SR1077): two flex rows of two 50px items under `column-gap: 10px`; the second
+    /// row's later rule `column-gap: normal` is the flex gap's 0 (css-align-3 §8.1), so its second item sits at x 50,
+    /// not 60. The first row (no normal) keeps the 10px gap (armed).
+    #[test]
+    fn gap_normal_flex_column_gap_engine() {
+        let html = r#"<!doctype html><html><head><style>
+            .r { display: flex; column-gap: 10px; width: 300px; height: 20px }
+            .r.t { column-gap: normal }
+            .r div { width: 50px; height: 20px; flex: none }
+            </style></head><body style="margin:0">
+            <div id="g" class="r"><div id="g1"></div><div id="g2"></div></div>
+            <div id="t" class="r t"><div id="t1"></div><div id="t2"></div></div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        let left = |e: &mut crate::AetherEngine, id: &str, c: &str| imgalt_rect(e, id).0 - imgalt_rect(e, c).0;
+        assert!((left(&mut e, "g2", "g") - 60.0).abs() <= 0.5, "column-gap: 10px: x 60 (armed): {}", left(&mut e, "g2", "g"));
+        assert!((left(&mut e, "t2", "t") - 50.0).abs() <= 0.5, "a later column-gap: normal is 0: x 50: {}", left(&mut e, "t2", "t"));
+    }
+
+    // ---- AETHERCSSGAPSHORTHANDMULTICOL (LEDGER SR1079): the gap shorthand writes the multicol gutter (named tail block) ----
+
+    /// AETHERCSSGAPSHORTHANDMULTICOL (SR1079): SR1016's shape, a two-column 410px div at 20px with red blocks: alone
+    /// the gutter is 1em (195..215) so x 220 is column two's red; `gap: 40px`, `grid-gap: 40px` and `gap: 0px 40px`
+    /// each set the 40px gutter (185..225), so x 220 is gutter. Before, the shorthand left the 1em gutter.
+    #[test]
+    fn gap_shorthand_multicol_engine() {
+        let html = r#"<!doctype html><html><head><style>
+            .mc { width: 410px; column-count: 2; font-size: 20px; margin: 0 0 20px }
+            .mc div { height: 20px; background-color: rgb(255, 0, 0) }
+            .mc.g { gap: 40px }
+            .mc.gg { grid-gap: 40px }
+            .mc.g2 { gap: 0px 40px }
+            </style></head><body style="margin:0">
+            <div class="mc"><div></div><div></div></div>
+            <div class="mc g"><div></div><div></div></div>
+            <div class="mc gg"><div></div><div></div></div>
+            <div class="mc g2"><div></div><div></div></div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(500, 200));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        for y in [10, 50, 90, 130] {
+            assert_eq!(imgalt_px(&e, 100, y), (255, 0, 0), "y {y}: the first column paints red");
+        }
+        assert_eq!(imgalt_px(&e, 220, 10), (255, 0, 0), "no gap: 1em gutter, x 220 is column two (armed)");
+        assert_ne!(imgalt_px(&e, 220, 50), (255, 0, 0), "gap: 40px: x 220 is gutter");
+        assert_ne!(imgalt_px(&e, 220, 90), (255, 0, 0), "grid-gap: 40px: x 220 is gutter");
+        assert_ne!(imgalt_px(&e, 220, 130), (255, 0, 0), "gap: 0px 40px: the column token, x 220 is gutter");
+    }
 }

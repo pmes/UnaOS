@@ -228,7 +228,7 @@ fn css_wide_rest_flex() {
 }
 
 /// AETHERCSSWIDENONINHERITEDREST (SR848): align-items / justify-content reset to normal, gap / row-gap to 0;
-/// column-gap's keyword stays dropped (AETHER-CSS-WIDE-COLUMN-GAP-NORMAL owed, pinned).
+/// column-gap's keyword stays dropped (AETHER-CSS-WIDE-COLUMN-GAP-NORMAL owed, pinned; flipped by SR1077: initial is 0).
 #[test]
 fn css_wide_rest_align_gap() {
     let n = styled(&[("align-items", "normal"), ("justify-content", "normal")]);
@@ -240,9 +240,8 @@ fn css_wide_rest_align_gap() {
     assert_eq!((s.row_gap, s.column_gap), (zero.row_gap, zero.column_gap), "gap: initial is 0");
     let s = cascade(&[&[("row-gap", "10px")], &[("row-gap", "initial")]]);
     assert_eq!(s.row_gap, zero.row_gap, "row-gap: initial is 0");
-    let ten = cascade(&[&[("column-gap", "10px")]]);
     let s = cascade(&[&[("column-gap", "10px")], &[("column-gap", "initial")]]);
-    assert_eq!(s.column_gap, ten.column_gap, "column-gap: initial unchanged by this arc (owed, pinned)");
+    assert_eq!(s.column_gap, zero.column_gap, "column-gap: initial is the flex gap's 0 (SR1077 flipped the SR848 pin)");
 }
 
 /// AETHERCSSWIDENONINHERITEDREST (SR848): the background layer longhands reset to repeat / `0% 0%` / auto; the
@@ -2204,4 +2203,95 @@ fn place_shorthands_in_skipped() {
     for n in ["place-content", "place-items", "place-self"] {
         assert!(ALL_SKIPPED.contains(&n) && !ALL_LONGHANDS.contains(&n), "{n} is a skipped shorthand");
     }
+}
+
+// ---- AETHERCSSWIDECOLUMNGAPNORMALFLEX (LEDGER SR1077): `normal` on the flex / grid gaps writes an explicit zero (named tail block) ----
+
+/// AETHERCSSWIDECOLUMNGAPNORMALFLEX (SR1077): `column-gap: normal` after 10px is the flex gap's 0 (css-align-3 §8.1),
+/// in one block (the engine's one-style road) and across rules (merge copies Somes).
+#[test]
+fn gap_normal_column_gap_zero() {
+    let zero = styled(&[("gap", "0px")]);
+    let ten = styled(&[("column-gap", "10px")]);
+    assert_ne!(ten.column_gap, zero.column_gap, "10px (armed)");
+    let s = styled(&[("column-gap", "10px"), ("column-gap", "normal")]);
+    assert_eq!(s.column_gap, zero.column_gap, "in one block: a later normal is 0");
+    let s = cascade(&[&[("column-gap", "10px")], &[("column-gap", "normal")]]);
+    assert_eq!(s.column_gap, zero.column_gap, "across rules: a later normal is 0");
+    let s = cascade(&[&[("column-gap", "normal")], &[("column-gap", "10px")]]);
+    assert_eq!(s.column_gap, ten.column_gap, "a later 10px still wins over an earlier normal");
+}
+
+/// AETHERCSSWIDECOLUMNGAPNORMALFLEX (SR1077): `gap: normal` zeroes both gaps, `gap: 10px normal` only the column
+/// gap, and `row-gap: normal` after 5px is 0.
+#[test]
+fn gap_normal_shorthand_and_row_gap_zero() {
+    let zero = styled(&[("gap", "0px")]);
+    let both = styled(&[("gap", "10px 20px")]);
+    assert_ne!((both.row_gap, both.column_gap), (zero.row_gap, zero.column_gap), "10px 20px (armed)");
+    let s = styled(&[("gap", "10px 20px"), ("gap", "normal")]);
+    assert_eq!((s.row_gap, s.column_gap), (zero.row_gap, zero.column_gap), "in one block: gap: normal is 0 0");
+    let s = cascade(&[&[("gap", "10px 20px")], &[("gap", "normal")]]);
+    assert_eq!((s.row_gap, s.column_gap), (zero.row_gap, zero.column_gap), "across rules: gap: normal is 0 0");
+    let s = styled(&[("gap", "10px normal")]);
+    assert_eq!((s.row_gap, s.column_gap), (styled(&[("row-gap", "10px")]).row_gap, zero.column_gap), "gap: 10px normal");
+    let five = styled(&[("row-gap", "5px")]);
+    assert_ne!(five.row_gap, zero.row_gap, "5px (armed)");
+    let s = styled(&[("row-gap", "5px"), ("row-gap", "normal")]);
+    assert_eq!(s.row_gap, zero.row_gap, "in one block: row-gap: normal is 0");
+    let s = cascade(&[&[("row-gap", "5px")], &[("row-gap", "normal")]]);
+    assert_eq!(s.row_gap, zero.row_gap, "across rules: row-gap: normal is 0");
+}
+
+/// AETHERCSSWIDECOLUMNGAPNORMALFLEX (SR1077): the multicol gutter's `normal` stays SR1016's explicit normal (1em):
+/// the flex zero does not reach `PaintStyle::col_gap`.
+#[test]
+fn gap_normal_multicol_unchanged() {
+    let s = cascade(&[&[("column-count", "2"), ("column-gap", "40px")], &[("column-gap", "normal")]]);
+    assert_eq!(s.paint.col_gap, Some(None), "multicol normal stays the explicit normal (1em)");
+    let s = styled(&[("column-count", "2"), ("column-gap", "40px"), ("column-gap", "normal")]);
+    assert_eq!(s.paint.col_gap, Some(None), "in one block too");
+}
+
+// ---- AETHERCSSGAPSHORTHANDMULTICOL (LEDGER SR1079): the gap shorthand writes the multicol gutter (named tail block) ----
+
+/// AETHERCSSGAPSHORTHANDMULTICOL (SR1079): `gap` / `grid-gap` is the shorthand for `row-gap` + `column-gap`
+/// (css-align-3 §8.3) and `column-gap` is the multicol gutter (css-multicol-1 §4.1), so the shorthand's column token
+/// writes `PaintStyle::col_gap` through `col_gap_of`: a px length is Some(Some(px)), `normal` Some(None) (1em), a
+/// percentage leaves it untouched; `row-gap` never touches it.
+#[test]
+fn gap_shorthand_multicol_col_gap() {
+    let mc = |v: &str| styled(&[("column-count", "2"), ("gap", v)]);
+    assert_eq!(styled(&[("column-count", "2")]).paint.col_gap, None, "no gap: the gutter is unset (armed)");
+    assert_eq!(mc("24px").paint.col_gap, Some(Some(24.0)), "gap: 24px is the 24px gutter");
+    let s = mc("10px 24px");
+    assert_eq!(s.paint.col_gap, Some(Some(24.0)), "gap: 10px 24px: the COLUMN token");
+    assert_eq!(s.row_gap, styled(&[("row-gap", "10px")]).row_gap, "gap: 10px 24px: row gap 10px");
+    let s = styled(&[("column-count", "2"), ("grid-gap", "24px")]);
+    assert_eq!(s.paint.col_gap, Some(Some(24.0)), "grid-gap: 24px, the alias");
+    assert_eq!(mc("5px normal").paint.col_gap, Some(None), "gap: 5px normal: the explicit normal (1em)");
+    let s = mc("10%");
+    assert_eq!(s.paint.col_gap, None, "gap: 10%: the gutter is untouched");
+    assert!(s.column_gap.is_some(), "gap: 10%: the flex / grid gap takes the percentage");
+    let s = styled(&[("column-count", "2"), ("row-gap", "24px")]);
+    assert_eq!(s.paint.col_gap, None, "row-gap never writes the gutter");
+    let s = styled(&[("column-count", "2"), ("column-gap", "24px")]);
+    assert_eq!(s.paint.col_gap, Some(Some(24.0)), "column-gap: 24px reads back through the helper");
+    let s = cascade(&[&[("column-count", "2"), ("column-gap", "40px")], &[("gap", "normal")]]);
+    assert_eq!(s.paint.col_gap, Some(None), "a later gap: normal is the explicit normal across rules");
+}
+
+/// AETHERCSSGAPSHORTHANDMULTICOL (SR1079): the multicol road reads the shorthand's gutter: a 410px two-column box at
+/// 20px under `gap: 30px` lays a 30px gutter (1em = 20px without it).
+#[test]
+fn gap_shorthand_multicol_used_gap() {
+    let gap = |rules: &[&[(&str, &str)]]| {
+        let doc = page(vec![el("div", &[("id", "mc")], (0..4).map(|_| el("div", &[("style", "height: 20px")], vec![])).collect())]);
+        let mc = doc.by_id("mc");
+        let tree = lay_styled(&doc, &Sheet(vec![(mc.id, std::rc::Rc::new(cascade(rules)))]), 800.0, 600.0);
+        tree.multicol[&id_of(&tree, &mc)].gap
+    };
+    let base: &[(&str, &str)] = &[("width", "410px"), ("column-count", "2"), ("font-size", "20px")];
+    assert_eq!(gap(&[base]), 20.0, "no gap: 1em (armed)");
+    assert_eq!(gap(&[base, &[("gap", "30px")]]), 30.0, "gap: 30px is the 30px gutter");
 }
