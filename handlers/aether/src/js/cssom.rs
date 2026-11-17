@@ -340,46 +340,7 @@ const BORDER_IMAGE: [&str; 5] =
 
 /// The longhands of a shorthand this binding expands.
 fn longhands(sh: &str) -> Option<Vec<String>> {
-    let v = |xs: &[&str]| Some(xs.iter().map(|s| s.to_string()).collect::<Vec<String>>());
-    match sh {
-        "margin" | "padding" => Some(SIDES.iter().map(|s| format!("{sh}-{s}")).collect()),
-        "inset" => v(&SIDES),
-        "border-width" | "border-style" | "border-color" => {
-            let k = &sh[7..];
-            Some(SIDES.iter().map(|s| format!("border-{s}-{k}")).collect())
-        }
-        "border-top" | "border-right" | "border-bottom" | "border-left" => {
-            Some(["width", "style", "color"].iter().map(|k| format!("{sh}-{k}")).collect())
-        }
-        // Blink's `border` also resets border-image (css-backgrounds-3 §4.4: "border … resets
-        // border-image to its initial value").
-        "border" => Some(
-            ["width", "style", "color"]
-                .iter()
-                .flat_map(|k| SIDES.iter().map(move |s| format!("border-{s}-{k}")))
-                .chain(BORDER_IMAGE.iter().map(|s| s.to_string()))
-                .collect(),
-        ),
-        "border-image" => v(&BORDER_IMAGE),
-        "gap" => v(&["row-gap", "column-gap"]),
-        "overflow" => v(&["overflow-x", "overflow-y"]),
-        "font-synthesis" => v(&["font-synthesis-weight", "font-synthesis-style", "font-synthesis-small-caps"]),
-        "flex" => v(&["flex-grow", "flex-shrink", "flex-basis"]),
-        "outline" => v(&["outline-color", "outline-style", "outline-width"]),
-        "border-radius" => v(&["border-top-left-radius", "border-top-right-radius", "border-bottom-right-radius", "border-bottom-left-radius"]),
-        "background" => v(&[
-            "background-image",
-            "background-position-x",
-            "background-position-y",
-            "background-size",
-            "background-repeat",
-            "background-attachment",
-            "background-origin",
-            "background-clip",
-            "background-color",
-        ]),
-        _ => None,
-    }
+    SHORTHANDS.iter().find(|(s, _)| *s == sh).map(|(_, ls)| ls.iter().map(|l| l.to_string()).collect())
 }
 
 fn bg_initial(p: &str) -> &'static str {
@@ -589,58 +550,7 @@ fn expand(prop: &str, v: &[CV]) -> Result<Vec<(String, String)>, ()> {
 
 /// The shorthands that may stand for longhand `p` in serialization, in preference order.
 fn shorthands_of(p: &str) -> Vec<&'static str> {
-    let mut out = Vec::new();
-    if p.starts_with("border-image-") {
-        out.push("border");
-        out.push("border-image");
-        return out;
-    }
-    if p.starts_with("border-") && (p.ends_with("-width") || p.ends_with("-style") || p.ends_with("-color")) && !p.contains("radius") {
-        out.push("border");
-        if p.ends_with("-width") {
-            out.push("border-width");
-        } else if p.ends_with("-style") {
-            out.push("border-style");
-        } else {
-            out.push("border-color");
-        }
-        for s in ["border-top", "border-right", "border-bottom", "border-left"] {
-            if p.starts_with(&format!("{s}-")) {
-                out.push(s);
-            }
-        }
-    }
-    if p.starts_with("margin-") {
-        out.push("margin");
-    }
-    if p.starts_with("padding-") {
-        out.push("padding");
-    }
-    if matches!(p, "top" | "right" | "bottom" | "left") {
-        out.push("inset");
-    }
-    if matches!(p, "row-gap" | "column-gap") {
-        out.push("gap");
-    }
-    if matches!(p, "overflow-x" | "overflow-y") {
-        out.push("overflow");
-    }
-    if matches!(p, "font-synthesis-weight" | "font-synthesis-style" | "font-synthesis-small-caps") {
-        out.push("font-synthesis");
-    }
-    if matches!(p, "flex-grow" | "flex-shrink" | "flex-basis") {
-        out.push("flex");
-    }
-    if p.starts_with("outline-") && p != "outline-offset" {
-        out.push("outline");
-    }
-    if p.ends_with("-radius") {
-        out.push("border-radius");
-    }
-    if p.starts_with("background-") {
-        out.push("background");
-    }
-    out
+    SHORTHANDS.iter().filter(|(_, ls)| ls.contains(&p)).map(|(sh, _)| *sh).collect()
 }
 
 fn four_serialize(v: [&str; 4]) -> String {
@@ -2007,4 +1917,268 @@ fn font_synthesis_words(vals: &[&str]) -> Option<String> {
         }
     }
     Some(if on.is_empty() { "none".to_string() } else { on.join(" ") })
+}
+
+// ---- AETHERCSSOMSHORTHANDTABLE (LEDGER SR786): every shorthand's longhands in one table (named tail block) ----
+
+/// AETHERCSSOMSHORTHANDTABLE (SR786): every shorthand this binding expands and its longhands in canonical order —
+/// the ONE table [`longhands`] looks up and [`shorthands_of`] scans in reverse (a longhand's shorthands in row order,
+/// which is `Block::serialize`'s preference order: `border` before `border-width` before `border-top`). The per-shorthand
+/// grammar stays in [`expand`] and [`serialize_shorthand`]; the table holds only the pairs, so the two directions
+/// cannot drift (owed AETHER-CSSOM-SHORTHAND-TABLE-SERIALIZE / -INITIAL).
+const SHORTHANDS: &[(&str, &[&str])] = &[
+    (
+        "border",
+        &[
+            "border-top-width", "border-right-width", "border-bottom-width", "border-left-width", "border-top-style",
+            "border-right-style", "border-bottom-style", "border-left-style", "border-top-color", "border-right-color",
+            "border-bottom-color", "border-left-color", "border-image-source", "border-image-slice",
+            "border-image-width", "border-image-outset", "border-image-repeat",
+        ],
+    ),
+    (
+        "border-image",
+        &[
+            "border-image-source", "border-image-slice", "border-image-width", "border-image-outset",
+            "border-image-repeat",
+        ],
+    ),
+    ("border-width", &["border-top-width", "border-right-width", "border-bottom-width", "border-left-width"]),
+    ("border-style", &["border-top-style", "border-right-style", "border-bottom-style", "border-left-style"]),
+    ("border-color", &["border-top-color", "border-right-color", "border-bottom-color", "border-left-color"]),
+    ("border-top", &["border-top-width", "border-top-style", "border-top-color"]),
+    ("border-right", &["border-right-width", "border-right-style", "border-right-color"]),
+    ("border-bottom", &["border-bottom-width", "border-bottom-style", "border-bottom-color"]),
+    ("border-left", &["border-left-width", "border-left-style", "border-left-color"]),
+    ("margin", &["margin-top", "margin-right", "margin-bottom", "margin-left"]),
+    ("padding", &["padding-top", "padding-right", "padding-bottom", "padding-left"]),
+    ("inset", &["top", "right", "bottom", "left"]),
+    ("gap", &["row-gap", "column-gap"]),
+    ("overflow", &["overflow-x", "overflow-y"]),
+    ("font-synthesis", &["font-synthesis-weight", "font-synthesis-style", "font-synthesis-small-caps"]),
+    ("flex", &["flex-grow", "flex-shrink", "flex-basis"]),
+    ("outline", &["outline-color", "outline-style", "outline-width"]),
+    (
+        "border-radius",
+        &[
+            "border-top-left-radius", "border-top-right-radius", "border-bottom-right-radius",
+            "border-bottom-left-radius",
+        ],
+    ),
+    (
+        "background",
+        &[
+            "background-image", "background-position-x", "background-position-y", "background-size",
+            "background-repeat", "background-attachment", "background-origin", "background-clip", "background-color",
+        ],
+    ),
+];
+
+#[cfg(test)]
+mod shorthand_table_tests {
+    use super::*;
+
+    /// The old `longhands` (`sh=...`) and `shorthands_of` (`p>...`, non-empty only) results, captured from the two
+    /// hand-written matches at cd877b54d over PROPERTIES and every longhand (242 names) before the table replaced them.
+    const OLD_CAPTURE: &str = "border=border-top-width border-right-width border-bottom-width border-left-width border-top-style border-right-style border-bottom-style border-left-style border-top-color border-right-color border-bottom-color border-left-color border-image-source border-image-slice border-image-width border-image-outset border-image-repeat
+border-image=border-image-source border-image-slice border-image-width border-image-outset border-image-repeat
+border-width=border-top-width border-right-width border-bottom-width border-left-width
+border-style=border-top-style border-right-style border-bottom-style border-left-style
+border-color=border-top-color border-right-color border-bottom-color border-left-color
+border-top=border-top-width border-top-style border-top-color
+border-right=border-right-width border-right-style border-right-color
+border-bottom=border-bottom-width border-bottom-style border-bottom-color
+border-left=border-left-width border-left-style border-left-color
+margin=margin-top margin-right margin-bottom margin-left
+padding=padding-top padding-right padding-bottom padding-left
+inset=top right bottom left
+gap=row-gap column-gap
+overflow=overflow-x overflow-y
+font-synthesis=font-synthesis-weight font-synthesis-style font-synthesis-small-caps
+flex=flex-grow flex-shrink flex-basis
+outline=outline-color outline-style outline-width
+border-radius=border-top-left-radius border-top-right-radius border-bottom-right-radius border-bottom-left-radius
+background=background-image background-position-x background-position-y background-size background-repeat background-attachment background-origin background-clip background-color
+background-attachment>background
+background-blend-mode>background
+background-clip>background
+background-color>background
+background-image>background
+background-origin>background
+background-position>background
+background-position-x>background
+background-position-y>background
+background-repeat>background
+background-size>background
+border-bottom-color>border border-color border-bottom
+border-bottom-left-radius>border-radius
+border-bottom-right-radius>border-radius
+border-bottom-style>border border-style border-bottom
+border-bottom-width>border border-width border-bottom
+border-color>border border-color
+border-image-outset>border border-image
+border-image-repeat>border border-image
+border-image-slice>border border-image
+border-image-source>border border-image
+border-image-width>border border-image
+border-left-color>border border-color border-left
+border-left-style>border border-style border-left
+border-left-width>border border-width border-left
+border-radius>border-radius
+border-right-color>border border-color border-right
+border-right-style>border border-style border-right
+border-right-width>border border-width border-right
+border-style>border border-style
+border-top-color>border border-color border-top
+border-top-left-radius>border-radius
+border-top-right-radius>border-radius
+border-top-style>border border-style border-top
+border-top-width>border border-width border-top
+border-width>border border-width
+bottom>inset
+column-gap>gap
+flex-basis>flex
+flex-grow>flex
+flex-shrink>flex
+font-synthesis-small-caps>font-synthesis
+font-synthesis-style>font-synthesis
+font-synthesis-weight>font-synthesis
+left>inset
+margin-block>margin
+margin-bottom>margin
+margin-inline>margin
+margin-left>margin
+margin-right>margin
+margin-top>margin
+outline-color>outline
+outline-style>outline
+outline-width>outline
+overflow-x>overflow
+overflow-y>overflow
+padding-block>padding
+padding-bottom>padding
+padding-inline>padding
+padding-left>padding
+padding-right>padding
+padding-top>padding
+right>inset
+row-gap>gap
+top>inset";
+
+    /// The ten names the old `shorthands_of` prefix rules mapped to a shorthand whose longhands do not include them;
+    /// the table (the `longhands` side) maps each to none.
+    const FIXED: [&str; 10] = [
+        "background-blend-mode", "background-position", "border-color", "border-radius", "border-style", "border-width",
+        "margin-block", "margin-inline", "padding-block", "padding-inline",
+    ];
+
+    const PROBES: [&str; 7] = ["1px", "solid", "red", "1px solid red", "hidden", "1", "weight style small-caps"];
+
+    fn universe() -> Vec<String> {
+        let mut names: Vec<String> = PROPERTIES.iter().map(|s| s.to_string()).collect();
+        names.extend(SHORTHANDS.iter().flat_map(|(_, ls)| ls.iter().map(|l| l.to_string())));
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    fn expand_str(prop: &str, value: &str) -> Result<Vec<(String, String)>, ()> {
+        expand(prop, &css_core::parser::parse_component_values(value))
+    }
+
+    /// The identity: the table reproduces the old matches byte for byte, but for the ten named prefix over-matches.
+    #[test]
+    fn shorthand_table_reproduces_the_old_matches() {
+        let mut keys = 0;
+        let mut old_of: HashMap<&str, Vec<&str>> = HashMap::new();
+        for line in OLD_CAPTURE.lines() {
+            if let Some((sh, ls)) = line.split_once('=') {
+                keys += 1;
+                let want: Vec<String> = ls.split(' ').map(|s| s.to_string()).collect();
+                assert_eq!(longhands(sh), Some(want), "longhands({sh})");
+            } else if let Some((p, shs)) = line.split_once('>') {
+                old_of.insert(p, shs.split(' ').collect());
+            }
+        }
+        assert_eq!(keys, SHORTHANDS.len(), "every old shorthand is a table row and no more");
+        let names = universe();
+        assert_eq!(names.len(), 242);
+        for p in &names {
+            let want = if FIXED.contains(&p.as_str()) { Vec::new() } else { old_of.get(p.as_str()).cloned().unwrap_or_default() };
+            assert_eq!(shorthands_of(p), want, "shorthands_of({p})");
+        }
+        for p in FIXED {
+            assert!(!old_of.get(p).unwrap().is_empty(), "{p} was an old over-match");
+        }
+    }
+
+    /// The table is closed: no duplicate shorthand or longhand in a row, every longhand maps back to its shorthand,
+    /// no shorthand is itself a longhand, and every name is a PROPERTIES entry (but border-image's five longhands).
+    #[test]
+    fn shorthand_table_is_closed() {
+        for (i, (sh, ls)) in SHORTHANDS.iter().enumerate() {
+            assert!(SHORTHANDS[..i].iter().all(|(s, _)| s != sh), "{sh} is one row");
+            assert!(PROPERTIES.contains(sh), "{sh} in PROPERTIES");
+            assert!(shorthands_of(sh).is_empty(), "{sh} is no longhand");
+            for (j, l) in ls.iter().enumerate() {
+                assert!(!ls[..j].contains(l), "{sh}: {l} once");
+                assert!(shorthands_of(l).contains(sh), "{l} maps back to {sh}");
+                assert!(PROPERTIES.contains(l) || l.starts_with("border-image-"), "{l} in PROPERTIES");
+            }
+        }
+    }
+
+    /// expand knows every table shorthand and no other: (a) each row's shorthand expands to exactly its longhands
+    /// under some probe value (`border-image` has no expand arm: its value falls through to opaque storage, owed
+    /// AETHER-CSSOM-BORDER-IMAGE-EXPAND); (b) a PROPERTIES name whose expansion names any other property is a row
+    /// or `word-wrap` (expand's overflow-wrap alias).
+    #[test]
+    fn shorthand_table_matches_expand() {
+        for (sh, ls) in SHORTHANDS {
+            let want: Vec<&str> = ls.to_vec();
+            let hit = PROBES.iter().any(|v| {
+                expand_str(sh, v).is_ok_and(|pairs| pairs.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>() == want)
+            });
+            if *sh == "border-image" {
+                assert!(!hit, "border-image gained an expand arm: retire AETHER-CSSOM-BORDER-IMAGE-EXPAND");
+                let pairs = expand_str(sh, "none").unwrap();
+                assert_eq!(pairs.len(), 1);
+                assert_eq!(pairs[0].0, "border-image", "the fallthrough stores the shorthand opaquely");
+            } else {
+                assert!(hit, "{sh} expands to its table longhands");
+            }
+        }
+        for p in PROPERTIES {
+            for v in PROBES {
+                if let Ok(pairs) = expand_str(p, v) {
+                    if pairs.iter().any(|(n, _)| n != p) {
+                        assert!(*p == "word-wrap" || longhands(p).is_some(), "{p}: {v} expands but is no table row");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shorthand_font_synthesis_longhands_map_back() {
+        for l in ["font-synthesis-weight", "font-synthesis-style", "font-synthesis-small-caps"] {
+            assert_eq!(shorthands_of(l), vec!["font-synthesis"], "{l}");
+        }
+    }
+
+    #[test]
+    fn shorthand_border_top_width_order() {
+        assert_eq!(shorthands_of("border-top-width"), vec!["border", "border-width", "border-top"]);
+        assert_eq!(shorthands_of("border-image-source"), vec!["border", "border-image"]);
+    }
+
+    /// The fixed drift's behaviour: a stored non-longhand is no longer dropped behind a prefix shorthand that serializes.
+    #[test]
+    fn shorthand_serialize_keeps_a_non_longhand() {
+        assert_eq!(
+            Block::parse("background: red; background-position: 10px").serialize(),
+            "background: red; background-position: 10px;"
+        );
+        assert_eq!(Block::parse("margin: 1px; margin-block: 2px").serialize(), "margin: 1px; margin-block: 2px;");
+    }
 }
