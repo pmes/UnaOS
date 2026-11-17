@@ -3864,3 +3864,28 @@ fn striaxformmore_face_nudge_note() {
     assert_eq!(face.last_error.take(), Some(format!("pip left: {}", timeline_core::EditError::Xform)));
     assert_eq!(face.state.undo_depth(), 2);
 }
+
+// ---- STRIAXFORMKEYS (LEDGER SR9049): the face's placement key words and the placement line (named tail block) ----
+/// STRIAXFORMKEYS (SR9049): `pip key` sets a point at the playhead; on the keyed clip a corner word edits the point at
+/// the playhead, and the message row reads the placement shown there with the point count; a key word with the playhead
+/// off the clip is refused by name on the message row with no undo step.
+#[test]
+fn striaxformkeys_face_key_note() {
+    use stria::nle_face::{EditorState, Face, PixelOrder, synth_fixture};
+    let (tl0, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl0), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.select(0, 1).unwrap();
+    face.state.playhead = 10;
+    assert!(face.verb("pip tl"));
+    assert!(face.verb("pip key"));
+    assert_eq!(face.message_text().as_deref(), Some("pip: x 25 y 25 scale 250 keys 1"));
+    face.state.playhead = 19;
+    assert!(face.verb("pip br"));
+    assert_eq!(face.last_error.take(), None);
+    assert_eq!(face.message_text().as_deref(), Some("pip: x 725 y 725 scale 250 keys 2"));
+    assert_eq!(face.state.undo_depth(), 3);
+    face.state.playhead = 30;
+    assert!(face.verb("pip key"));
+    assert_eq!(face.last_error.take(), Some(format!("pip key: {}", timeline_core::EditError::XKey)));
+    assert_eq!(face.state.undo_depth(), 3);
+}

@@ -103,6 +103,7 @@ pub struct Clip {
     /// STRIAOPACITY (SR868): the video clip's opacity, percent 0..=[`OPAQUE`] (opaque, the default); below it the track underneath shows through.
     pub opacity: u8,
     pub xform: Xform, // STRIAPOSITIONSCALE (SR879): the per-clip position / scale (picture-in-picture; Xform::NONE = the whole frame; file tail)
+    pub xkeys: XKeys, // STRIAXFORMKEYS (SR9049): the per-clip placement keyframes on source ticks (XKeys::NONE = none: the static `xform`; file tail)
 }
 
 /// NLE4: the gain range a clip may carry, centi-dB (-144 dB .. +24 dB).
@@ -111,7 +112,7 @@ pub const GAIN_MAX_CDB: i32 = 2_400;
 
 impl Clip {
     pub fn new(src: SourceId, src_in: i64, src_out: i64, at: i64) -> Clip {
-        Clip { src, src_in, src_out, at, gain_cdb: 0, fade_in: 0, fade_out: 0, crop: Crop::NONE, opacity: OPAQUE, xform: Xform::NONE }
+        Clip { src, src_in, src_out, at, gain_cdb: 0, fade_in: 0, fade_out: 0, crop: Crop::NONE, opacity: OPAQUE, xform: Xform::NONE, xkeys: XKeys::NONE }
     }
     /// The same clip at gain `cdb` (centi-dB).
     pub fn gained(self, cdb: i32) -> Clip {
@@ -386,6 +387,8 @@ pub enum EditError {
     Opacity,
     /// STRIAPOSITIONSCALE (SR879): a placement off the frame (`x + s` or `y + s` past 1000, `s` 0) or a malformed `pip` / `scale` word.
     Xform,
+    /// STRIAXFORMKEYS (SR9049): a placement key word with the playhead off the selected clip, a ninth point, or no point to remove.
+    XKey,
 }
 
 impl core::fmt::Display for EditError {
@@ -409,6 +412,7 @@ impl core::fmt::Display for EditError {
             EditError::Crop => "crop is l t r b in 1/1000 with l + r and t + b under 1000",
             EditError::Opacity => "opacity is a percent 0..=100, and video only",
             EditError::Xform => "pip is x y and scale s in 1/1000 with x + s and y + s at most 1000",
+            EditError::XKey => "a placement key needs the playhead on the selected clip, at most 8 points, and a point there to remove",
         })
     }
 }
@@ -1761,7 +1765,7 @@ impl Timeline {
     }
     /// The placement of the clip covering tick `t` on `track` ([`Xform::NONE`] when none).
     pub fn xform_at(&self, track: usize, t: i64) -> Xform {
-        self.tracks.get(track).and_then(|tr| tr.clips.iter().find(|c| c.covers(t))).map_or(Xform::NONE, |c| c.xform)
+        self.tracks.get(track).and_then(|tr| tr.clips.iter().find(|c| c.covers(t))).map_or(Xform::NONE, |c| c.xform_at(t)) // STRIAXFORMKEYS (SR9049): a keyed clip's placement at the tick (file tail)
     }
 }
 
@@ -1826,5 +1830,126 @@ impl Xform {
     pub fn nudged(self, dx: i32, dy: i32) -> Option<Xform> {
         let xf = Xform::clamped(self.s as i32, self.x as i32 + dx, self.y as i32 + dy);
         (xf != self).then_some(xf)
+    }
+}
+
+// ---- STRIAXFORMKEYS (LEDGER SR9049): per-clip placement keyframes, linear between points through the one clamp (named tail block) ----
+// A video clip may carry up to [`XKeys::MAX`] placement points ([`Clip::xkeys`]), each a SOURCE tick and an [`Xform`], so
+// split / trim / move / slip keep every point on the frame it was set on. [`XKeys::at`] holds the first point before it and
+// the last after it, and between two points moves x, y and s linearly, through SR975's ONE clamp [`Xform::clamped`].
+// [`Clip::xform_at`] is the placement shown at a timeline tick (the static `xform` when unkeyed: byte-identical), read by
+// [`Timeline::xform_at`], the one lookup the render's composite reads; [`Clip::placed`] is what the schedule (two-layer
+// step) and the kernel Player's refusal ask. Stored in the EDL as `* UNA XKEY <src_tick> <x> <y> <s>` lines (edl.rs).
+
+/// A clip's placement points: `n` of them, sorted by source tick, unique ticks, each rect inside the frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XKeys {
+    n: u8,
+    k: [(i64, Xform); XKEYS_MAX],
+}
+
+/// The most points one clip carries (the array length; [`XKeys::MAX`]).
+const XKEYS_MAX: usize = 8;
+
+impl Default for XKeys {
+    fn default() -> XKeys {
+        XKeys::NONE
+    }
+}
+
+impl XKeys {
+    /// The most points one clip carries.
+    pub const MAX: usize = XKEYS_MAX;
+    /// No points (the clip's static `xform` is shown).
+    pub const NONE: XKeys = XKeys { n: 0, k: [(0, Xform::NONE); XKEYS_MAX] };
+    pub fn len(&self) -> usize {
+        self.n as usize
+    }
+    pub fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+    /// The points, by source tick.
+    pub fn iter(&self) -> impl Iterator<Item = (i64, Xform)> + '_ {
+        self.k[..self.len()].iter().copied()
+    }
+    /// The point at source tick `t`, if one is there.
+    pub fn get(&self, t: i64) -> Option<Xform> {
+        self.iter().find(|p| p.0 == t).map(|p| p.1)
+    }
+    /// The same points with `xf` at source tick `t` (replacing the one there); `None` when a new tick finds them full.
+    pub fn with(self, t: i64, xf: Xform) -> Option<XKeys> {
+        let mut out = self;
+        if let Some(i) = self.iter().position(|p| p.0 == t) {
+            out.k[i].1 = xf;
+            return Some(out);
+        }
+        if self.len() >= XKeys::MAX {
+            return None;
+        }
+        let i = self.iter().position(|p| p.0 > t).unwrap_or(self.len());
+        out.k.copy_within(i..self.len(), i + 1);
+        out.k[i] = (t, xf);
+        out.n += 1;
+        Some(out)
+    }
+    /// The same points without the one at source tick `t`; `None` when none is there.
+    pub fn without(self, t: i64) -> Option<XKeys> {
+        let i = self.iter().position(|p| p.0 == t)?;
+        let mut out = self;
+        out.k.copy_within(i + 1..self.len(), i);
+        out.n -= 1;
+        out.k[out.len()] = (0, Xform::NONE);
+        Some(out)
+    }
+    /// Sorted, unique ticks, at most [`XKeys::MAX`], every rect inside the frame.
+    pub fn ok(&self) -> bool {
+        self.len() <= XKeys::MAX && self.iter().all(|p| p.1.ok()) && self.k[..self.len()].windows(2).all(|w| w[0].0 < w[1].0)
+    }
+    /// The placement at source tick `t`: `None` with no points; the first point's before it, the last point's after it,
+    /// else x, y and s linear between the two points around `t`, through [`Xform::clamped`].
+    pub fn at(&self, t: i64) -> Option<Xform> {
+        let k = &self.k[..self.len()];
+        let (first, last) = (*k.first()?, k[k.len() - 1]);
+        if t <= first.0 {
+            return Some(first.1);
+        }
+        if t >= last.0 {
+            return Some(last.1);
+        }
+        let i = k.iter().position(|p| p.0 > t)?;
+        let ((t0, a), (t1, b)) = (k[i - 1], k[i]);
+        let lerp = |p: u16, q: u16| (p as i64 + (q as i64 - p as i64) * (t - t0) / (t1 - t0)) as i32;
+        Some(Xform::clamped(lerp(a.s, b.s), lerp(a.x, b.x), lerp(a.y, b.y)))
+    }
+}
+
+impl Clip {
+    /// The source tick timeline tick `t` maps to on this clip (rate 1).
+    pub fn src_tick(&self, t: i64) -> i64 {
+        self.src_in + (t - self.at)
+    }
+    /// The placement shown at timeline tick `t`: the points' ([`XKeys::at`]) when keyed, else the static `xform`.
+    pub fn xform_at(&self, t: i64) -> Xform {
+        self.xkeys.at(self.src_tick(t)).unwrap_or(self.xform)
+    }
+    /// True when the clip is placed anywhere: a static placement other than the whole frame, or any point.
+    pub fn placed(&self) -> bool {
+        self.xform != Xform::NONE || !self.xkeys.is_empty()
+    }
+}
+
+impl Timeline {
+    /// The same timeline with clip `idx` of `track` carrying the points `keys` ([`XKeys::NONE`] clears). Refused: no such
+    /// track (`NoTrack`) or clip (`NoClip`), an audio track (`Kind`), points out of order or off the frame (`Xform`).
+    pub fn set_xkeys(&self, track: usize, idx: usize, keys: XKeys) -> Result<Timeline, EditError> {
+        if self.tracks.get(track).ok_or(EditError::NoTrack)?.kind != Kind::Video {
+            return Err(EditError::Kind);
+        }
+        if !keys.ok() {
+            return Err(EditError::Xform);
+        }
+        let mut tl = self.clone();
+        clip_mut(&mut tl, track, idx)?.xkeys = keys;
+        Ok(tl)
     }
 }

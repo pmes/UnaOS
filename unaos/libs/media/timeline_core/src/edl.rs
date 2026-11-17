@@ -213,7 +213,7 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
             want_comment(l, line, last_trans.and_then(|i| trans.get_mut(i)).filter(|x| x.0 == Kind::Video).map(|x| &mut x.2))?; if let Some(r) = l.strip_prefix("* UNA EASE ") {
                 ease_comment(r, line, last_trans.and_then(|i| trans.get_mut(i)).map(|x| &mut x.2))?; // NLEWIPES (SR679)
             }
-            xform_comment(l, line, cur.and_then(|i| events.get_mut(i)).filter(|e| e.1 == Kind::Video).map(|e| &mut e.3))?; crop_comment(l, line, cur.and_then(|i| events.get_mut(i)).filter(|e| e.1 == Kind::Video).map(|e| &mut e.3))?; if l.starts_with("* UNA GAIN ") || l.starts_with("* UNA FADE ") {
+            xkey_comment(l, line, cur.and_then(|i| events.get_mut(i)).filter(|e| e.1 == Kind::Video).map(|e| &mut e.3))?; xform_comment(l, line, cur.and_then(|i| events.get_mut(i)).filter(|e| e.1 == Kind::Video).map(|e| &mut e.3))?; crop_comment(l, line, cur.and_then(|i| events.get_mut(i)).filter(|e| e.1 == Kind::Video).map(|e| &mut e.3))?; if l.starts_with("* UNA GAIN ") || l.starts_with("* UNA FADE ") {
                 audio_comment(l, fps, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?;
             }
             alpha_comment(l, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?; if l.starts_with("* UNA XFADE") {
@@ -438,7 +438,7 @@ pub fn write(tl: &Timeline, title: &str) -> Result<String, EdlError> {
             timecode(c.end(), fps)
         ));
         s.push_str(&ease_line(tl.tracks[*ti].transitions.iter().find(|x| x.at == c.at))); s.push_str(&want_line(tl.tracks[*ti].transitions.iter().find(|x| x.at == c.at))); // NLEWIPES (SR679)
-        s.push_str(&crop_line(c)); s.push_str(&xform_line(c)); if c.gain_cdb != 0 {
+        s.push_str(&crop_line(c)); s.push_str(&xform_line(c)); s.push_str(&xkey_lines(c)); if c.gain_cdb != 0 {
             s.push_str(&format!("* UNA GAIN {}\n", c.gain_cdb));
         }
         if c.fade_in != 0 || c.fade_out != 0 {
@@ -703,4 +703,34 @@ fn xform_line(c: &Clip) -> String {
         return String::new();
     }
     format!("* UNA XFORM {} {} {}\n", c.xform.x, c.xform.y, c.xform.s)
+}
+
+// ---- STRIAXFORMKEYS (LEDGER SR9049): the clip's `* UNA XKEY` lines (named tail block) ----
+// `* UNA XKEY <src_tick> <x> <y> <s>` is one placement point ([`crate::XKeys`]) of the VIDEO event line above it: its
+// source tick and its rect in 1/1000 of the frame, written right after the clip's XFORM line, one line per point, only
+// when the clip is keyed, so an EDL with no points writes as before. One with no video event above it, not four integers
+// (a negative tick), a rect off the frame, a second point at one tick, or a point past [`crate::XKeys::MAX`] is a syntax error.
+
+/// STRIAXFORMKEYS: apply a `* UNA XKEY` line to the video event above it (`None`: none there); any other line is not this one.
+fn xkey_comment(l: &str, line: usize, clip: Option<&mut Clip>) -> Result<(), EdlError> {
+    let Some(r) = l.strip_prefix("* UNA XKEY ") else { return Ok(()) };
+    let c = clip.ok_or(EdlError::Syntax { line })?;
+    let w: Vec<&str> = r.split_whitespace().collect();
+    let (t, xf) = match w.as_slice() {
+        [t, x, y, s] => match (t.parse::<i64>(), x.parse::<u16>(), y.parse::<u16>(), s.parse::<u16>()) {
+            (Ok(t), Ok(x), Ok(y), Ok(s)) if t >= 0 => (t, crate::Xform { x, y, s }),
+            _ => return Err(EdlError::Syntax { line }),
+        },
+        _ => return Err(EdlError::Syntax { line }),
+    };
+    if !xf.ok() || c.xkeys.get(t).is_some() {
+        return Err(EdlError::Syntax { line });
+    }
+    c.xkeys = c.xkeys.with(t, xf).ok_or(EdlError::Syntax { line })?;
+    Ok(())
+}
+
+/// STRIAXFORMKEYS: the clip's `* UNA XKEY` lines, or nothing when it has no points.
+fn xkey_lines(c: &Clip) -> String {
+    c.xkeys.iter().map(|(t, xf)| format!("* UNA XKEY {} {} {} {}\n", t, xf.x, xf.y, xf.s)).collect()
 }

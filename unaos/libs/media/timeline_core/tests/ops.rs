@@ -655,3 +655,103 @@ mod striaxformmore {
         assert_eq!(st.verb("pip left"), Some(Err(EditError::Kind)));
     }
 }
+
+// ---- STRIAXFORMKEYS (LEDGER SR9049): per-clip placement keyframes, their words and their EDL lines (named tail block) ----
+mod striaxformkeys {
+    use super::base;
+    use timeline_core::edl::{self, EdlError};
+    use timeline_core::editor::EditorState;
+    use timeline_core::{Clip, EditError, XKeys, Xform};
+
+    #[test]
+    fn striaxformkeys_keys_interpolate_through_the_clamp() {
+        let half = Xform { x: 500, y: 500, s: 500 };
+        assert_eq!(XKeys::NONE.at(0), None, "no points: the static placement");
+        let k = XKeys::NONE.with(10, half).unwrap().with(0, Xform::NONE).unwrap();
+        assert_eq!(k.iter().map(|p| p.0).collect::<Vec<_>>(), vec![0, 10], "points sorted by tick");
+        assert_eq!(k.at(-3), Some(Xform::NONE), "before the first point: held");
+        assert_eq!(k.at(5), Some(Xform { x: 250, y: 250, s: 750 }), "linear between points");
+        assert_eq!(k.at(99), Some(half), "after the last point: held");
+        let mut full = XKeys::NONE;
+        for t in 0..XKeys::MAX as i64 {
+            full = full.with(t * 10, Xform::PIP).unwrap();
+        }
+        assert_eq!(full.len(), XKeys::MAX);
+        assert_eq!(full.with(5, Xform::PIP), None, "a ninth point is refused");
+        assert_eq!(full.with(10, Xform::NONE).map(|f| (f.len(), f.get(10))), Some((XKeys::MAX, Some(Xform::NONE))), "a point at a held tick is replaced");
+        assert_eq!(full.without(5), None, "no point there");
+        assert_eq!(full.without(10).map(|f| (f.len(), f.get(10), f.get(20))), Some((XKeys::MAX - 1, None, Some(Xform::PIP))));
+        let (tl, a, _) = base();
+        let k2 = XKeys::NONE.with(20, Xform::NONE).unwrap().with(30, half).unwrap();
+        let mut c = Clip::new(a, 20, 40, 100);
+        assert!(!c.placed(), "a new clip is not placed");
+        c.xkeys = k2;
+        assert!(c.placed());
+        assert_eq!((c.src_tick(105), c.xform_at(105)), (25, Xform { x: 250, y: 250, s: 750 }), "points on source ticks");
+        let t2 = tl.set_xkeys(0, 1, k2).unwrap();
+        assert_eq!((t2.xform_at(0, 15), t2.xform_at(0, 10)), (Xform { x: 250, y: 250, s: 750 }, Xform::NONE), "the one lookup follows the points");
+        assert_eq!(tl.set_xkeys(1, 0, k2), Err(EditError::Kind));
+        assert_eq!(tl.set_xkeys(0, 9, k2), Err(EditError::NoClip));
+    }
+
+    #[test]
+    fn striaxformkeys_key_words_one_undo_step_each() {
+        let (tl, _, _) = base();
+        let mut st = EditorState::new(tl.clone());
+        assert_eq!(st.verb("pip key"), Some(Err(EditError::NoClip)));
+        st.select(0, 1).unwrap();
+        st.playhead = 10;
+        assert_eq!(st.verb("pip key"), Some(Ok(())));
+        assert_eq!((st.undo_depth(), st.selected().map(|c| c.xkeys.get(20))), (1, Some(Some(Xform::NONE))));
+        assert_eq!(st.verb("pip tl"), Some(Ok(())), "a keyed clip's placement word edits the point at the playhead");
+        assert_eq!((st.undo_depth(), st.selected().map(|c| (c.xform, c.xkeys.get(20)))), (2, Some((Xform::NONE, Xform::corner("tl")))));
+        st.playhead = 19;
+        assert_eq!(st.verb("pip br"), Some(Ok(())));
+        assert_eq!((st.undo_depth(), st.selected().map(|c| c.xkeys.len())), (3, Some(2)));
+        st.playhead = 14;
+        assert_eq!(st.selected().map(|c| c.xform_at(14)), Some(Xform { x: 336, y: 336, s: 250 }), "linear between the points");
+        assert_eq!(st.timeline.xform_at(0, 14), Xform { x: 336, y: 336, s: 250 });
+        assert_eq!(st.verb("pip unkey"), Some(Err(EditError::XKey)), "no point at the playhead");
+        assert_eq!(st.undo_depth(), 3, "a refused word commits nothing");
+        st.playhead = 19;
+        assert_eq!(st.verb("pip br"), Some(Ok(())), "the placement shown there again");
+        assert_eq!(st.undo_depth(), 3, "the shown placement unchanged commits nothing");
+        assert_eq!(st.verb("pip unkey"), Some(Ok(())));
+        assert_eq!((st.undo_depth(), st.selected().map(|c| c.xkeys.len())), (4, Some(1)));
+        st.playhead = 30;
+        assert_eq!(st.verb("pip key"), Some(Err(EditError::XKey)), "the playhead off the clip");
+        assert_eq!(st.verb("pip tl"), Some(Err(EditError::XKey)));
+        assert_eq!(st.verb("pip unkey all"), Some(Ok(())));
+        assert_eq!((st.undo_depth(), st.selected().map(|c| c.xkeys.is_empty())), (5, Some(true)));
+        assert_eq!(st.verb("pip unkey all"), Some(Err(EditError::XKey)), "no points to clear");
+        assert_eq!(st.undo_depth(), 5);
+        for _ in 0..5 {
+            assert!(st.undo());
+        }
+        assert_eq!(st.timeline, tl);
+        st.timeline.tracks[1].clips = tl.tracks[0].clips.clone();
+        st.select(1, 0).unwrap();
+        st.playhead = 0;
+        assert_eq!(st.verb("pip key"), Some(Err(EditError::Kind)));
+    }
+
+    #[test]
+    fn striaxformkeys_edl_xkey_round_trip_and_refusals() {
+        let (tl, _, _) = base();
+        let plain = edl::write(&tl, "T").unwrap();
+        assert!(!plain.contains("XKEY"), "no points: the EDL as before");
+        let k = XKeys::NONE.with(20, Xform::PIP).unwrap().with(29, Xform { x: 0, y: 0, s: 500 }).unwrap();
+        let t2 = tl.set_xkeys(0, 1, k).unwrap();
+        let text = edl::write(&t2, "T").unwrap();
+        assert!(text.contains("* UNA XKEY 20 725 725 250\n* UNA XKEY 29 0 0 500\n"), "{text}");
+        let back = edl::parse(&text, 25).unwrap();
+        assert_eq!(back.tracks[0].clips[1].xkeys, k);
+        assert_eq!(edl::write(&back, "T").unwrap(), text);
+        for bad in ["* UNA XKEY 20 0 0 500", "* UNA XKEY 29 600 0 500", "* UNA XKEY 29 0 0", "* UNA XKEY -1 0 0 500"] {
+            let t = text.replace("* UNA XKEY 29 0 0 500", bad);
+            assert!(matches!(edl::parse(&t, 25), Err(EdlError::Syntax { .. })), "{bad}");
+        }
+        let lead = plain.replacen("\n001 ", "\n* UNA XKEY 0 0 0 500\n001 ", 1);
+        assert!(lead != plain && matches!(edl::parse(&lead, 25), Err(EdlError::Syntax { .. })), "a point with no event above");
+    }
+}

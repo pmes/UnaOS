@@ -3112,7 +3112,7 @@ impl Face {
         }
         match self.state.verb(v)? {
             Ok(()) => {
-                self.xform_note = self.state.selected().map(|c| format!("pip: x {} y {} scale {}", c.xform.x, c.xform.y, c.xform.s));
+                self.xform_note = self.state.selected().map(|c| (c.xform_at(self.state.playhead), c.xkeys.len())).map(|(xf, n)| format!("pip: x {} y {} scale {}{}", xf.x, xf.y, xf.s, if n > 0 { format!(" keys {n}") } else { String::new() })); // STRIAXFORMKEYS (SR9049): the placement shown at the playhead, its key count when keyed
             }
             Err(e) => self.last_error = Some(format!("{v}: {e}")),
         }
