@@ -1623,6 +1623,16 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 style.paint.decoration_thickness = Some(t);
             }
         }
+        "text-underline-offset" => {
+            if let Some(o) = underline_offset_value(value, cx) {
+                style.paint.underline_offset = Some(o);
+            }
+        }
+        "text-underline-position" => {
+            if let Some(p) = underline_position_code(value) {
+                style.paint.underline_position = Some(p);
+            }
+        }
         "white-space" | "white-space-collapse" => {
             let code = match value {
                 "normal" => Some(0),
@@ -2600,7 +2610,7 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
         background, color, font_size, weight, border, line_height, hidden, clip, underline,
         nowrap, family, italic, text_transform, border_width, bg_repeat, text_hidden,
         mask_repeat, text_align, object_fit, flex_container, border_style, radius,
-        white_space, word_break, overflow_wrap, letter_spacing, line_through, display_kind, decoration_color, decoration_style, decoration_thickness,
+        white_space, word_break, overflow_wrap, letter_spacing, line_through, display_kind, decoration_color, decoration_style, decoration_thickness, underline_offset, underline_position,
         ua_vmargin, border_collapse, caption_side, border_spacing, has_width, position_kind, z_index,
         list_item, list_style, vertical_align, float, opacity, font_size_rel, table_fixed, bg_alpha, border_alpha,
         stretch, word_spacing, rtl, clear, tf_translate, tf_rotate, tf_scale, transform_origin, inset_px,
@@ -3705,7 +3715,7 @@ fn noninherited_initial<'a>(prop: &str, value: &'a str) -> &'a str {
         "width" | "height" | "min-width" | "min-height" | "max-width" | "max-height" => "auto",
         "border" | "border-top" | "border-right" | "border-bottom" | "border-left" | "border-style"
         | "border-top-style" | "border-right-style" | "border-bottom-style" | "border-left-style" => "none",
-        "border-width" => "3px", "text-decoration-style" => "solid", "text-decoration-thickness" => "auto", "border-top-color" | "border-right-color" | "border-bottom-color" | "border-left-color" => "currentcolor", // SR1014 fold: the branch's table row
+        "border-width" => "3px", "text-decoration-style" => "solid", "text-decoration-thickness" => "auto", "border-top-color" | "border-right-color" | "border-bottom-color" | "border-left-color" => "currentcolor", "text-underline-offset" => "auto", // SR1014 fold: the branch's table row; SR1045 the offset's
         // AETHERCSSWIDENONINHERITEDREST (SR848): the rest of the non-inherited arms, each its arm's own literal.
         "position" => "static",
         "float" | "clear" => "none",
@@ -4112,7 +4122,7 @@ pub const ALL_LONGHANDS: &[&str] = &[
     "background-color", "background-image", "background-size", "background-position", "background-repeat", "box-shadow",
     "color", "font-family", "font-stretch", "font-synthesis-weight", "font-synthesis-style", "font-synthesis-small-caps", "font-variant-caps", "font-size", "font-weight", "font-style", "line-height",
     "word-spacing", "letter-spacing", "text-shadow", "visibility", "opacity",
-    "text-decoration-line", "white-space", "white-space-collapse", "word-break", "overflow-wrap", "box-sizing", "text-transform",
+    "text-decoration-line", "white-space", "white-space-collapse", "word-break", "overflow-wrap", "box-sizing", "text-transform", "text-underline-offset", "text-underline-position", "text-decoration-color", "text-decoration-style", "text-decoration-thickness", // SR1045 (SR1018 / SR1038 arms)
     "object-fit", "object-position", "mask-image", "mask-size", "mask-position", "mask-repeat",
     "border-top-width", "border-right-width", "border-bottom-width", "border-left-width",
     "border-top-left-radius", "border-top-right-radius", "border-bottom-right-radius", "border-bottom-left-radius",
@@ -4149,4 +4159,56 @@ fn apply_css_wide_all<H: Host>(value: &str, style: &mut SpecifiedStyle<H>, cx: &
         "revert" | "revert-layer" => {}
         _ => H::record_css(&format!("all-value:{}", clip(value))),
     }
+}
+
+// ---- AETHERCSSTEXTUNDERLINEOFFSET (LEDGER SR1045): text-underline-offset and text-underline-position values (named tail block) ----
+
+/// AETHERCSSTEXTUNDERLINEOFFSET (SR1045): a `text-underline-position` value (css-text-decor-4 §2.5:
+/// `auto | [ from-font | under ] || [ left | right ]`) as [`PaintStyle::underline_position`]'s code: 0 auto (and
+/// `initial`), 1 from-font, 2 under. `left` / `right` place the line in VERTICAL writing only, so they keep the
+/// horizontal part (bare `left` / `right` = auto; AETHER-CSS-TEXT-UNDERLINE-POSITION-VERTICAL owed). Anything else None
+/// (`inherit` / `unset` never reach here: the inherit bit takes them in `css_wide`).
+pub fn underline_position_code(v: &str) -> Option<u8> {
+    let v = v.trim();
+    if v.eq_ignore_ascii_case("auto") || v.eq_ignore_ascii_case("initial") {
+        return Some(0);
+    }
+    let (mut horiz, mut side) = (None, false);
+    for w in v.split_ascii_whitespace() {
+        let is = |k: &str| w.eq_ignore_ascii_case(k);
+        if (is("from-font") || is("under")) && horiz.is_none() {
+            horiz = Some(if is("under") { 2 } else { 1 });
+        } else if (is("left") || is("right")) && !side {
+            side = true;
+        } else {
+            return None;
+        }
+    }
+    if horiz.is_none() && !side {
+        return None;
+    }
+    Some(horiz.unwrap_or(0))
+}
+
+/// AETHERCSSTEXTUNDERLINEOFFSET (SR1045): a `text-underline-offset` value (css-text-decor-4 §2.6) in the
+/// [`PaintStyle::underline_offset`] marker shape: `auto` (and `initial` / `unset`, which SR832's table rewrites to it)
+/// is `Some(None)`; a length, negative allowed, is `Some(Some(px))` through [`parse_px`] (em at the parse context's
+/// font); a percentage is of 1em (`N%` = `N/100 em`); a bare non-zero number, `inherit` or anything else None.
+fn underline_offset_value(v: &str, cx: &ParseCx) -> Option<Option<f32>> {
+    let v = v.trim();
+    if v.eq_ignore_ascii_case("auto") || v.eq_ignore_ascii_case("initial") || v.eq_ignore_ascii_case("unset") {
+        return Some(None);
+    }
+    if let Some(n) = v.strip_suffix('%') {
+        let pct = n.trim().parse::<f32>().ok()?;
+        return parse_px(&format!("{}em", pct / 100.0), cx).map(Some);
+    }
+    if !v.starts_with(|c: char| c.is_ascii_digit() || c == '.' || c == '-' || c == '+') {
+        return None;
+    }
+    let bare = v.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '-' || c == '+');
+    if bare && v.parse::<f32>().ok() != Some(0.0) {
+        return None;
+    }
+    parse_px(v, cx).filter(|px| px.is_finite()).map(Some)
 }

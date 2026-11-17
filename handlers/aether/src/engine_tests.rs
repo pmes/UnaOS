@@ -7558,4 +7558,80 @@ mod tests {
         let mut e = css_wide_all_engine();
         assert_eq!(font_shorthand_cs(&mut e, "ag", "color"), "rgb(0, 128, 0)", "the later green wins");
     }
+
+    // ---- AETHERCSSTEXTUNDERLINEOFFSET (LEDGER SR1045): text-underline-offset / -position place the underline (named tail block) ----
+
+    /// AETHERCSSTEXTUNDERLINEOFFSET (SR1045): 20px serif rows of "gyp gyp" (black text, red decorations, 20px apart): `#ua`
+    /// the auto underline (the twin), `#uo` `text-underline-offset: 4px`, `#uu` `text-underline-position: under`; `#pu` a
+    /// `text-underline-position: under` parent and `#po` a `text-underline-offset: 6px` parent, each holding an underlined
+    /// span (`#pus` / `#pos`) that sets neither.
+    fn text_underline_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 20px }
+            div, span { text-decoration-color: red }
+            </style></head><body style="margin:0;font:20px serif;color:black">
+            <div id="ua" style="text-decoration-line:underline">gyp gyp</div>
+            <div id="uo" style="text-decoration-line:underline;text-underline-offset:4px">gyp gyp</div>
+            <div id="uu" style="text-decoration-line:underline;text-underline-position:under">gyp gyp</div>
+            <div id="pu" style="text-underline-position:under"><span id="pus" style="text-decoration-line:underline">gyp gyp</span></div>
+            <div id="po" style="text-underline-offset:6px"><span id="pos" style="text-decoration-line:underline">gyp gyp</span></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSTEXTUNDERLINEOFFSET (SR1045): the sorted distinct rows of element `id`'s rect, extended 8px down, holding a
+    /// pixel `hue` accepts.
+    fn text_underline_rows(e: &mut crate::AetherEngine, id: &str, hue: fn((u8, u8, u8)) -> bool) -> Vec<usize> {
+        let (l, t, w, h) = imgalt_rect(e, id);
+        let (sw, sh) = (e.width as usize, e.height as usize);
+        let (x0, x1) = (l.floor().max(0.0) as usize, ((l + w).ceil() as usize).min(sw));
+        let (y0, y1) = (t.floor().max(0.0) as usize, ((t + h).ceil() as usize + 8).min(sh));
+        let mut rows: Vec<usize> = (y0..y1).filter(|&y| (x0..x1).any(|x| hue(imgalt_px(e, x, y)))).collect();
+        rows.dedup();
+        rows
+    }
+
+    /// AETHERCSSTEXTUNDERLINEOFFSET (SR1045): `text-underline-offset: 4px` paints the same band 4 rows lower than the auto
+    /// twin (each measured from its own box top).
+    #[test]
+    fn text_underline_offset_four_rows_lower() {
+        let mut e = text_underline_engine();
+        let auto = text_underline_rows(&mut e, "ua", css_wide_red);
+        let off = text_underline_rows(&mut e, "uo", css_wide_red);
+        assert!(!auto.is_empty() && !off.is_empty(), "both paint red: {auto:?} {off:?}");
+        let (ta, to) = (imgalt_rect(&mut e, "ua").1.floor() as i64, imgalt_rect(&mut e, "uo").1.floor() as i64);
+        assert_eq!(off[0] as i64 - to, auto[0] as i64 - ta + 4, "4 rows lower: {off:?} vs {auto:?}");
+        assert_eq!(off.len(), auto.len(), "the same band height");
+    }
+
+    /// AETHERCSSTEXTUNDERLINEOFFSET (SR1045): `text-underline-position: under` paints below every row of the "gyp" glyph
+    /// ink; the auto twin's band runs through the descenders (armed).
+    #[test]
+    fn text_underline_position_under_clears_descenders() {
+        let mut e = text_underline_engine();
+        let (ink, red) = (text_underline_rows(&mut e, "ua", text_decoration_black), text_underline_rows(&mut e, "ua", css_wide_red));
+        assert!(!ink.is_empty() && !red.is_empty(), "armed: #ua paints text and an underline");
+        assert!(red[0] <= *ink.last().unwrap(), "armed: the auto underline cuts the descenders: red {red:?} ink to {}", ink.last().unwrap());
+        let (ink, red) = (text_underline_rows(&mut e, "uu", text_decoration_black), text_underline_rows(&mut e, "uu", css_wide_red));
+        assert!(!ink.is_empty() && !red.is_empty(), "#uu paints text and an underline");
+        assert!(red[0] > *ink.last().unwrap(), "under is below the descenders: red {red:?} ink to {}", ink.last().unwrap());
+    }
+
+    /// AETHERCSSTEXTUNDERLINEOFFSET (SR1045): text-underline-position is inherited: the span under the `under` parent paints
+    /// below its descenders; text-underline-offset is not: the span under the 6px parent paints at the auto rows, through
+    /// its descenders.
+    #[test]
+    fn text_underline_position_inherits_offset_not() {
+        let mut e = text_underline_engine();
+        let (ink, red) = (text_underline_rows(&mut e, "pus", text_decoration_black), text_underline_rows(&mut e, "pus", css_wide_red));
+        assert!(!ink.is_empty() && !red.is_empty(), "#pus paints text and an underline");
+        assert!(red[0] > *ink.last().unwrap(), "the inherited under: red {red:?} ink to {}", ink.last().unwrap());
+        let (ink, red) = (text_underline_rows(&mut e, "pos", text_decoration_black), text_underline_rows(&mut e, "pos", css_wide_red));
+        assert!(!ink.is_empty() && !red.is_empty(), "#pos paints text and an underline");
+        assert!(red[0] <= *ink.last().unwrap(), "the parent's offset does not reach the span: red {red:?} ink to {}", ink.last().unwrap());
+    }
 }
