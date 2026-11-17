@@ -220,13 +220,14 @@ pub struct Face {
     roll_tool: bool, // STRIAROLLMORE (SR954): a trim-handle drag rolls its cut (file tail)
     slip_hold: Option<SlipHold>, // STRIASLIPVIEWMORE (SR946): a word slip / slide's pair held until the next action (file tail)
     crop_drag: Option<view::CropDrag>, // STRIACROPMORE (SR960): the live crop drag on the preview picture (file tail); STRIAUNDOMORE (SR973): the message row's note, read after last_error (file tail)
+    pub note: Option<String>, // STRIASNAPNEXT (SR990): a success line on the message row, read after last_error, cleared by the next acting input (file tail)
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, note: None, rate: 1, drag: None, drag_shown: DragShown::default(), pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, frame_saved: None, peaks: WavePeaks::default(), tc: None, slip_view: None, loudness: None, meter_hold: MeterHold::default(), help_query: None, info: None, export_queue: std::collections::VecDeque::new(), snap_off: false, autosave: Autosave::default(), keymap: Keymap::default(), proxy: None, reel_paths: Vec::new(), zoom_fit: None, pcache: PreviewCache::default(), proxy_queue: Vec::new(), proxy_hold: None, laid: None, lcache: LabelCache::default(), xform_note: None, export_preset: None, preset_note: None, roll_tool: false, slip_hold: None, crop_drag: None, note: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, note: None, rate: 1, drag: None, drag_shown: DragShown::default(), pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, frame_saved: None, peaks: WavePeaks::default(), tc: None, slip_view: None, loudness: None, meter_hold: MeterHold::default(), help_query: None, info: None, export_queue: std::collections::VecDeque::new(), snap_off: false, autosave: Autosave::default(), keymap: Keymap::default(), proxy: None, reel_paths: Vec::new(), zoom_fit: None, pcache: PreviewCache::default(), proxy_queue: Vec::new(), proxy_hold: None, laid: None, lcache: LabelCache::default(), xform_note: None, export_preset: None, preset_note: None, roll_tool: false, slip_hold: None, crop_drag: None, note: None, note: None }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -234,7 +235,7 @@ impl Face {
     }
     /// One message from the surface or the buttons; true when the canvas must be repainted.
     pub fn on(&mut self, msg: &SMessage) -> bool {
-        if let Some(r) = self.bin_input(msg) { return r; } if let Some(r) = self.preview_meter_input(msg) { return r; } if let Some(r) = self.crop_drag_on(msg) { return r; } if !self.takes(msg) { return false; } self.laid_clear(msg); self.xform_note = None; self.preset_note = None; self.note = None; if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } if let Some(r) = self.clipboard_key(msg) { return r; } if let Some(r) = self.help_type_input(msg) { return r; } if let Some(r) = self.history_pick(msg) { return r; } // STRIAPASTEKEYS (SR921): BrowserCopy / BrowserPaste reach Face::key as the Ctrl+c / Ctrl+v chords (file tail); NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's; STRIAPROJECTBIN (SR885): the bin Surface's pointer first (file tail)
+        if let Some(r) = self.bin_input(msg) { return r; } if let Some(r) = self.preview_meter_input(msg) { return r; } if let Some(r) = self.crop_drag_on(msg) { return r; } if !self.takes(msg) { return false; } self.laid_clear(msg); self.xform_note = None; self.preset_note = None; self.note = None; self.clear_note(msg); if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } if let Some(r) = self.clipboard_key(msg) { return r; } if let Some(r) = self.help_type_input(msg) { return r; } if let Some(r) = self.history_pick(msg) { return r; } // STRIAPASTEKEYS (SR921): BrowserCopy / BrowserPaste reach Face::key as the Ctrl+c / Ctrl+v chords (file tail); NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's; STRIAPROJECTBIN (SR885): the bin Surface's pointer first (file tail)
         match msg {
             SMessage::Input { target, text } if target == SURFACE => self.verb(text), SMessage::ConsoleInput(q) => self.help_field(q), // STRIAHELPMORE (SR977): the bar's help query field, its Enter (file tail)
             SMessage::BrowserClick(x, y, _) if !self.buttons => self.click(*x, *y),
@@ -2420,7 +2421,7 @@ impl Face {
     }
     /// The face's message line: the last error while one stands, else [`Face::reel_line`].
     pub fn message_text(&self) -> Option<String> {
-        self.last_error.clone().or_else(|| self.info_text()).or_else(|| self.xform_note.clone()).or_else(|| self.preset_note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.export.as_ref().map(|j| job_line(j) + &self.waiting_note())).or_else(|| self.laid.clone()).or_else(|| self.shuttle_line()).or_else(|| self.roll_tool_note()).or_else(|| self.reel_line()) // STRIAXFORMPRESETS (SR938): the placement line after a pip / scale word (file tail) // STRIAJKLMORE (SR945): the shuttle rate after the export line (file tail) // STRIAEXPORTQUEUEMORE (SR971): the running row names the waiting count (file tail)
+        self.last_error.clone().or_else(|| self.info_text()).or_else(|| self.xform_note.clone()).or_else(|| self.preset_note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.export.as_ref().map(|j| job_line(j) + &self.waiting_note())).or_else(|| self.laid.clone()).or_else(|| self.shuttle_line()).or_else(|| self.roll_tool_note()).or_else(|| self.reel_line()) // STRIAXFORMPRESETS (SR938): the placement line after a pip / scale word (file tail) // STRIAJKLMORE (SR945): the shuttle rate after the export line (file tail) // STRIAEXPORTQUEUEMORE (SR971): the running row names the waiting count (file tail)
     }
     /// The message over a painted canvas: one line at x 4, baseline the message row's foot - 4, clipped to the canvas width, through
     /// [`Labels`]; unchanged with labels off, on the tracks Surface, or a band under [`MESSAGE_H`].
@@ -5060,7 +5061,7 @@ impl Face {
             return None;
         }
         self.snap_off = !self.snap_off;
-        self.last_error = Some(format!("snap: {}", if self.snap_off { "off" } else { "on" }));
+        self.note = Some(format!("snap: {}", if self.snap_off { "off" } else { "on" })); // STRIASNAPNEXT (SR990): a success line is a note, not an error
         Some(true)
     }
     /// A plain press snaps (the default; Alt at the press inverts it).
@@ -8479,5 +8480,24 @@ mod audioscrubnext_tests {
         mute.on(&SMessage::BrowserMouseMove(124.0, 70.0, 0));
         assert!(!mute.scrub_pending());
         assert!(!mute.tick());
+    }
+}
+
+// ---- STRIASNAPNEXT (LEDGER SR990): the face note — a success line on the message row (named tail block) ----
+// `Face.note` is read by `message_text` after `last_error` (an error wins) and before the export line and the reel
+// line; `serve` and the witness never take it, so it stands across repaints until the next acting input clears it.
+impl Face {
+    /// Clear the note on an acting input: a typed word, a click, a press, select-all, a named key, a one-char text
+    /// key. A move, a release, the wheel, a zoom and a resize keep it.
+    fn clear_note(&mut self, msg: &SMessage) {
+        let acts = match msg {
+            SMessage::Input { .. } | SMessage::BrowserClick(..) | SMessage::BrowserButton { down: true, .. } | SMessage::BrowserSelectAll => true,
+            SMessage::BrowserKey(k) => k.chars().count() > 1,
+            SMessage::BrowserText(t) => t.chars().count() == 1,
+            _ => false,
+        };
+        if acts {
+            self.note = None;
+        }
     }
 }
