@@ -3194,10 +3194,10 @@ mod shorthand_computed_tests {
             ("a", "flex", "0 1 auto"),
             ("a", "border-width", "0px"),
             ("a", "border-style", "none"),
-            // Owed AETHER-CSSOM-BORDER-COMPUTED / AETHER-CSSOM-INITIAL-GRAMMAR-ROWS: a colour or border-image longhand
-            // has no computed row, so these rows still read "".
+            // Owed AETHER-CSSOM-BORDER-COMPUTED / AETHER-CSSOM-INITIAL-GRAMMAR-ROWS: border / outline / background still
+            // have a longhand with no computed row, so they read "".
             ("a", "border", ""),
-            ("a", "border-color", ""),
+            ("a", "border-color", "rgb(0, 0, 0)"), // SR1104: the four colour longhands are report columns, so border-color composes
             ("a", "outline", ""),
             ("a", "background", ""),
             ("o", "overflow", "hidden visible"),
@@ -3231,8 +3231,8 @@ mod shorthand_computed_before_cascade_tests {
     #[test]
     fn shorthand_computed_before_cascade_covered_rows() {
         let covered: Vec<&str> = SHORTHANDS.iter().map(|(s, _)| *s).filter(|s| report_covered(s)).collect();
-        assert_eq!(covered, vec!["border-width", "border-style", "border-left", "margin", "padding"]); // SR1103 (fold compose): the three side style columns cover border-style and, with SR1096's width and the left colour column, border-left
-        for sh in ["border-color", "gap", "inset", "overflow", "border-top", "font-synthesis", "not-a-shorthand"] {
+        assert_eq!(covered, vec!["border-width", "border-style", "border-color", "border-top", "border-right", "border-bottom", "border-left", "margin", "padding"]); // SR1103 / SR1104 (fold compose): the side style and colour columns cover the three four-value rows and the four side rows
+        for sh in ["border", "gap", "inset", "overflow", "font-synthesis", "not-a-shorthand"] {
             assert!(!report_covered(sh), "{sh}: not covered");
         }
     }

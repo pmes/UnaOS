@@ -6625,7 +6625,7 @@ mod tests {
     #[test]
     fn cssom_direction_column_report_width() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 37); // SR1036 fold: unicode-bidi (SR1008) is column 21, SR1036 appends white-space-collapse / text-wrap-mode / text-decoration-color as 22-24 (SR1096: nine box-side columns appended, 34; SR1103: three border side style columns appended, 37)
+        assert_eq!(crate::css::REPORT_COLS, 40); // SR1036 fold: unicode-bidi (SR1008) is column 21, SR1036 appends white-space-collapse / text-wrap-mode / text-decoration-color as 22-24 (SR1096: nine box-side columns appended, 34; SR1103: three border side style columns appended, 37; SR1104: three border side colour columns, 40)
         assert_eq!(crate::css::REPORT_PROPS[20], "direction");
         assert_eq!((crate::css::REPORT_PROPS[0], crate::css::REPORT_PROPS[12]), ("display", "visibility"));
     }
@@ -7833,7 +7833,7 @@ b</div>
     #[test]
     fn cssom_unicode_bidi_report_width() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 37); // SR1036 fold: three columns after unicode-bidi (SR1096: nine box-side columns appended, 34; SR1103: three border side style columns, 37)
+        assert_eq!(crate::css::REPORT_COLS, 40); // SR1036 fold: three columns after unicode-bidi (SR1096: nine box-side columns appended, 34; SR1103: three border side style columns, 37; SR1104: three border side colour columns, 40)
         assert_eq!(crate::css::REPORT_PROPS[21], "unicode-bidi");
         assert_eq!(crate::css::REPORT_PROPS[20], "direction");
     }
@@ -8669,11 +8669,11 @@ b</div>
     #[test]
     fn cssom_columns_rest_report_width() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 37); // SR1036 fold: unicode-bidi (SR1008) sits at 21 before the three (SR1096: nine box-side columns appended, 34; SR1103: three border side style columns, 37)
+        assert_eq!(crate::css::REPORT_COLS, 40); // SR1036 fold: unicode-bidi (SR1008) sits at 21 before the three (SR1096: nine box-side columns appended, 34; SR1103: three border side style columns, 37; SR1104: three border side colour columns, 40)
         assert_eq!(crate::css::REPORT_PROPS[20], "direction");
         assert_eq!(&crate::css::REPORT_PROPS[22..25], &["white-space-collapse", "text-wrap-mode", "text-decoration-color"]); // SR1096: the nine box-side columns follow at 25..34
         let mut e = cssom_columns_rest_engine();
-        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('wn')).length)"), "37"); // SR1036 fold: 25 columns with unicode-bidi (SR1096: 34 with the nine box-side columns; SR1103: 37 with the three border side style columns)
+        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('wn')).length)"), "40"); // SR1036 fold: 25 columns with unicode-bidi (SR1096: 34 with the nine box-side columns; SR1103: 37 with the three border side style columns)
         assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('wn')).item(24)"), "text-decoration-color"); // SR1096: still column 24 (the box-side columns append after it)
     }
 
@@ -11467,14 +11467,14 @@ b</div>
     #[test]
     fn box_side_columns_report_width() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 37); // SR1103: three border side style columns appended after the nine
+        assert_eq!(crate::css::REPORT_COLS, 40); // SR1103: three border side style columns appended after the nine; SR1104: three border side colour columns, 40
         assert_eq!(crate::css::REPORT_PROPS[24], "text-decoration-color");
         assert_eq!(
             &crate::css::REPORT_PROPS[25..34], // SR1103: the nine stay at 25..34
             &["margin-right", "margin-bottom", "margin-left", "padding-right", "padding-bottom", "padding-left", "border-right-width", "border-bottom-width", "border-left-width"]
         );
         let mut e = box_side_engine();
-        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('d')).length)"), "37"); // SR1103
+        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('d')).length)"), "40"); // SR1103
         assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('d')).item(33)"), "border-left-width");
     }
 
@@ -11724,11 +11724,11 @@ b</div>
     #[test]
     fn border_side_style_columns_report_width() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 37);
+        assert_eq!(crate::css::REPORT_COLS, 40); // SR1104: three border side colour columns, 40
         assert_eq!(crate::css::REPORT_PROPS[15], "border-top-style");
-        assert_eq!(&crate::css::REPORT_PROPS[34..], &["border-right-style", "border-bottom-style", "border-left-style"]);
+        assert_eq!(&crate::css::REPORT_PROPS[34..37], &["border-right-style", "border-bottom-style", "border-left-style"]); // SR1104: the three colour columns follow at 37..40
         let mut e = border_side_style_engine();
-        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('dd')).length)"), "37");
+        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('dd')).length)"), "40");
         assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('dd')).item(36)"), "border-left-style");
     }
 
@@ -11757,5 +11757,60 @@ b</div>
         // A partly declared border-style composes from the four columns (SR1092's fallback): before SR1103 the top
         // column read `solid`, so this read `solid none none`; four_serialize drops the left side equal to the right.
         assert_eq!(font_shorthand_cs(&mut e, "bt", "borderStyle"), "dashed none none");
+    }
+
+    // ---- AETHERCSSOMBORDERSIDECOLORCOLUMNS (LEDGER SR1104): report columns for the top / right / bottom border colours (named tail block) ----
+
+    /// AETHERCSSOMBORDERSIDECOLORCOLUMNS (SR1104): `#bc` border: 1px solid red with a blue left; `#cc` a colourless top
+    /// border under color: green (currentcolor); `#ac` a half-alpha red top; `#nc` an unstyled div.
+    fn border_side_color_columns_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0">
+            <div id="bc" style="width:40px;height:20px;border:1px solid red;border-left-color:blue"></div>
+            <div id="cc" style="width:40px;height:20px;color:green;border-top:1px solid"></div>
+            <div id="ac" style="width:40px;height:20px;border-top:1px solid rgba(255, 0, 0, 0.5)"></div>
+            <div id="nc" style="width:40px;height:20px"></div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        e
+    }
+
+    /// AETHERCSSOMBORDERSIDECOLORCOLUMNS (SR1104): the three colour columns append after SR1103's three (no earlier index
+    /// moves; border-left-color stays column 16) and the computed declaration enumerates all 40.
+    #[test]
+    fn border_side_color_columns_layout() {
+        assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
+        assert_eq!(crate::css::REPORT_COLS, 40);
+        assert_eq!(crate::css::REPORT_PROPS[16], "border-left-color");
+        assert_eq!(&crate::css::REPORT_PROPS[34..37], &["border-right-style", "border-bottom-style", "border-left-style"]);
+        assert_eq!(&crate::css::REPORT_PROPS[37..], &["border-top-color", "border-right-color", "border-bottom-color"]);
+        let mut e = border_side_color_columns_engine();
+        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('nc')).length)"), "40");
+        assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('nc')).item(39)"), "border-bottom-color");
+    }
+
+    /// AETHERCSSOMBORDERSIDECOLORCOLUMNS (SR1104): each side reads its own ink through `border_ink` (before SR1104 the top /
+    /// right / bottom colours had no column and read cssom's road); a colourless side reads currentcolor resolved; the
+    /// report serializes no alpha (one `border_alpha` for four sides: owed AETHER-CSS-BORDER-SIDE-ALPHA), so a half-alpha
+    /// red reads `rgb(255, 0, 0)`; an undeclared side reads the element's color (Chromium's currentcolor).
+    #[test]
+    fn border_side_color_columns_read() {
+        let mut e = border_side_color_columns_engine();
+        for (id, prop, want) in [
+            ("bc", "borderTopColor", "rgb(255, 0, 0)"),
+            ("bc", "borderRightColor", "rgb(255, 0, 0)"),
+            ("bc", "borderBottomColor", "rgb(255, 0, 0)"),
+            ("bc", "borderLeftColor", "rgb(0, 0, 255)"),
+            ("cc", "borderTopColor", "rgb(0, 128, 0)"),
+            ("ac", "borderTopColor", "rgba(255, 0, 0, 0.5)"), // SR1104 (fold compose): trunk carries the per-side alpha (SR1134 / SR1151), so the half-alpha red reads its alpha
+            ("nc", "borderTopColor", "rgb(0, 0, 0)"),
+            ("nc", "borderRightColor", "rgb(0, 0, 0)"),
+            ("nc", "borderBottomColor", "rgb(0, 0, 0)"),
+            ("nc", "borderLeftColor", "rgb(0, 0, 0)"),
+        ] {
+            assert_eq!(font_shorthand_cs(&mut e, id, prop), want, "{id} {prop}");
+        }
     }
 }
