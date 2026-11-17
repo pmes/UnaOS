@@ -3846,3 +3846,34 @@ fn striacropmore_keys_step_the_crop() {
     assert!(!face.on(&bandy::SMessage::BrowserText("Alt+l".into())));
     println!("striacropmore: eight chords, Alt+l Alt+b Alt+Shift+L -> 0/0/0/{s}");
 }
+
+// ---- STRIACROPTHREE (LEDGER SR9032): the crop drag moves the whole rect (named tail block) ----
+
+/// STRIACROPTHREE (SR9032): on a clip cropped 100 on every side, a press in the middle of the picture (inside the crop rect,
+/// away from the picture's edges) begins a move (all four sides); a tenth of the picture to the right is l = 200, r = 0
+/// (t / b kept), the release commits ONCE (undo depth 2 after the crop_set) and undo restores the centred rect.
+#[test]
+fn striacropthree_drag_moves_whole_rect() {
+    let (mut face, (qx, _, qw, _), ym) = striacropmore_face();
+    let c100 = timeline_core::Crop { l: 100, t: 100, r: 100, b: 100 };
+    face.state.crop_set(|_| c100).unwrap();
+    let _ = face.paint();
+    let btn = |down: bool, x: f64, y: f64| bandy::SMessage::BrowserButton { down, x, y, mods: 0, surface: 0 };
+    let xm = qx + qw / 2.0;
+    assert!(face.on(&btn(true, xm, ym)));
+    assert!(face.dragging().is_none());
+    assert_eq!(face.crop_dragging().map(|d| d.sides), Some(15));
+    let dx = qw / 10.0;
+    assert!(face.on(&bandy::SMessage::BrowserMouseMove(xm + dx, ym, 0)));
+    assert_eq!(face.crop_dragging().map(|d| d.crop()), Some(timeline_core::Crop { l: 200, t: 100, r: 0, b: 100 }));
+    assert_eq!(face.state.undo_depth(), 1, "nothing committed while live");
+    assert!(face.on(&btn(false, xm + dx, ym)));
+    face.on(&bandy::SMessage::BrowserClick(xm + dx, ym, 0));
+    assert!(face.crop_dragging().is_none());
+    assert_eq!(face.last_error.take(), None);
+    assert_eq!(face.state.selected().map(|c| c.crop), Some(timeline_core::Crop { l: 200, t: 100, r: 0, b: 100 }));
+    assert_eq!(face.state.undo_depth(), 2);
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.selected().map(|c| c.crop), Some(c100));
+    println!("striacropthree: centre press moved the rect {dx} px -> l=200 r=0, one commit, undo restores");
+}
