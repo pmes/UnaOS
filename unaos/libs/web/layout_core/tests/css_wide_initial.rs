@@ -2252,3 +2252,55 @@ fn gap_shorthand_multicol_used_gap() {
     assert_eq!(gap(&[base]), 20.0, "no gap: 1em (armed)");
     assert_eq!(gap(&[base, &[("gap", "30px")]]), 30.0, "gap: 30px is the 30px gutter");
 }
+
+// ---- AETHERCSSBORDERTHINTHICK (LEDGER SR1075): <line-width> keywords and 1-4 border-width values (named tail block) ----
+
+/// AETHERCSSBORDERTHINTHICK (SR1075): css-backgrounds-3 §4.3 `thin` / `medium` / `thick` are 1 / 3 / 5px (Chromium), stored
+/// in the ONE width store with no side (style none); a style then creates the sides at that width. Before SR1075 the
+/// keyword was dropped (`border_width` None).
+#[test]
+fn border_thin_thick_keywords() {
+    for (k, w) in [("thin", 1.0), ("medium", 3.0), ("thick", 5.0), ("THICK", 5.0)] {
+        let s = styled(&[("border-width", k)]);
+        assert_eq!((s.paint.border, s.paint.border_width), (None, Some([Some(w); 4])), "{k}");
+        assert_eq!(styled(&[("border-width", k), ("border-style", "solid")]).paint.border, Some([Some((w, STORED_GREY)); 4]), "{k} styled");
+    }
+    let s = styled(&[("border-top-width", "thick")]);
+    assert_eq!(s.paint.border_width, Some([Some(5.0), None, None, None]), "a side longhand: the top only");
+    let s = styled(&[("border-top-width", "thin"), ("border-style", "solid")]);
+    assert_eq!(s.paint.border.expect("sides")[0], Some((1.0, STORED_GREY)), "the top thin");
+    assert_eq!(s.paint.border.expect("sides")[1], Some((3.0, STORED_GREY)), "the others medium");
+}
+
+/// AETHERCSSBORDERTHINTHICK (SR1075): the `border` / `border-<side>` shorthands take the keyword as their width part
+/// (before SR1075 `thin` matched no part and the width stayed medium: `border: thin solid red` was four 3px red sides).
+#[test]
+fn border_thin_thick_shorthands() {
+    let red = stored_rgb("red");
+    assert_eq!(styled(&[("border", "thin solid red")]).paint.border, Some([Some((1.0, red)); 4]), "border: thin (before: 3.0)");
+    assert_eq!(styled(&[("border", "solid thick")]).paint.border, Some([Some((5.0, STORED_GREY)); 4]), "any order");
+    let s = styled(&[("border-top", "thick dashed")]);
+    assert_eq!(s.paint.border.expect("sides")[0], Some((5.0, STORED_GREY)), "border-top: thick");
+    assert_eq!(s.paint.border_width.expect("store")[0], Some(5.0), "stored");
+    assert_eq!(styled(&[("border", "1px solid")]).paint.border, Some([Some((1.0, STORED_GREY)); 4]), "armed: a length still");
+}
+
+/// AETHERCSSBORDERTHINTHICK (SR1075): `border-width` takes 1-4 values in the margin / padding order (the same
+/// `parse_sides`); a 0 side is kept at 0.0 with its style (Chromium: the side exists, paints nothing); 5 values or a bad
+/// token refuse the whole declaration. Before SR1075 only one value parsed (`1px 0` was dropped).
+#[test]
+fn border_thin_thick_width_sides() {
+    let g = STORED_GREY;
+    let w = |v: &str| styled(&[("border-width", v)]).paint.border_width;
+    assert_eq!(w("1px 0"), Some([Some(1.0), Some(0.0), Some(1.0), Some(0.0)]));
+    assert_eq!(w("1px 2px 3px"), Some([Some(1.0), Some(2.0), Some(3.0), Some(2.0)]));
+    assert_eq!(w("1px 2px 3px 4px"), Some([Some(1.0), Some(2.0), Some(3.0), Some(4.0)]));
+    assert_eq!(w("2px thin"), Some([Some(2.0), Some(1.0), Some(2.0), Some(1.0)]), "a keyword among lengths");
+    assert_eq!(w("1px 2px 3px 4px 5px"), None, "five values refused");
+    assert_eq!(w("1px foo"), None, "a bad token refuses the declaration");
+    let want = Some([Some((1.0, g)), Some((0.0, g)), Some((1.0, g)), Some((0.0, g))]);
+    for d in [[("border-width", "1px 0"), ("border-style", "solid")], [("border-style", "solid"), ("border-width", "1px 0")]] {
+        assert_eq!(styled(&d).paint.border, want, "{d:?}");
+    }
+    assert_eq!(cascade(&[&[("border-width", "1px 0")], &[("border-style", "solid")]]).paint.border, want, "across rules");
+}

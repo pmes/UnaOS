@@ -9477,4 +9477,45 @@ b</div>
         assert_ne!(imgalt_px(&e, 220, 90), (255, 0, 0), "grid-gap: 40px: x 220 is gutter");
         assert_ne!(imgalt_px(&e, 220, 130), (255, 0, 0), "gap: 0px 40px: the column token, x 220 is gutter");
     }
+
+    // ---- AETHERCSSBORDERTHINTHICK (LEDGER SR1075): `thin` / `thick` paint 1px / 5px frames; border-width takes 1-4 values (named tail block) ----
+
+    /// AETHERCSSBORDERTHINTHICK (SR1075): 40x20 boxes in green ink, rows 12px apart: `#tn` `border: thin solid`, `#tk`
+    /// `border: thick solid`, `#tz` `border-width: 1px 0; border-style: solid`.
+    fn border_thin_thick_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 12px }
+            </style></head><body style="margin:0;font:20px serif;color:rgb(0, 160, 0)">
+            <div id="tn" style="width:40px;height:20px;border:thin solid"></div>
+            <div id="tk" style="width:40px;height:20px;border:thick solid"></div>
+            <div id="tz" style="width:40px;height:20px;border-width:1px 0;border-style:solid"></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSBORDERTHINTHICK (SR1075): `#tn` is a 42x22 border box whose row 0 (mid-x) is the ink and row 1 not; `#tk`
+    /// is 50x30 with rows 0-4 inked and row 5 not (before SR1075 both were medium 3px, 46x26); `#tz` is 40x22 (top / bottom
+    /// 1px, left / right 0; before SR1075 the two-value declaration was dropped). getComputedStyle reads 1px / 5px.
+    #[test]
+    fn border_thin_thick_paints() {
+        let mut e = border_thin_thick_engine();
+        for (id, bw, size) in [("tn", 1usize, (42.0, 22.0)), ("tk", 5, (50.0, 30.0))] {
+            let (l, t, w, h) = imgalt_rect(&mut e, id);
+            assert_eq!((w, h), size, "#{id}: the border box");
+            let x = (l + w / 2.0) as usize;
+            for dy in 0..bw {
+                let c = imgalt_px(&mut e, x, t as usize + dy);
+                assert!(css_wide_green(c), "#{id}: row {dy} is the ink: {c:?}");
+            }
+            let c = imgalt_px(&mut e, x, t as usize + bw);
+            assert!(!css_wide_green(c), "#{id}: row {bw} is inside the frame: {c:?}");
+            assert_eq!(font_shorthand_cs(&mut e, id, "borderTopWidth"), format!("{bw}px"), "#{id}: getComputedStyle");
+        }
+        let (_, _, w, h) = imgalt_rect(&mut e, "tz");
+        assert_eq!((w, h), (40.0, 22.0), "#tz: border-width: 1px 0");
+    }
 }
