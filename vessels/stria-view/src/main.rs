@@ -56,12 +56,13 @@ struct Cli {
     two: bool,
     split: bool,
     mute: bool,
+    keys: Option<String>, // STRIAKEYBOARDMAP (SR886): `--keys MAP`, the key overlay text handed to `Face::with_keys`
 }
 
 /// SURFACEID (SR332): the second Surface of `--two-surfaces` (no painter: a press on it must not reach the editor).
 const AUX_SURFACE: &str = "stria.nle.aux";
 
-const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels] [--two-surfaces | --split] [--mute]  (SCRIPT: verbs, at:T:ROW, ruler:T, press:X:Y, move:X:Y, release, key:NAME, wheel:N, marquee:X0:Y0:X1:Y1, shift:TOKEN, alt:TOKEN, transition:T:I, meters, tick:N, aux:TOKEN)";
+const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels] [--two-surfaces | --split] [--mute] [--keys MAP]  (SCRIPT: verbs, at:T:ROW, ruler:T, press:X:Y, move:X:Y, release, key:NAME, wheel:N, marquee:X0:Y0:X1:Y1, shift:TOKEN, alt:TOKEN, transition:T:I, meters, tick:N, aux:TOKEN)";
 
 fn die(msg: String) -> ! {
     eprintln!("stria-view: {msg}");
@@ -69,7 +70,7 @@ fn die(msg: String) -> ! {
 }
 
 fn cli() -> Cli {
-    let mut c = Cli { edl: None, synth: false, fps: 25, srcs: Vec::new(), size: (960, 540), script: None, out: None, labels: false, two: false, split: false, mute: false };
+    let mut c = Cli { edl: None, synth: false, fps: 25, srcs: Vec::new(), size: (960, 540), script: None, out: None, labels: false, two: false, split: false, mute: false, keys: None };
     let mut a = std::env::args().skip(1);
     while let Some(arg) = a.next() {
         match arg.as_str() {
@@ -90,6 +91,7 @@ fn cli() -> Cli {
                 c.srcs.push((r.to_string(), p.to_string()));
             }
             "--do" => c.script = a.next(),
+            "--keys" => c.keys = a.next(), // STRIAKEYBOARDMAP (SR886): the key map as text (entries split on newline or `;`)
             "--out" => c.out = a.next(),
             "--help" | "-h" => {
                 eprintln!("{USAGE}");
@@ -290,7 +292,7 @@ fn main() {
     let (tl, sources) = load(&c);
     let windowed = cfg!(any(target_os = "macos", all(target_os = "linux", feature = "gtk")));
     if c.script.is_some() || c.out.is_some() || c.two || !windowed {
-        let face = route(&c, Face::new(EditorState::new(tl), sources, c.size, PixelOrder::Rgba, c.labels).with_doc(c.edl.as_deref().map(std::path::Path::new)));
+        let face = route(&c, Face::new(EditorState::new(tl), sources, c.size, PixelOrder::Rgba, c.labels).with_doc(c.edl.as_deref().map(std::path::Path::new)).with_keys(c.keys.as_deref().unwrap_or("")));
         std::process::exit(witness(&c, face));
     }
 
@@ -300,7 +302,7 @@ fn main() {
     let mut engine: Option<Box<dyn std::any::Any>> = None; // NLEPLAYAUDIO (SR676): the audio engine, held for the process life
     {
         let rx = synapse.subscribe();
-        let face = play_audio(&c, &mut engine, route(&c, Face::new(EditorState::new(tl), sources, c.size, PixelOrder::Rgba, true).with_doc(c.edl.as_deref().map(std::path::Path::new))));
+        let face = play_audio(&c, &mut engine, route(&c, Face::new(EditorState::new(tl), sources, c.size, PixelOrder::Rgba, true).with_doc(c.edl.as_deref().map(std::path::Path::new)).with_keys(c.keys.as_deref().unwrap_or(""))));
         rt.spawn(nle_face::serve(synapse.clone(), rx, face));
     }
     quartzite::Backend::new_tetra_vessel(
@@ -422,7 +424,7 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(face.state.timeline, tl0.trim_in(0, 1, 3).unwrap());
         assert_eq!(presses, vec![(0, false), (1, true)]);
-        let c = Cli { edl: None, synth: true, fps: 25, srcs: Vec::new(), size: (320, 160), script: None, out: None, labels: false, two: true, split: false, mute: false };
+        let c = Cli { edl: None, synth: true, fps: 25, srcs: Vec::new(), size: (320, 160), script: None, out: None, labels: false, two: true, split: false, mute: false, keys: None };
         assert_eq!(presses_json(&c, &presses), r#","presses":[[0,false],[1,true]]"#);
         assert_eq!(presses_json(&Cli { two: false, ..c }, &presses), "");
     }
@@ -902,5 +904,28 @@ mod exportstall_tests {
         assert_eq!(export_json(&face), "");
         println!("nle5dexportmessageetastallwitness witness: {j}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- STRIAKEYBOARDMAP (LEDGER SR886): the witness's --keys overlay (named tail block) ----
+#[cfg(test)]
+mod striakeyboardmap_tests {
+    use super::*;
+
+    /// STRIAKEYBOARDMAP M3: the face `--keys "p play"` builds takes `key:p` as play (the overlay first); a refused map
+    /// leaves the static table and its reason on the message row.
+    #[test]
+    fn keys_overlay_through_the_script() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false).with_keys("p play");
+        assert!(face.last_error.is_none(), "{:?}", face.last_error);
+        assert!(!face.playing);
+        assert!(drive(&mut face, "key:p").is_empty());
+        assert!(face.playing, "p plays through the overlay");
+        let (tl, src) = nle_face::synth_fixture();
+        let face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false).with_keys("p spilt");
+        assert_eq!(face.last_error.as_deref(), Some("keys: line 1: unknown action \"spilt\""));
+        assert!(face.keymap().is_empty());
+        println!("striakeyboardmap witness: --keys \"p play\" + key:p -> playing");
     }
 }

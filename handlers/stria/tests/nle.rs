@@ -3648,3 +3648,126 @@ fn nle5dexportmessageetastallwitness_paused_face_export_stall() {
     let _ = std::fs::remove_dir_all(&dir);
     println!("nle5dexportmessageetastallwitness: paused face export_stall {stall:?}, line \"{line}\"");
 }
+
+// ---- STRIAKEYBOARDMAP (LEDGER SR886): the key overlay — remaps, refusals, the help rows, view-only (named tail block) ----
+use stria::nle_face::{KEYMAP_UNBIND, Keymap, KeymapError, help_rows_with, parse_keymap};
+
+fn striakeyboardmap_face(keys: &str) -> Face {
+    let (tl, src) = synth_fixture();
+    Face::new(EditorState::new(tl), src, (640, 480), PixelOrder::Rgba, false).with_keys(keys)
+}
+
+fn striakeyboardmap_text(f: &mut Face, t: &str) -> bool {
+    f.on(&bandy::SMessage::BrowserText(t.into()))
+}
+
+/// `p play` binds p and leaves Space (not named) bound; `Space none` frees Space; `s split` binds a VERBS word with no static
+/// key and edits exactly as the word does.
+#[test]
+fn striakeyboardmap_remap_binds_and_frees() {
+    let mut f = striakeyboardmap_face("p play");
+    assert!(f.last_error.is_none(), "{:?}", f.last_error);
+    assert!(striakeyboardmap_text(&mut f, "p"));
+    assert!(f.playing, "p plays");
+    assert!(striakeyboardmap_text(&mut f, " "));
+    assert!(!f.playing, "Space still plays / pauses");
+    let mut f = striakeyboardmap_face(&format!("Space {KEYMAP_UNBIND}"));
+    assert!(f.last_error.is_none(), "{:?}", f.last_error);
+    assert!(!striakeyboardmap_text(&mut f, " "), "Space is unbound");
+    assert!(!f.playing);
+    let mut f = striakeyboardmap_face("s split");
+    let mut twin = striakeyboardmap_face("");
+    f.state.playhead = 5;
+    twin.state.playhead = 5;
+    assert!(twin.verb("split"));
+    assert!(striakeyboardmap_text(&mut f, "s"), "s is taken");
+    assert_eq!(f.state.timeline, twin.state.timeline, "s edits as the word split does");
+    assert_eq!(f.last_error, twin.last_error);
+    println!("striakeyboardmap: p play, Space none, s split");
+}
+
+/// The overlay wins over KEYS: `j stop` makes j stop the transport instead of shuttling; KEYS itself is unchanged.
+#[test]
+fn striakeyboardmap_overlay_wins() {
+    let mut f = striakeyboardmap_face("j stop");
+    assert!(striakeyboardmap_text(&mut f, " "));
+    assert!(f.playing);
+    assert!(striakeyboardmap_text(&mut f, "j"));
+    assert!(!f.playing, "j stops");
+    assert_eq!(f.rate, 1);
+    assert!(KEYS.contains(&("j", "shuttle-")), "the static table is never mutated");
+    let mut plain = striakeyboardmap_face("");
+    assert!(striakeyboardmap_text(&mut plain, "j"));
+    assert!(plain.playing && plain.rate < 0, "without the map j shuttles back");
+}
+
+/// Each refusal by name and text; a refused map is not applied (the static table stays, the reason on the message row).
+#[test]
+fn striakeyboardmap_refusals() {
+    assert_eq!(parse_keymap("p spilt"), Err(KeymapError::UnknownAction { line: 1, word: "spilt".into() }));
+    assert_eq!(parse_keymap("p play\np stop"), Err(KeymapError::DuplicateKey { line: 2, key: "p".into() }));
+    assert_eq!(parse_keymap("# mine\np"), Err(KeymapError::NoAction { line: 2, key: "p".into() }));
+    assert_eq!(parse_keymap("? play"), Err(KeymapError::HelpUnbound));
+    assert_eq!(parse_keymap("? none"), Err(KeymapError::HelpUnbound));
+    assert_eq!(parse_keymap("Space play;Space stop"), Err(KeymapError::DuplicateKey { line: 2, key: "Space".into() }));
+    assert_eq!(KeymapError::UnknownAction { line: 3, word: "spilt".into() }.to_string(), "keys: line 3: unknown action \"spilt\"");
+    assert_eq!(KeymapError::DuplicateKey { line: 5, key: "p".into() }.to_string(), "keys: line 5: \"p\" is bound twice");
+    assert_eq!(KeymapError::NoAction { line: 2, key: "p".into() }.to_string(), "keys: line 2: \"p\" names no action");
+    assert_eq!(KeymapError::HelpUnbound.to_string(), "keys: no key shows the help");
+    assert_eq!(parse_keymap(""), Ok(Keymap::default()));
+    assert_eq!(parse_keymap("# only a comment\n\n"), Ok(Keymap::default()));
+    let mut f = striakeyboardmap_face("p play\n? play");
+    assert_eq!(f.last_error.as_deref(), Some("keys: no key shows the help"));
+    assert!(f.keymap().is_empty(), "a refused map is not applied in part");
+    f.last_error = None;
+    assert!(!striakeyboardmap_text(&mut f, "p"), "p stays unbound");
+    assert!(striakeyboardmap_text(&mut f, "?"));
+    assert!(f.help_shown(), "? still shows the help");
+}
+
+/// The help rows show the effective bindings: a remapped key joins its action's row and leaves its old one.
+#[test]
+fn striakeyboardmap_help_rows_show_the_remap() {
+    assert_eq!(help_rows_with(&Keymap::default()), help_rows());
+    let row = |rows: &[(String, &'static str)], act: &'static str| rows.iter().find(|r| r.1 == help_phrase(act)).map(|r| r.0.clone());
+    let rows = help_rows_with(&parse_keymap("p play").unwrap());
+    assert_eq!(row(&rows, "play").as_deref(), Some("Space / p"));
+    let rows = help_rows_with(&parse_keymap("j stop").unwrap());
+    assert_eq!(row(&rows, "stop").as_deref(), Some("k / j"));
+    assert_eq!(row(&rows, "shuttle-"), None, "j was shuttle-'s only key");
+    let map = parse_keymap("? none; h help").unwrap();
+    let rows = help_rows_with(&map);
+    assert_eq!(row(&rows, "help").as_deref(), Some("h"));
+    let mut f = striakeyboardmap_face("? none; h help");
+    assert!(f.last_error.is_none(), "{:?}", f.last_error);
+    assert!(!striakeyboardmap_text(&mut f, "?"));
+    assert!(striakeyboardmap_text(&mut f, "h"));
+    assert!(f.help_shown());
+    println!("striakeyboardmap: help rows play={:?}", row(&help_rows_with(&parse_keymap("p play").unwrap()), "play"));
+}
+
+/// A key map is view-only: taking it pushes no undo step and leaves the document clean.
+#[test]
+fn striakeyboardmap_view_only() {
+    let (tl, src) = synth_fixture();
+    let before = tl.clone();
+    let mut f = Face::new(EditorState::new(tl), src, (640, 480), PixelOrder::Rgba, false).with_keys("p play\nj stop");
+    assert!(!f.dirty());
+    assert_eq!(f.state.timeline, before);
+    assert!(striakeyboardmap_text(&mut f, "p") && striakeyboardmap_text(&mut f, "j"));
+    assert!(!f.dirty());
+    assert_eq!(f.state.timeline, before);
+    assert!(f.verb("undo"));
+    assert_eq!(f.state.timeline, before, "no undo step to take back");
+}
+
+/// While the help shows, a remapped key only dismisses it (Stria's rule, through the overlay).
+#[test]
+fn striakeyboardmap_dismiss_through_overlay() {
+    let mut f = striakeyboardmap_face("p play");
+    assert!(f.verb("help"));
+    assert!(f.help_shown());
+    assert!(striakeyboardmap_text(&mut f, "p"));
+    assert!(!f.help_shown(), "p dismissed the help");
+    assert!(!f.playing, "and was not applied");
+}

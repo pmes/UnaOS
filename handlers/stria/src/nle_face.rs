@@ -194,13 +194,14 @@ pub struct Face {
     /// NLE5DKEYSHELP (SR744): the keys help overlay is shown over the timeline band ([`Face::paint_help`]).
     help: bool,
     hover_ticks: Option<((usize, usize), u16)>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
+    keymap: Keymap, // STRIAKEYBOARDMAP (SR886): the key overlay over KEYS, consulted first ([`Face::with_keys`], file tail)
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, keymap: Keymap::default() }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -493,7 +494,7 @@ impl Face {
         if (k.chars().count() == 1) != text {
             return false;
         }
-        let Some(&(_, act)) = KEYS.iter().find(|(name, _)| *name == k) else { return false };
+        let Some(act) = self.bound(k) else { return false }; // STRIAKEYBOARDMAP (SR886): the face's key overlay first, then KEYS (file tail)
         if self.help { self.help = false; return true; } if act == "help" { return self.verb(act); } // NLE5DKEYSHELP (SR744): a taken key while the help shows only dismisses it (not applied); `?` shows it through the one verb
         if VERBS.contains(&act) || slipslide_word(act).is_some() { // NLE3ESLIPSTEP (SR752): the 10-frame words are keys, not VERBS: the same road
             return self.verb(act);
@@ -2617,7 +2618,7 @@ pub fn help_phrase(act: &'static str) -> &'static str {
 }
 
 /// A KEYS name as the help shows it: `" "` is `Space`; an AppKit private-use key (U+F700..=U+F8FF) is not shown.
-fn key_label(k: &'static str) -> Option<&'static str> {
+fn key_label(k: &str) -> Option<&str> {
     if k == " " {
         return Some("Space");
     }
@@ -2629,9 +2630,9 @@ fn key_label(k: &'static str) -> Option<&'static str> {
 }
 
 /// The help's rows, one per KEYS action in KEYS order: `(its keys joined " / ", its phrase)`.
-pub fn help_rows() -> Vec<(String, &'static str)> {
+pub fn help_rows() -> Vec<(String, &'static str)> { help_rows_with(&Keymap::default()) } pub fn help_rows_with(map: &Keymap) -> Vec<(String, &'static str)> { // STRIAKEYBOARDMAP (SR886): the same rows over a key overlay's effective bindings (`Keymap::bindings`, file tail)
     let mut rows: Vec<(&'static str, String, &'static str)> = Vec::new();
-    for &(k, act) in KEYS {
+    for (k, act) in map.bindings() {
         let i = match rows.iter().position(|r| r.0 == act) {
             Some(i) => i,
             None => {
@@ -2691,7 +2692,7 @@ impl Face {
         if per == 0 {
             return px;
         }
-        let rows = help_rows();
+        let rows = help_rows_with(&self.keymap);
         // The columns: (first row, keys width, phrase width), as many as the width holds, at least one.
         let mut cols: Vec<(usize, f32, f32)> = Vec::new();
         let (mut x, mut start) = (HELP_PAD, 0usize);
@@ -3095,5 +3096,121 @@ impl Face {
             return None;
         }
         stall_since(j.rate_at.0.elapsed(), j.rate_ema)
+    }
+}
+
+// ---- STRIAKEYBOARDMAP (LEDGER SR886): the key overlay — parse, refusals, lookup (named tail block) ----
+// A person's key map is TEXT handed to the face by its caller (`Face::with_keys`; stria-view `--keys MAP`): the face reads
+// no file and owns no settings path (a preference is Principia's: NLE5D-KEYS-CONFIG-STORE owed). Entries split on a newline
+// or `;`; a blank entry or one starting `#` is skipped; an entry is `<key> <action>`: the first whitespace token is the key
+// (`Space` names " "; any other token verbatim, so `Face::key`'s one-char-from-text / name-from-BrowserKey rule decides how
+// it arrives), the rest is the action: a VERBS word or a KEYS action (the words `Face::key` dispatches), or `none` (the key
+// is unbound). The overlay is consulted BEFORE KEYS and never mutates it; the help rows show the effective bindings. A map
+// is taken whole or not at all: an unknown action, a key named twice, a key with no action, or a map under which no key
+// shows the help is refused by name and the static table stays.
+
+/// STRIAKEYBOARDMAP (SR886): the map's word that unbinds a key.
+pub const KEYMAP_UNBIND: &str = "none";
+
+/// STRIAKEYBOARDMAP (SR886): a parsed key overlay: `(key, Some(action) | None = unbound)` in text order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Keymap(Vec<(String, Option<&'static str>)>);
+
+/// STRIAKEYBOARDMAP (SR886): why a key map was refused (`line` counts entries from 1, blank and `#` entries included).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeymapError {
+    UnknownAction { line: usize, word: String },
+    DuplicateKey { line: usize, key: String },
+    NoAction { line: usize, key: String },
+    HelpUnbound,
+}
+
+impl std::fmt::Display for KeymapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeymapError::UnknownAction { line, word } => write!(f, "keys: line {line}: unknown action \"{word}\""),
+            KeymapError::DuplicateKey { line, key } => write!(f, "keys: line {line}: \"{key}\" is bound twice"),
+            KeymapError::NoAction { line, key } => write!(f, "keys: line {line}: \"{key}\" names no action"),
+            KeymapError::HelpUnbound => write!(f, "keys: no key shows the help"),
+        }
+    }
+}
+
+/// STRIAKEYBOARDMAP (SR886): a word `Face::key` can dispatch, as its table's `&'static str` (VERBS first, then KEYS).
+fn keymap_vocab(w: &str) -> Option<&'static str> {
+    VERBS.iter().copied().find(|v| *v == w).or_else(|| KEYS.iter().map(|&(_, a)| a).find(|a| *a == w))
+}
+
+/// STRIAKEYBOARDMAP (SR886): a map's text as a [`Keymap`], or the first refusal.
+pub fn parse_keymap(text: &str) -> Result<Keymap, KeymapError> {
+    let mut map: Vec<(String, Option<&'static str>)> = Vec::new();
+    for (i, entry) in text.split(['\n', ';']).enumerate() {
+        let line = i + 1;
+        let entry = entry.trim();
+        if entry.is_empty() || entry.starts_with('#') {
+            continue;
+        }
+        let (name, word) = match entry.split_once(char::is_whitespace) {
+            Some((n, w)) => (n, w.trim()),
+            None => (entry, ""),
+        };
+        let key = if name == "Space" { " ".to_string() } else { name.to_string() };
+        if word.is_empty() {
+            return Err(KeymapError::NoAction { line, key: name.to_string() });
+        }
+        let act = if word == KEYMAP_UNBIND {
+            None
+        } else {
+            Some(keymap_vocab(word).ok_or_else(|| KeymapError::UnknownAction { line, word: word.to_string() })?)
+        };
+        if map.iter().any(|(k, _)| *k == key) {
+            return Err(KeymapError::DuplicateKey { line, key: name.to_string() });
+        }
+        map.push((key, act));
+    }
+    let map = Keymap(map);
+    if !map.bindings().iter().any(|&(_, a)| a == "help") {
+        return Err(KeymapError::HelpUnbound);
+    }
+    Ok(map)
+}
+
+impl Keymap {
+    /// The effective bindings: KEYS rows whose key the map does not name (KEYS order), then the map's bound rows (text order).
+    pub fn bindings(&self) -> Vec<(&str, &'static str)> {
+        let mut out: Vec<(&str, &'static str)> = KEYS.iter().filter(|(k, _)| !self.0.iter().any(|(m, _)| m == k)).map(|&(k, a)| (k, a)).collect();
+        out.extend(self.0.iter().filter_map(|(k, a)| a.map(|a| (k.as_str(), a))));
+        out
+    }
+    /// The action a key names: the map's entry when it names the key (`None` when unbound there), else KEYS's.
+    pub fn action(&self, k: &str) -> Option<&'static str> {
+        match self.0.iter().find(|(m, _)| m == k) {
+            Some(&(_, a)) => a,
+            None => KEYS.iter().find(|(name, _)| *name == k).map(|&(_, a)| a),
+        }
+    }
+    /// The map has no entries (the static table alone).
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl Face {
+    /// STRIAKEYBOARDMAP (SR886): the face with a person's key map ([`parse_keymap`]); a refused map leaves the static table
+    /// and its reason on the message row (`last_error`). Empty text is the empty map. View-only: no undo step, no dirty.
+    pub fn with_keys(mut self, text: &str) -> Face {
+        match parse_keymap(text) {
+            Ok(m) => self.keymap = m,
+            Err(e) => self.last_error = Some(e.to_string()),
+        }
+        self
+    }
+    /// STRIAKEYBOARDMAP (SR886): the face's key overlay.
+    pub fn keymap(&self) -> &Keymap {
+        &self.keymap
+    }
+    /// STRIAKEYBOARDMAP (SR886): the action a key names on this face (the overlay first, then KEYS).
+    fn bound(&self, k: &str) -> Option<&'static str> {
+        self.keymap.action(k)
     }
 }
