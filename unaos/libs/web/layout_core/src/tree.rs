@@ -1726,7 +1726,7 @@ pub fn apply_specs<H: Host>(tree: &mut LayoutTree<H>, specs: &[(taffy::NodeId, R
         let entry = tree.paint_map.entry(node_id).or_default();
         css::merge_paint(entry, &spec.paint);
     }
-    inherit_box_pass(tree, specs, &mut abs_nodes); size_flex_items_by_content(tree, specs);
+    system_color_pass(tree); inherit_box_pass(tree, specs, &mut abs_nodes); size_flex_items_by_content(tree, specs);
     // AETHERCAPTIONSIDECSS (SR462): a caption whose cascaded, inherited caption-side is bottom goes after the rows.
     caption_side_order(tree);
     // Static-position fallback: `position:absolute` with no inset specified
@@ -3917,4 +3917,99 @@ pub fn scheme_dark(scheme: Option<u8>) -> bool {
 /// AETHERCSSWIDECOLORCONTROLSDARK (SR1031): the UA colour row of a resolved scheme ([`scheme_dark`]).
 pub fn ua_colours(scheme: Option<u8>) -> &'static UaColours {
     if scheme_dark(scheme) { &UA_DARK } else { &UA_LIGHT }
+}
+
+// ---- AETHERCOLORSCHEMESYSTEMCOLORS (LEDGER SR1046): the system colour keywords resolved against the element's color-scheme (named tail block) ----
+
+/// AETHERCOLORSCHEMESYSTEMCOLORS (SR1046): the ONE system colour table (css-color-4 §6.2): css_core's 19 keywords in
+/// css_core's order, each with its DARK value; the light value is css_core's own (`css::parse_color_str`, the parse
+/// road). None keeps the light value under dark. The UA rows are READ from [`UA_DARK`]; linktext / visitedtext /
+/// activetext / graytext are Chromium's dark values as recalled, not probed, and the seven None words are unverified
+/// (AETHER-COLOR-SCHEME-SYSTEM-COLORS-DARKROW owed). ButtonBorder takes the dark control frame.
+pub const SYSTEM_COLORS: [(&str, Option<(u8, u8, u8)>); 19] = [
+    ("canvas", Some(UA_DARK.canvas)),
+    ("canvastext", Some(UA_DARK.canvastext)),
+    ("linktext", Some((158, 158, 255))),
+    ("visitedtext", Some((208, 173, 240))),
+    ("activetext", Some((255, 158, 158))),
+    ("buttonface", Some(UA_DARK.face)),
+    ("buttontext", Some(UA_DARK.ink)),
+    ("buttonborder", Some(UA_DARK.frame)),
+    ("field", Some(UA_DARK.field)),
+    ("fieldtext", Some(UA_DARK.ink)),
+    ("graytext", Some((142, 142, 142))),
+    ("threedface", Some(UA_DARK.face)),
+    ("highlighttext", None),
+    ("selecteditem", None),
+    ("selecteditemtext", None),
+    ("mark", None),
+    ("marktext", None),
+    ("accentcolor", None),
+    ("accentcolortext", None),
+];
+
+/// AETHERCOLORSCHEMESYSTEMCOLORS (SR1046): the RGB of system colour `idx` under a resolved scheme: the table's dark
+/// value when [`scheme_dark`] and it has one, else css_core's light value.
+pub fn system_color<H: Host>(idx: u8, scheme: Option<u8>) -> Option<(u8, u8, u8)> {
+    let (name, dark) = SYSTEM_COLORS.get(idx as usize)?;
+    match dark {
+        Some(c) if scheme_dark(scheme) => Some(*c),
+        _ => css::parse_color_str::<H>(name),
+    }
+}
+
+/// AETHERCOLORSCHEMESYSTEMCOLORS (SR1046): writes each slot's colour under `scheme` into its field when the field holds
+/// a value (an explicit `inherit` cleared it: nothing to write); the border only on the mask's present sides. The
+/// slots stay, so a later run under another scheme writes again (idempotent).
+pub fn resolve_system_colors<H: Host>(paint: &mut PaintStyle<H>, scheme: Option<u8>) {
+    if let (Some(k), true) = (paint.sys_color, paint.color.is_some()) {
+        if let Some(c) = system_color::<H>(k, scheme) {
+            paint.color = Some(c);
+        }
+    }
+    if let (Some(k), true) = (paint.sys_background, paint.background.is_some()) {
+        if let Some(c) = system_color::<H>(k, scheme) {
+            paint.background = Some(c);
+        }
+    }
+    if let (Some((k, m)), Some(mut sides)) = (paint.sys_border, paint.border) {
+        if let Some(c) = system_color::<H>(k, scheme) {
+            for (i, side) in sides.iter_mut().enumerate() {
+                if m & (1 << i) != 0 {
+                    if let Some((_, sc)) = side {
+                        *sc = c;
+                    }
+                }
+            }
+            paint.border = Some(sides);
+        }
+    }
+}
+
+/// AETHERCOLORSCHEMESYSTEMCOLORS (SR1046): `apply_specs`' resolution of every paint_map entry holding a system colour
+/// slot (inline `style=""` is folded at build time, not as a spec, so the whole map is scanned), BEFORE
+/// `inherit_box_pass` so an inherited background / border copies the parent's resolved colour. The scheme is the
+/// nearest ancestor-or-self `color_scheme` (render's `inherited.scheme` chain, None at the root: light). Every paint
+/// walk, the UA control colours and `computed_report` then read the resolved RGB.
+fn system_color_pass<H: Host>(tree: &mut LayoutTree<H>) {
+    let ids: Vec<taffy::NodeId> = tree
+        .paint_map
+        .iter()
+        .filter(|(_, p)| p.sys_color.is_some() || p.sys_background.is_some() || p.sys_border.is_some())
+        .map(|(id, _)| *id)
+        .collect();
+    for id in ids {
+        let mut scheme = None;
+        let mut cur = Some(id);
+        while let Some(n) = cur {
+            if let Some(s) = tree.paint_map.get(&n).and_then(|p| p.color_scheme) {
+                scheme = Some(s);
+                break;
+            }
+            cur = tree.taffy.parent(n);
+        }
+        if let Some(p) = tree.paint_map.get_mut(&id) {
+            resolve_system_colors(p, scheme);
+        }
+    }
 }

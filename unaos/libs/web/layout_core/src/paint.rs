@@ -255,7 +255,7 @@ pub struct PaintStyle<H: Host> {
     /// AETHERCSSCURRENTCOLORREST (SR849): bits 0-3 = border side [top, right, bottom, left] colour is `currentColor`, [`CC_BG`] = background-color is; the RGB in `border` / `background` is then a carrier the paint reads replace.
     pub currentcolor: u8,
     /// AETHERCSSWIDECOLORCONTROLSDARK (SR1031): css-color-adjust-1 §2.1 `color-scheme` (inherited): None unspecified (the parent's), Some(bits) bit 0 light, bit 1 dark, Some(0) `normal`; read through `tree::ua_colours`.
-    pub color_scheme: Option<u8>,
+    pub color_scheme: Option<u8>, pub sys_color: Option<u8>, pub sys_background: Option<u8>, pub sys_border: Option<(u8, u8)>, // SR1046: system colour keyword slots (index into SYSTEM_COLORS; border = (index, side mask)), resolved by tree::system_color_pass
 }
 
 
@@ -368,7 +368,7 @@ impl<H: Host> Default for PaintStyle<H> {
             outline_color: None,
             outline_offset: None,
             currentcolor: 0,
-            color_scheme: None,
+            color_scheme: None, sys_color: None, sys_background: None, sys_border: None,
         }
     }
 }
@@ -1041,6 +1041,26 @@ impl<H: Host> PaintStyle<H> {
         }
         if src.background.is_some() {
             self.currentcolor = (self.currentcolor & !CC_BG) | (src.currentcolor & CC_BG);
+        }
+    }
+}
+
+// ---- AETHERCOLORSCHEMESYSTEMCOLORS (LEDGER SR1046): the system colour slots follow their field through merge_paint (named tail block) ----
+
+impl<H: Host> PaintStyle<H> {
+    /// AETHERCOLORSCHEMESYSTEMCOLORS (SR1046): merge_paint's carry for the system colour slots (css-color-4 §6.2), the
+    /// [`PaintStyle::merge_currentcolor`] shape: a later block that writes `color` / `background` / `border` carries its
+    /// slot (None when it wrote a plain colour, so `color: red` after `color: CanvasText` clears it); a later block that
+    /// writes none of them keeps the earlier slots.
+    pub fn merge_system_colors(&mut self, src: &Self) {
+        if src.color.is_some() {
+            self.sys_color = src.sys_color;
+        }
+        if src.background.is_some() {
+            self.sys_background = src.sys_background;
+        }
+        if src.border.is_some() {
+            self.sys_border = src.sys_border;
         }
     }
 }

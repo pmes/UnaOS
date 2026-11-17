@@ -1224,7 +1224,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             "inherit" | "initial" | "unset" => {}
             other => H::record_css(&format!("justify-content-value:{}", other)),
         },
-        "background-color" => { bg_currentcolor::<H>(&mut style.paint, value);
+        "background-color" => { bg_currentcolor::<H>(&mut style.paint, value); sys_slot(&mut style.paint.sys_background, value);
             if value.eq_ignore_ascii_case("transparent") {
                 style.paint.bg_alpha = Some(0.0);
             } else if !is_neutral_keyword(value) {
@@ -1242,7 +1242,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         "background-image" if value.to_ascii_lowercase().contains("-gradient(") => {
             style.paint.bg_gradient = H::parse_gradient(value).map(Some);
         }
-        "background" if value.to_ascii_lowercase().contains("-gradient(") => { bg_currentcolor::<H>(&mut style.paint, value);
+        "background" if value.to_ascii_lowercase().contains("-gradient(") => { bg_currentcolor::<H>(&mut style.paint, value); sys_slot(&mut style.paint.sys_background, value);
             // A gradient layer (css-images-3 §3.1, §3.2) plus any colour outside it.
             style.paint.bg_gradient = H::parse_gradient(value).map(Some);
             let lower = value.to_ascii_lowercase();
@@ -1285,7 +1285,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 }
             }
         },
-        "background" => { bg_currentcolor::<H>(&mut style.paint, value);
+        "background" => { bg_currentcolor::<H>(&mut style.paint, value); sys_slot(&mut style.paint.sys_background, value);
             // Shorthand: a color and/or an image url, plus the repeat
             // keyword and a `position / size` pair when present.
             bg_shorthand_none::<H>(&mut style.paint, value); if let Some(u) = extract_css_url(value) {
@@ -1368,7 +1368,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 }
             }
         }
-        "color" => {
+        "color" => { sys_slot(&mut style.paint.sys_color, value);
             if !is_neutral_keyword(value) {
                 match parse_color_str::<H>(value) {
                     Some(c) => style.paint.color = Some(c),
@@ -1819,7 +1819,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 style.paint.outline_offset = Some(px);
             }
         }
-        "border" => {
+        "border" => { sys_border_slot(&mut style.paint, crate::paint::CC_SIDES, value);
             let v = value.trim();
             if v == "none" || v == "0" {
                 style.paint.border = Some([None; 4]);
@@ -1867,7 +1867,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 style.paint.border = Some(sides);
             }
         }
-        "border-top-color" | "border-right-color" | "border-bottom-color" | "border-left-color" => side_color_of::<H>(side_index(prop.trim_end_matches("-color")), value, &mut style.paint), "border-color" => {
+        "border-top-color" | "border-right-color" | "border-bottom-color" | "border-left-color" => { sys_border_slot(&mut style.paint, 1 << side_index(prop.trim_end_matches("-color")), value); side_color_of::<H>(side_index(prop.trim_end_matches("-color")), value, &mut style.paint) } "border-color" => { sys_border_slot(&mut style.paint, crate::paint::CC_SIDES, value);
             // `transparent` (or a fully transparent rgba) is how a page
             // says "keep the box, drop the stroke" — the UA control border
             // must go with it, or every quiet button paints an empty frame.
@@ -2601,7 +2601,7 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
         deco_clone, text_combine, scroll_margin, container_scroll,
         outline_style, outline_width, outline_color, outline_offset, synth_weight, synth_style, synth_small_caps, small_caps, color_scheme,
     );
-    clone!(text_shadows, transform, clip_path, filter, backdrop_filter, container_name); dst.merge_inherit(src); dst.merge_currentcolor(src);
+    clone!(text_shadows, transform, clip_path, filter, backdrop_filter, container_name); dst.merge_inherit(src); dst.merge_currentcolor(src); dst.merge_system_colors(src);
     if let Some(src_list) = &src.font_rel {
         let list = dst.font_rel.get_or_insert_with(Vec::new);
         for (p, v) in src_list {
@@ -4050,4 +4050,41 @@ pub fn parse_color_scheme(value: &str) -> Option<u8> {
         return None;
     }
     Some(bits)
+}
+
+// ---- AETHERCOLORSCHEMESYSTEMCOLORS (LEDGER SR1046): the system colour keyword slots written at parse (named tail block) ----
+
+/// AETHERCOLORSCHEMESYSTEMCOLORS (SR1046): css-color-4 §6.2 a system colour keyword's index in [`crate::SYSTEM_COLORS`]
+/// (case-insensitive), else None. The parse still writes css_core's light value as the field's carrier; the index is
+/// the marker `tree::system_color_pass` resolves against the element's used `color-scheme`.
+pub fn system_color_index(name: &str) -> Option<u8> {
+    let name = name.trim();
+    crate::SYSTEM_COLORS.iter().position(|(n, _)| n.eq_ignore_ascii_case(name)).map(|i| i as u8)
+}
+
+/// AETHERCOLORSCHEMESYSTEMCOLORS (SR1046): the `color` / background arms' slot: a CSS-wide keyword leaves it (the arm
+/// writes nothing either); otherwise the first top-level component that is a system colour keyword, else None (a plain
+/// colour, `currentcolor`, an image: the field holds no system colour from this declaration).
+fn sys_slot(slot: &mut Option<u8>, value: &str) {
+    if !is_neutral_keyword(value) {
+        *slot = split_top_level(value).into_iter().find_map(system_color_index);
+    }
+}
+
+/// AETHERCOLORSCHEMESYSTEMCOLORS (SR1046): the border arms' slot, `(index, side mask)` in the SR849 `CC_SIDES` shape:
+/// `border` / `border-color` give `mask` = all four sides, a `border-*-color` longhand its one side. A CSS-wide keyword
+/// leaves it. A system keyword puts `mask`'s sides on it; a side longhand's bit joins only when the other sides hold the
+/// same keyword or none (one slot holds one keyword), else that side keeps its light carrier. No keyword clears
+/// `mask`'s bits (a later `border-left-color: black` is not recoloured); an empty mask is None.
+fn sys_border_slot<H: Host>(paint: &mut PaintStyle<H>, mask: u8, value: &str) {
+    if is_neutral_keyword(value) {
+        return;
+    }
+    let (old_k, old_m) = paint.sys_border.unwrap_or((0, 0));
+    let rest = old_m & !mask;
+    let (k, m) = match split_top_level(value).into_iter().find_map(system_color_index) {
+        Some(k) if rest == 0 || old_k == k => (k, rest | mask),
+        _ => (old_k, rest),
+    };
+    paint.sys_border = (m != 0).then_some((k, m));
 }
