@@ -5542,3 +5542,29 @@ fn striaopacity_face_word_is_one_undo_step() {
     assert_eq!(face.last_error.take().as_deref(), Some("opacity 150: opacity is a percent 0..=100, and video only"));
     assert_eq!(face.state.undo_depth(), 1);
 }
+
+// ---- STRIACLIPLINK (LEDGER SR863): the face's `link` / `unlink` words (named tail block) ----
+#[test]
+fn striacliplink_face_link_word() {
+    let (tl, src) = synth_fixture();
+    let tl0 = tl.clone();
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(VERBS.contains(&"link") && VERBS.contains(&"unlink"));
+    assert_eq!(VERBS.last(), Some(&"help"), "help stays last");
+    assert!(face.verb("link"));
+    assert_eq!(face.last_error.take().as_deref(), Some("link: no such clip"), "nothing selected, on the message row");
+    face.state.select(0, 2).unwrap();
+    face.state.select_add(1, 2).unwrap();
+    assert!(face.verb("link"));
+    assert_eq!(face.last_error.take(), None);
+    assert_eq!(face.state.timeline, tl0.set_group(&[(0, 2), (1, 2)], 1).unwrap());
+    face.state.deselect();
+    face.state.select(1, 2).unwrap();
+    assert_eq!(face.state.set, vec![(0, 2), (1, 2)], "one member selects the pair");
+    assert!(face.verb("nudge+"));
+    assert_eq!((face.state.timeline.tracks[0].clips[2].at, face.state.timeline.tracks[1].clips[2].at), (26, 26), "picture and sound moved together");
+    assert!(face.verb("unlink"));
+    assert_eq!(face.state.timeline, tl0.move_many(&[(0, 2), (1, 2)], 1).unwrap());
+    assert_eq!(face.state.undo_depth(), 3, "link, nudge, unlink: one step each");
+    println!("striacliplink: VERBS[{}] link, unlink; pair nudged to 26", VERBS.len() - 3);
+}

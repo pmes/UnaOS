@@ -419,3 +419,44 @@ fn striaopacity_alpha_line_round_trips_and_refusals_are_named() {
     assert_eq!(edl::parse(&format!("{head}{a}* UNA ALPHA 50\n"), 25), Err(EdlError::Edit(EditError::Opacity)), "audio");
     assert_eq!(edl::parse(&format!("{head}{v}* UNA ALPHA 0\n"), 25).unwrap().tracks[0].clips[0].opacity, 0);
 }
+
+// ---- STRIACLIPLINK (LEDGER SR863): `* UNA GROUP` is the event's link group (named tail block) ----
+fn striacliplink_tl() -> Timeline {
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 50);
+    tl.add_track(Kind::Video);
+    tl.add_track(Kind::Audio);
+    tl.tracks[0].clips = vec![Clip::new(a, 0, 10, 0), Clip::new(a, 10, 20, 10)];
+    tl.tracks[1].clips = vec![Clip::new(a, 0, 10, 0), Clip::new(a, 10, 20, 10)];
+    tl
+}
+
+#[test]
+fn striacliplink_edl_group_round_trip() {
+    let tl = striacliplink_tl().set_group(&[(0, 0), (1, 0)], 7).unwrap();
+    let text = edl::write(&tl, "LINK").unwrap();
+    assert_eq!(text.matches("* UNA GROUP 7\n").count(), 2, "{text}");
+    assert!(text.contains("00:00:00:10\n* UNA GROUP 7\n002"), "the line follows its event: {text}");
+    assert_eq!(edl::parse(&text, 25).unwrap(), tl);
+}
+
+#[test]
+fn striacliplink_edl_group_zero_writes_nothing() {
+    let text = edl::write(&striacliplink_tl(), "LINK").unwrap();
+    assert!(!text.contains("GROUP"), "{text}");
+    assert_eq!(edl::parse(&text, 25).unwrap(), striacliplink_tl());
+}
+
+#[test]
+fn striacliplink_edl_group_refusals() {
+    let text = edl::write(&striacliplink_tl(), "LINK").unwrap();
+    let head = text.find("001 ").unwrap();
+    let early = format!("{}* UNA GROUP 3\n{}", &text[..head], &text[head..]);
+    let line = early[..early.find("* UNA GROUP").unwrap()].lines().count() + 1;
+    assert_eq!(edl::parse(&early, 25), Err(EdlError::Syntax { line }), "no event above");
+    for bad in ["0", "x", "1 2", "-1"] {
+        let t = text.replacen("\n002", &format!("\n* UNA GROUP {bad}\n002"), 1);
+        let line = t[..t.find("* UNA GROUP").unwrap()].lines().count() + 1;
+        assert_eq!(edl::parse(&t, 25), Err(EdlError::Syntax { line }), "{bad}");
+    }
+}

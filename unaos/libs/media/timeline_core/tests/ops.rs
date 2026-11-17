@@ -992,3 +992,161 @@ fn striaopacity_opacity_word_is_one_undo_step() {
     assert_eq!(st.verb("opacity 50"), Some(Err(EditError::Opacity)), "an audio clip");
     assert_eq!(st.timeline, tl);
 }
+
+// ---- STRIACLIPLINK (LEDGER SR863): the clip link group through the selection set (named tail block) ----
+use timeline_core::editor::{Edge, EditorState};
+
+/// V1 + A1 from one source each: A[0,10)@0 and B[20,30)@10 on both tracks (the picture and its sound).
+fn striacliplink_base() -> Timeline {
+    let (mut tl, a, b) = base();
+    tl.tracks[1].clips = vec![Clip::new(a, 0, 10, 0), Clip::new(b, 20, 30, 10)];
+    tl.validate().unwrap();
+    tl
+}
+
+/// The same with V1's and A1's first clips linked as group 1.
+fn striacliplink_linked() -> Timeline {
+    striacliplink_base().set_group(&[(0, 0), (1, 0)], 1).unwrap()
+}
+
+#[test]
+fn striacliplink_mates_and_set_group() {
+    let tl = striacliplink_base();
+    assert_eq!(tl.next_group(), 1);
+    assert_eq!(tl.mates(0, 0), vec![(0, 0)], "an unlinked clip is its own set");
+    let ln = striacliplink_linked();
+    assert_eq!((ln.tracks[0].clips[0].group, ln.tracks[1].clips[0].group, ln.tracks[0].clips[1].group), (1, 1, 0));
+    assert_eq!(ln.mates(1, 0), vec![(0, 0), (1, 0)]);
+    assert_eq!(ln.mates(0, 9), Vec::<(usize, usize)>::new());
+    assert_eq!(ln.next_group(), 2);
+    assert_eq!(tl.set_group(&[], 1), Err(EditError::NoClip));
+    assert_eq!(tl.set_group(&[(0, 9)], 1), Err(EditError::NoClip));
+    assert_eq!(tl.set_group(&[(7, 0)], 1), Err(EditError::NoTrack));
+    assert_eq!(tl, striacliplink_base(), "a refusal leaves the timeline");
+    assert_eq!(ln.set_group(&[(0, 0), (1, 0)], 0).unwrap(), tl, "group 0 unlinks");
+}
+
+#[test]
+fn striacliplink_split_linked_pairs_halves() {
+    let tl = striacliplink_base();
+    assert_eq!(tl.split_linked(0, 4), tl.split(0, 4), "unlinked: exactly split");
+    assert_eq!(tl.split_linked(0, 10), tl.split(0, 10), "no clip spans a cut: the same refusal");
+    assert_eq!(tl.split_linked(9, 4), Err(EditError::NoTrack));
+    let ln = striacliplink_linked();
+    let s = ln.split_linked(0, 4).unwrap();
+    for k in 0..2 {
+        let c = &s.tracks[k].clips;
+        assert_eq!(c.len(), 3, "track {k} split");
+        assert_eq!((c[0].src_in, c[0].src_out, c[0].at, c[0].group), (0, 4, 0, 1), "the head keeps the id");
+        assert_eq!((c[1].src_in, c[1].src_out, c[1].at, c[1].group), (4, 10, 4, 2), "the tails share a fresh id");
+        assert_eq!(c[2].group, 0);
+    }
+    assert_eq!(s.mates(0, 1), vec![(0, 1), (1, 1)]);
+    assert_eq!(ln.split(0, 4).unwrap().tracks[0].clips[1].group, 1, "the bare op keeps the id on both halves");
+}
+
+#[test]
+fn striacliplink_split_at_playhead_is_split_for_group_zero() {
+    let mut st = EditorState::new(striacliplink_base());
+    st.select(0, 0).unwrap();
+    st.seek(4);
+    st.split_at_playhead().unwrap();
+    assert_eq!(st.timeline, striacliplink_base().split(0, 4).unwrap(), "unlinked: the trunk's split, byte for byte");
+    let mut st = EditorState::new(striacliplink_linked());
+    st.select(0, 0).unwrap();
+    st.seek(4);
+    assert_eq!(st.verb("split"), Some(Ok(())));
+    assert_eq!(st.timeline, striacliplink_linked().split_linked(0, 4).unwrap());
+    assert_eq!(st.set, vec![(0, 1), (1, 1)], "the right halves selected, as a pair");
+    assert_eq!(st.undo_depth(), 1);
+}
+
+#[test]
+fn striacliplink_select_takes_the_group() {
+    let mut st = EditorState::new(striacliplink_linked());
+    st.select(0, 0).unwrap();
+    assert_eq!((st.selection, st.set.clone()), (Some((0, 0)), vec![(0, 0), (1, 0)]));
+    st.deselect();
+    st.select_add(1, 0).unwrap();
+    assert_eq!(st.set, vec![(0, 0), (1, 0)], "shift-click on one member");
+    st.select_many(&[(1, 0)], false);
+    assert_eq!(st.set, vec![(0, 0), (1, 0)], "a marquee crossing one member");
+    st.select(0, 1).unwrap();
+    assert_eq!(st.set, vec![(0, 1)], "an unlinked clip alone");
+}
+
+#[test]
+fn striacliplink_unlink_lets_one_member_be_selected_alone() {
+    let mut st = EditorState::new(striacliplink_linked());
+    st.select_many(&[(0, 0)], false);
+    assert_eq!(st.verb("unlink"), Some(Ok(())));
+    assert_eq!(st.timeline, striacliplink_base());
+    st.select_many(&[(0, 0)], false);
+    assert_eq!(st.set, vec![(0, 0)], "marquee: alone after unlink");
+    st.deselect();
+    st.select_add(1, 0).unwrap();
+    assert_eq!(st.set, vec![(1, 0)], "shift-click: alone after unlink");
+}
+
+#[test]
+fn striacliplink_move_set_moves_the_group() {
+    let mut tl = striacliplink_linked();
+    tl.tracks[0].clips[1].at = 20; // room after both first clips
+    tl.tracks[1].clips[1].at = 20;
+    let mut st = EditorState::new(tl.clone());
+    st.select(1, 0).unwrap();
+    assert_eq!(st.verb("nudge+"), Some(Ok(())));
+    assert_eq!((st.timeline.tracks[0].clips[0].at, st.timeline.tracks[1].clips[0].at), (1, 1), "both moved");
+    assert_eq!(st.timeline, tl.move_many(&[(0, 0), (1, 0)], 1).unwrap());
+    assert_eq!(st.set, vec![(0, 0), (1, 0)], "the set follows");
+    assert_eq!(st.undo_depth(), 1, "one undo step");
+    assert!(st.undo());
+    assert_eq!(st.timeline, tl);
+}
+
+#[test]
+fn striacliplink_delete_and_lift_take_the_group() {
+    let tl = striacliplink_linked();
+    let mut st = EditorState::new(tl.clone());
+    st.select(0, 0).unwrap();
+    assert_eq!(st.verb("delete"), Some(Ok(())));
+    assert_eq!(st.timeline, tl.ripple_delete_many(&[(0, 0), (1, 0)]).unwrap());
+    assert_eq!((st.timeline.tracks[0].clips.len(), st.timeline.tracks[1].clips.len()), (1, 1));
+    let mut st = EditorState::new(tl.clone());
+    st.select(1, 0).unwrap();
+    assert_eq!(st.verb("lift"), Some(Ok(())));
+    assert_eq!(st.timeline, tl.lift_many(&[(0, 0), (1, 0)]).unwrap());
+    assert_eq!(st.undo_depth(), 1);
+}
+
+#[test]
+fn striacliplink_trim_is_the_primary_only() {
+    let tl = striacliplink_linked();
+    let mut st = EditorState::new(tl.clone());
+    st.select(0, 0).unwrap();
+    st.trim(Edge::Out, -2).unwrap();
+    assert_eq!(st.timeline, tl.trim_out(0, 0, 8).unwrap());
+    assert_eq!((st.timeline.tracks[1].clips[0].src_out, st.timeline.tracks[0].clips[0].group), (10, 1), "the mate stays; the id stays");
+}
+
+#[test]
+fn striacliplink_link_unlink_words() {
+    let tl = striacliplink_base();
+    let mut st = EditorState::new(tl.clone());
+    assert_eq!(st.verb("link"), Some(Err(EditError::NoClip)), "nothing selected");
+    assert_eq!(st.verb("unlink"), Some(Err(EditError::NoClip)), "nothing selected");
+    st.select(0, 0).unwrap();
+    assert_eq!(st.verb("link"), Some(Err(EditError::NoClip)), "a set of one");
+    assert_eq!(st.verb("unlink"), Some(Ok(())), "nothing linked: no commit");
+    assert_eq!((st.undo_depth(), &st.timeline), (0, &tl));
+    st.select_add(1, 0).unwrap();
+    assert_eq!(st.verb("link"), Some(Ok(())));
+    assert_eq!(st.timeline, striacliplink_linked());
+    assert_eq!(st.undo_depth(), 1);
+    st.select_add(0, 1).unwrap();
+    assert_eq!(st.verb("link"), Some(Ok(())), "a relink merges the old group into a fresh one");
+    assert_eq!(st.timeline.tracks[0].clips.iter().chain(&st.timeline.tracks[1].clips).map(|c| c.group).collect::<Vec<_>>(), vec![2, 2, 2, 0]);
+    assert_eq!(st.verb("unlink"), Some(Ok(())));
+    assert_eq!((st.timeline.clone(), st.undo_depth()), (tl, 3));
+    assert_eq!(st.verb("links"), None, "not a word");
+}

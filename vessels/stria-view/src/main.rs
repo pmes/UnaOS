@@ -536,6 +536,7 @@ fn transport() -> TetraNode {
         button("close-gaps", "Close Gaps"), // STRIAGAPCLOSE (SR857): closes every gap on the selected clip's track (one undo step)
         button("track+ video", "V+"), button("track+ audio", "A+"), button("track-", "Track -"), // STRIATRACKADDREMOVE (SR856): add a video / audio track, remove the selected clip's track
         button("track-gain", "Track 0 dB"), // STRIATRACKGAIN (SR864): the selected clip's track back to unity (`track-gain:<dB>` on `--do` sets it)
+        button("link", "Link"), button("unlink", "Unlink"), // STRIACLIPLINK (SR863): link / unlink the selected clips' group
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`); STRIAAUDIOCROSSFADE (SR860): Xfade puts / takes the selected audio clip's head crossfade
     ])
 }
@@ -1248,5 +1249,36 @@ mod striacrop_tests {
         assert_eq!(drive(&mut face, "crop:1:2"), vec!["bad token crop:1:2".to_string()]);
         assert_eq!(drive(&mut face, "crop:900:0:200:0"), vec![format!("crop 900 0 200 0: {}", timeline_core::EditError::Crop)]);
         assert_eq!(face.state.undo_depth(), 1);
+    }
+}
+
+// ---- STRIACLIPLINK (LEDGER SR863): the `link` / `unlink` buttons through `--do` (named tail block) ----
+#[cfg(test)]
+mod striacliplink_tests {
+    use super::*;
+
+    /// `--do link` with nothing selected names its refusal; after two clips are selected `link` joins them and a click on
+    /// one member selects both; `unlink` parts them; both words are buttons before `help`.
+    #[test]
+    fn striacliplink_do_link_button() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut f, "link");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("no such clip"), "{errors:?}");
+        f.state.select(0, 0).unwrap();
+        f.state.select_add(1, 0).unwrap();
+        let errors = drive(&mut f, "link");
+        assert!(errors.is_empty(), "{errors:?}");
+        f.state.select(0, 0).unwrap();
+        assert_eq!(f.state.set, vec![(0, 0), (1, 0)]);
+        let errors = drive(&mut f, "unlink");
+        assert!(errors.is_empty(), "{errors:?}");
+        f.state.select(0, 0).unwrap();
+        assert_eq!(f.state.set, vec![(0, 0)]);
+        let TetraNode::VStack(top) = editor_tree() else { panic!("not a VStack") };
+        let TetraNode::HStack(row) = &top[1] else { panic!("no transport row") };
+        let ids: Vec<&str> = row.iter().map(|b| match b { TetraNode::Button { id, .. } => id.as_str(), _ => "" }).collect();
+        assert_eq!(&ids[ids.len() - 3..], ["link", "unlink", "help"]);
     }
 }
