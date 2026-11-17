@@ -1901,7 +1901,7 @@ fn prepass<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F) -> P
                     .and_then(|p| p.weight)
                     .map(|w| w.resolve(inherited.weight))
                     .unwrap_or_else(|| default_weight(tag, inherited.weight));
-                size.italic = paint.and_then(|p| p.italic).unwrap_or_else(|| default_italic(tag, inherited.italic));
+                size.italic = paint.and_then(|p| p.italic).unwrap_or_else(|| default_italic(tag, inherited.italic)); size.caps = paint.map_or(inherited.caps, |p| p.caps(inherited.caps));
                 if let Some(st) = paint.and_then(|p| p.stretch) {
                     size.stretch = st;
                 }
@@ -2805,7 +2805,7 @@ pub(crate) struct TextRun {
     pub(crate) family: u16,
     /// Computed font-weight (1..=1000).
     pub(crate) weight: u16,
-    pub(crate) italic: bool,
+    pub(crate) italic: bool, pub(crate) caps: u8,
     /// font-stretch, percent.
     pub(crate) stretch: u16,
     pub(crate) text_transform: u8,
@@ -2828,7 +2828,7 @@ impl TextRun {
     pub(crate) fn advancer(&self) -> Adv {
         Adv::new(self.sel(), self.font_size, self.mode.letter_spacing)
             .with_word_spacing(self.mode.word_spacing)
-            .with_dir(self.mode.rtl)
+            .with_dir(self.mode.rtl).with_small_caps(crate::paint::small_caps_synth(self.caps))
     }
 }
 
