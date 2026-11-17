@@ -14629,3 +14629,102 @@ fn striaopacitykeysface_buttons_and_step_note() {
     assert_eq!((face.last_error.take(), face.note.as_deref()), (None, Some("opacity key cleared at 12")));
     println!("striaopacitykeysface: opacity-key 40, opacity- -> 30 % at 12");
 }
+
+// ---- STRIAEXPORTRANGE (LEDGER SR9075): export marker / export markers as export-queue entries (named tail block) ----
+
+fn striaexportrange_dir(name: &str) -> std::path::PathBuf {
+    common::scratch_dir("striaexportrange", name)
+}
+
+/// The synth face with M1 ranged 12..20 and a marker named `name` ranged 24..30 (the notes and lines taken).
+fn striaexportrange_face(name: &str) -> Face {
+    let mut f = striamarkerjumpkeys_face();
+    f.state.seek(12);
+    assert!(f.verb("mark"));
+    f.state.seek(20);
+    assert!(f.verb("marker range"));
+    f.state.seek(24);
+    assert!(f.verb(&format!("mark {name}")));
+    f.state.seek(30);
+    assert!(f.verb("marker range"));
+    let _ = (f.last_error.take(), f.note.take());
+    f
+}
+
+fn striaexportrange_pngs(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir).map_or(0, |d| d.filter_map(Result::ok).filter(|e| e.path().extension().is_some_and(|x| x == "png")).count())
+}
+
+/// Both words sit before `help`; every refusal is named on the message row and queues nothing (no thread, no directory).
+#[test]
+fn striaexportrange_words_and_refusals_queue_nothing() {
+    let help = VERBS.iter().position(|v| *v == "help").unwrap();
+    let a = VERBS.iter().position(|v| *v == "export marker").expect("export marker is a VERBS word");
+    let b = VERBS.iter().position(|v| *v == "export markers").expect("export markers is a VERBS word");
+    assert!(a < b && b < help);
+    let dir = striaexportrange_dir("refuse");
+    let mut f = striamarkerjumpkeys_face();
+    assert!(f.verb(&format!("export marker {} png", dir.display())));
+    assert_eq!(f.last_error.take().as_deref(), Some("export marker: no marker at or before 00:00:00:00"));
+    assert!(f.verb(&format!("export markers {} png", dir.display())));
+    assert_eq!(f.last_error.take().as_deref(), Some("export markers: no ranged marker"));
+    f.state.seek(12);
+    assert!(f.verb("mark"));
+    let _ = (f.last_error.take(), f.note.take());
+    assert!(f.verb(&format!("export marker {} png", dir.display())));
+    assert_eq!(f.last_error.take().as_deref(), Some("export marker: M1 is a point marker (no range)"));
+    let mut f = striaexportrange_face("M1");
+    assert!(f.verb(&format!("export markers {} png", dir.display())));
+    assert_eq!(f.last_error.take().as_deref(), Some("export markers: two markers named M1"));
+    assert!(f.verb("export marker"));
+    assert_eq!(f.last_error.take().as_deref(), Some("export marker: no directory (no document path)"));
+    assert!(f.verb(&format!("export marker {} gif", dir.display())));
+    assert!(f.last_error.take().is_some_and(|l| l.starts_with("export marker: ")));
+    assert!(!f.exporting() && f.export_queued() == 0 && !dir.exists());
+    println!("striaexportrange: refusals named, nothing queued");
+}
+
+/// `export markers <dir> png` makes one queue entry per ranged marker in tick order, each into `<dir>/<safe name>`:
+/// the first starts, the second waits (export-list names it by the marker), both finish; no undo step.
+#[test]
+fn striaexportrange_markers_queue_one_entry_each() {
+    let dir = striaexportrange_dir("markers");
+    let mut f = striaexportrange_face("M 2");
+    let depth = f.state.undo_depth();
+    let tl = f.state.timeline.clone();
+    assert!(f.verb(&format!("export markers {} png", dir.display())));
+    assert_eq!((f.last_error.as_deref(), f.note.take().as_deref()), (None, Some("export markers: 2 entries (M1, M 2)")));
+    assert!(f.exporting());
+    assert_eq!(f.export_queued(), 1);
+    assert!(f.verb("export-list"));
+    assert_eq!(f.last_error.take().as_deref(), Some("export: 1 waiting: M_2 png ticks 24..30"));
+    assert_eq!(f.wait_exports(), 2);
+    let line = f.last_error.take().expect("the last result line");
+    assert!(line.ends_with(&format!("-> {}", dir.join("M_2").display())), "{line}");
+    assert_eq!((striaexportrange_pngs(&dir.join("M1")), striaexportrange_pngs(&dir.join("M_2"))), (8, 6));
+    assert!(!f.exporting() && f.export_queued() == 0);
+    assert_eq!((f.state.undo_depth(), &f.state.timeline), (depth, &tl), "a face word: no undo step");
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("striaexportrange: M1 8 frames, M_2 6 frames; {line}");
+}
+
+/// `export marker` while a plain export runs queues the playhead's marker behind it (the note names it); Esc drops it.
+#[test]
+fn striaexportrange_marker_queues_behind_a_running_export() {
+    let (a, dir) = (nlefaceexport_dir("striaexportrange-running"), striaexportrange_dir("behind"));
+    let mut f = striaexportqueue_paused(&a);
+    f.state.seek(12);
+    assert!(f.verb("mark"));
+    f.state.seek(20);
+    assert!(f.verb("marker range"));
+    let _ = (f.last_error.take(), f.note.take());
+    assert!(f.verb(&format!("export marker {} png", dir.display())));
+    assert_eq!((f.last_error.as_deref(), f.note.take().as_deref()), (None, Some("export marker: M1 ticks 12..20 queued (1 waiting)")));
+    assert_eq!(f.export_queued(), 1);
+    assert!(f.cancel_export());
+    assert_eq!(f.export_queued(), 0);
+    assert!(f.wait_export());
+    assert!(!f.exporting() && !dir.join("M1").exists());
+    let _ = (std::fs::remove_dir_all(&a), std::fs::remove_dir_all(&dir));
+    println!("striaexportrange: queued behind the running export, dropped by Esc");
+}

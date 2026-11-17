@@ -158,7 +158,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 146] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "frame", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "ripple-all", "close-sync", "close-all", "preset", "export-skip", "export-clear", "export-list", "gap", "pip", "crop", "history", "recover", "snap", "meters-reset", "track-up", "track-down", "info", "loudness", "link", "unlink", "track+ video", "track+ audio", "track-", "headers", "close-gaps", "copy", "cut", "paste", "paste-insert", "paste-over", "tc", "xfade", "zoom-fit", "zoom-sel", "insert", "overwrite", "roll-", "roll+", "roll-tool", "mark", "unmark", "speed", "mute", "solo", "title", "gain-", "gain+", "gain", "fade-in", "fade-out", "track-gain", "opacity-", "opacity+", "bright-", "bright+", "contrast-", "contrast+", "sat-", "sat+", "normalize", "freeze", "pan-", "pan", "pan+", "proxy", "marker-", "marker+", "cut-", "cut+", "insert-marked", "overwrite-marked", "insert-all", "insert-marked-all", "target", "track-gain-", "track-gain+", "unlink-all", "link-av", "freeze-all", "title-size-", "title-size+", "title-align", "title-ink", "xfade-curve", "proxy-off", "proxy-all", "scale-", "scale+", "pip key", "pip unkey", "pip left", "pip right", "pip up", "pip down", "unmark all", "alone", "marker colour", "marker range", "rspeed", "marker marks", "source", "src-prev", "src-next", "src-in", "src-out", "unload", "pan-key", "pan-unkey", "env", "env-", "env+", "env-del", "goto", "reverse", "dur-", "dur+", "env-curve", "opacity-key", "opacity-unkey", "help"]; // STRIAGAINENVCURVE (SR9083): `env-curve` toggles the selected clip's envelope curve (timeline_core's verb; the note in the file tail); STRIAGAINENVELOPE (SR9047): the selected clip's gain envelope point at the playhead (timeline_core's verb; the note in the file tail); STRIATRACKGAINSTEP (SR901): `track-gain-` / `track-gain+` step the selected clip's track one dB (timeline_core's verb; the message line in the file tail); STRIATRACKGAIN (SR864): `track-gain [<dB>]` the selected clip's track (timeline_core's `EditorState::verb`; bare = unity); STRIANORMALIZE (SR878): the selected clip's gain to its exact peak (file tail); STRIACLIPGAINFACE (SR838): the selected clip's gain / fades (timeline_core's `EditorState::verb`; file tail); STRIAOPACITYKEYSFACE (SR9085): `opacity-key` / `opacity-unkey` are transport buttons (the point at the playhead); STRIAOPACITYFACE (SR898): `opacity-` / `opacity+` step the selection's opacity 10 % (file tail); STRIAGRADEFACE (SR899): the six grade step words (timeline_core editor.rs tail); STRIAPANAUTOMATION (SR9050): `pan-key` / `pan-unkey` set / clear the selected clip's pan point at the playhead (timeline_core editor.rs tail); STRIAPANFACE (SR897): `pan-` / `pan` / `pan+` step / centre the selected clip's pan (file tail); STRIAPROXYBUTTONS (SR930): `proxy-off` / `proxy-all` are the buttons' words for `proxy off` / `proxy all` (file tail); STRIAPROXYMEDIA (SR882): `proxy` renders the selected clip's source at half size once and previews from it (file tail); STRIAMARKERRANGES (SR9052): `marker marks` sets the export marks to the playhead's marker's range (file tail); STRIAMARKERJUMPKEYSNEXT (SR984): `marker colour [<name>]` / `marker range` style the playhead's marker (file tail); STRIASPEEDREVERSE (SR9067): reverse (timeline_core's `EditorState::verb`); STRIAKDUR (SR9089): `dur-` / `dur+` step the clip's transition (file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAEXPORTFRAME (SR830): `frame [<path>]` the playhead frame as a PNG (file tail); STRIATITLECLIP (SR828): title (file tail); STRIATRACKMUTESOLO (SR837): mute / solo the selected clip's track (timeline_core's verb), before help; STRIACLIPSPEED (SR829): speed (file tail); STRIAMARKERS (SR835): `mark [<name>]` / `unmark` at the playhead (file tail); STRIAROLLEDIT (SR851): one-frame roll of the cut at the selected clip's out edge (timeline_core editor tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite at the playhead (timeline_core); STRIAZOOMTOFIT (SR859): zoom-fit / zoom-sel (file tail); STRIAAUDIOCROSSFADE (SR860): xfade puts / takes the selected audio clip's head crossfade (timeline_core editor.rs tail); STRIATIMECODEDISPLAY (SR872): `tc` cycles the playhead readout (file tail); STRIACOPYPASTE (SR854): copy / cut / paste of the selection at the playhead (timeline_core editor.rs); STRIAGAPCLOSE (SR857): `close-gaps` closes every gap on the selected track (timeline_core `EditorState::verb`; `gap <n>` an argument word, no button); STRIATRACKADDREMOVE (SR856): track add / remove (timeline_core's verb; file tail); STRIACLIPLINK (SR863): `link` / `unlink` the selection's clip group (timeline_core editor.rs tail); STRIATRACKREORDER (SR877): `track-up` / `track-down` swap the selected clip's track with its same-kind neighbour (timeline_core editor.rs file tail); STRIAMETERCLIPVERB (SR902): meters-reset clears every clip latch and peak hold (file tail); STRIAPASTEINSERT (SR896): paste-insert / paste-over (timeline_core editor.rs); STRIASNAPTOGGLE (SR892): snap flips the drag snap default (file tail); STRIAAUTOSAVE (SR883): `recover` loads the autosave (file tail); STRIAUNDOHISTORY (SR876): history (file tail); STRIAFREEZEFRAME (SR880): freeze (timeline_core `EditorState::verb`); STRIACROPFACE (SR900): `crop` clears the selection's crop (timeline_core editor.rs file tail); STRIAPOSITIONSCALE (SR879): `pip` (timeline_core editor.rs tail); STRIAMARKERJUMP (SR894): `marker-` / `marker+` / `cut-` / `cut+` jump the playhead to the previous / next marker / clip edge (timeline_core editor.rs tail); STRIAINSERTMARKS (SR905): insert / overwrite into the in / out marks (timeline_core); STRIALINKAUTO (SR911): `unlink-all` parts every link (timeline_core editor.rs tail); STRIAGAPSBLACK (SR909): bare `gap` opens one second at the playhead (before `close-gaps`; timeline_core `EditorState::verb`); STRIAEXPORTQUEUESKIP (SR914): export-skip / export-clear (file tail); STRIAFREEZELEN (SR916): `freeze [<len>]` / `freeze-all [<len>]` (every track ripples; timeline_core `freeze_words`); STRIAXFADECURVEBUTTON (SR925): xfade-curve swaps that crossfade's curve (timeline_core editor.rs tail); STRIALINKAUTOFUZZ (SR928): `link-av` links the V1 / A1 pairs, near ones too (timeline_core editor.rs tail); STRIAEXPORTQUEUELIST (SR932): export-list (file tail); STRIAXFORMPRESETS (SR938): `scale-` / `scale+` (timeline_core editor.rs tail); STRIAEXPORTPRESETSMORE (SR948): `preset` picks the face's export preset (file tail); STRIAROLLMORE (SR954): the roll tool on / off (file tail); STRIAMARKERSMORE (SR966): `unmark all` (file tail); STRIAGAPSMORE (SR969): `close-all` the Close All button's word for `close-gaps all` (before `gap`; file tail); STRIAINSERTMARKSKEYSNEXT (SR985): the all-tracks inserts and the target track (timeline_core); STRIAGAPSTHREE (SR9028): `close-sync` the Close Sync button's word for `close-gaps sync` (before `close-all`; file tail); STRIARIPPLETHREE (SR9034): the ripple-all tool on / off (file tail); STRIACLIPSPEEDTHREE (SR9031): rspeed (file tail); STRIATRACKSTHREE (SR9038): the header column (file tail); STRIAXFORMTHREE (SR9033): `pip left` / `pip right` / `pip up` / `pip down`, SR975's nudge words (timeline_core editor.rs tail); STRIASOURCEVIEWER (SR9045): the source monitor's words (timeline_core); STRIAXFORMKEYSNAV (SR9069): `pip key` / `pip unkey` (timeline_core editor.rs SR9049 tail); STRIATITLESTYLEFACE (SR9077): the title step words (timeline_core `title_step`); STRIADROPFRAMEFACE (SR9078): `goto <timecode|frames>` seeks the playhead (file tail)
+pub const VERBS: [&str; 147] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "frame", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "ripple-all", "close-sync", "close-all", "preset", "export-skip", "export-clear", "export-list", "gap", "pip", "crop", "history", "recover", "snap", "meters-reset", "track-up", "track-down", "info", "loudness", "link", "unlink", "track+ video", "track+ audio", "track-", "headers", "close-gaps", "copy", "cut", "paste", "paste-insert", "paste-over", "tc", "xfade", "zoom-fit", "zoom-sel", "insert", "overwrite", "roll-", "roll+", "roll-tool", "mark", "unmark", "speed", "mute", "solo", "title", "gain-", "gain+", "gain", "fade-in", "fade-out", "track-gain", "opacity-", "opacity+", "bright-", "bright+", "contrast-", "contrast+", "sat-", "sat+", "normalize", "freeze", "pan-", "pan", "pan+", "proxy", "marker-", "marker+", "cut-", "cut+", "insert-marked", "overwrite-marked", "insert-all", "insert-marked-all", "target", "track-gain-", "track-gain+", "unlink-all", "link-av", "freeze-all", "title-size-", "title-size+", "title-align", "title-ink", "xfade-curve", "proxy-off", "proxy-all", "scale-", "scale+", "pip key", "pip unkey", "pip left", "pip right", "pip up", "pip down", "unmark all", "alone", "marker colour", "marker range", "rspeed", "marker marks", "source marker", "export markers", "src-prev", "src-next", "src-in", "src-out", "unload", "pan-key", "pan-unkey", "env", "env-", "env+", "env-del", "goto", "reverse", "dur-", "dur+", "env-curve", "opacity-key", "opacity-unkey", "help"]; // STRIAGAINENVCURVE (SR9083): `env-curve` toggles the selected clip's envelope curve (timeline_core's verb; the note in the file tail); STRIAGAINENVELOPE (SR9047): the selected clip's gain envelope point at the playhead (timeline_core's verb; the note in the file tail); STRIATRACKGAINSTEP (SR901): `track-gain-` / `track-gain+` step the selected clip's track one dB (timeline_core's verb; the message line in the file tail); STRIATRACKGAIN (SR864): `track-gain [<dB>]` the selected clip's track (timeline_core's `EditorState::verb`; bare = unity); STRIANORMALIZE (SR878): the selected clip's gain to its exact peak (file tail); STRIACLIPGAINFACE (SR838): the selected clip's gain / fades (timeline_core's `EditorState::verb`; file tail); STRIAOPACITYKEYSFACE (SR9085): `opacity-key` / `opacity-unkey` are transport buttons (the point at the playhead); STRIAOPACITYFACE (SR898): `opacity-` / `opacity+` step the selection's opacity 10 % (file tail); STRIAGRADEFACE (SR899): the six grade step words (timeline_core editor.rs tail); STRIAPANAUTOMATION (SR9050): `pan-key` / `pan-unkey` set / clear the selected clip's pan point at the playhead (timeline_core editor.rs tail); STRIAPANFACE (SR897): `pan-` / `pan` / `pan+` step / centre the selected clip's pan (file tail); STRIAPROXYBUTTONS (SR930): `proxy-off` / `proxy-all` are the buttons' words for `proxy off` / `proxy all` (file tail); STRIAPROXYMEDIA (SR882): `proxy` renders the selected clip's source at half size once and previews from it (file tail); STRIAEXPORTRANGE (SR9075): `export marker` / `export markers` queue the marker ranges as export-queue entries (file tail); STRIAMARKERRANGES (SR9052): `marker marks` sets the export marks to the playhead's marker's range (file tail); STRIAMARKERJUMPKEYSNEXT (SR984): `marker colour [<name>]` / `marker range` style the playhead's marker (file tail); STRIASPEEDREVERSE (SR9067): reverse (timeline_core's `EditorState::verb`); STRIAKDUR (SR9089): `dur-` / `dur+` step the clip's transition (file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAEXPORTFRAME (SR830): `frame [<path>]` the playhead frame as a PNG (file tail); STRIATITLECLIP (SR828): title (file tail); STRIATRACKMUTESOLO (SR837): mute / solo the selected clip's track (timeline_core's verb), before help; STRIACLIPSPEED (SR829): speed (file tail); STRIAMARKERS (SR835): `mark [<name>]` / `unmark` at the playhead (file tail); STRIAROLLEDIT (SR851): one-frame roll of the cut at the selected clip's out edge (timeline_core editor tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite at the playhead (timeline_core); STRIAZOOMTOFIT (SR859): zoom-fit / zoom-sel (file tail); STRIAAUDIOCROSSFADE (SR860): xfade puts / takes the selected audio clip's head crossfade (timeline_core editor.rs tail); STRIATIMECODEDISPLAY (SR872): `tc` cycles the playhead readout (file tail); STRIACOPYPASTE (SR854): copy / cut / paste of the selection at the playhead (timeline_core editor.rs); STRIAGAPCLOSE (SR857): `close-gaps` closes every gap on the selected track (timeline_core `EditorState::verb`; `gap <n>` an argument word, no button); STRIATRACKADDREMOVE (SR856): track add / remove (timeline_core's verb; file tail); STRIACLIPLINK (SR863): `link` / `unlink` the selection's clip group (timeline_core editor.rs tail); STRIATRACKREORDER (SR877): `track-up` / `track-down` swap the selected clip's track with its same-kind neighbour (timeline_core editor.rs file tail); STRIAMETERCLIPVERB (SR902): meters-reset clears every clip latch and peak hold (file tail); STRIAPASTEINSERT (SR896): paste-insert / paste-over (timeline_core editor.rs); STRIASNAPTOGGLE (SR892): snap flips the drag snap default (file tail); STRIAAUTOSAVE (SR883): `recover` loads the autosave (file tail); STRIAUNDOHISTORY (SR876): history (file tail); STRIAFREEZEFRAME (SR880): freeze (timeline_core `EditorState::verb`); STRIACROPFACE (SR900): `crop` clears the selection's crop (timeline_core editor.rs file tail); STRIAPOSITIONSCALE (SR879): `pip` (timeline_core editor.rs tail); STRIAMARKERJUMP (SR894): `marker-` / `marker+` / `cut-` / `cut+` jump the playhead to the previous / next marker / clip edge (timeline_core editor.rs tail); STRIAINSERTMARKS (SR905): insert / overwrite into the in / out marks (timeline_core); STRIALINKAUTO (SR911): `unlink-all` parts every link (timeline_core editor.rs tail); STRIAGAPSBLACK (SR909): bare `gap` opens one second at the playhead (before `close-gaps`; timeline_core `EditorState::verb`); STRIAEXPORTQUEUESKIP (SR914): export-skip / export-clear (file tail); STRIAFREEZELEN (SR916): `freeze [<len>]` / `freeze-all [<len>]` (every track ripples; timeline_core `freeze_words`); STRIAXFADECURVEBUTTON (SR925): xfade-curve swaps that crossfade's curve (timeline_core editor.rs tail); STRIALINKAUTOFUZZ (SR928): `link-av` links the V1 / A1 pairs, near ones too (timeline_core editor.rs tail); STRIAEXPORTQUEUELIST (SR932): export-list (file tail); STRIAXFORMPRESETS (SR938): `scale-` / `scale+` (timeline_core editor.rs tail); STRIAEXPORTPRESETSMORE (SR948): `preset` picks the face's export preset (file tail); STRIAROLLMORE (SR954): the roll tool on / off (file tail); STRIAMARKERSMORE (SR966): `unmark all` (file tail); STRIAGAPSMORE (SR969): `close-all` the Close All button's word for `close-gaps all` (before `gap`; file tail); STRIAINSERTMARKSKEYSNEXT (SR985): the all-tracks inserts and the target track (timeline_core); STRIAGAPSTHREE (SR9028): `close-sync` the Close Sync button's word for `close-gaps sync` (before `close-all`; file tail); STRIARIPPLETHREE (SR9034): the ripple-all tool on / off (file tail); STRIACLIPSPEEDTHREE (SR9031): rspeed (file tail); STRIATRACKSTHREE (SR9038): the header column (file tail); STRIAXFORMTHREE (SR9033): `pip left` / `pip right` / `pip up` / `pip down`, SR975's nudge words (timeline_core editor.rs tail); STRIASOURCEVIEWER (SR9045): the source monitor's words (timeline_core); STRIAXFORMKEYSNAV (SR9069): `pip key` / `pip unkey` (timeline_core editor.rs SR9049 tail); STRIATITLESTYLEFACE (SR9077): the title step words (timeline_core `title_step`); STRIADROPFRAMEFACE (SR9078): `goto <timecode|frames>` seeks the playhead (file tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -277,7 +277,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     fn verb_unnamed(&mut self, v: &str) -> bool {
-        if let Some(r) = self.env_curve_face_verb(v) { return r; } if let Some(r) = self.transition_step_note(v) { return r; } if let Some(r) = self.env_face_verb(v) { return r; } if let Some(r) = self.normalize_lufs_verb(v) { return r; } if let Some(r) = self.opacity_key_word(v) { return r; } if let Some(r) = self.target_verb(v) { return r; } if let Some(r) = self.proxy_words(v) { return r; } if let Some(r) = self.opacity_word(v) { return r; } if let Some(r) = self.meter_reset_verb(v) { return r; } if let Some(r) = self.normalize_verb(v) { return r; } if let Some(r) = self.proxy_verb(v) { return r; } if let Some(r) = self.gaps_note_verb(v) { return r; } if let Some(r) = self.track_order_word(v) { return r; } if let Some(r) = self.laid_verb(v) { return r; } if let Some(r) = self.xform_note_verb(v) { return r; } if let Some(r) = self.preset_verb(v) { return r; } if let Some(r) = self.transition_len_verb(v) { return r; } if let Some(r) = self.track_flag_face_verb(v) { return r; } if let Some(r) = self.headers_verb(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.info_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.snap_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.frame_verb(v) { return r; } if let Some(r) = self.clip_audio_verb(v) { return r; } if let Some(r) = self.marker_verb(v) { return r; } if let Some(r) = self.fit_verb(v) { return r; } if let Some(r) = self.tc_verb(v) { return r; } if let Some(r) = self.nudge_verb(v) { return r; } if let Some(r) = self.track_remove_verb(v) { return r; } if let Some(r) = self.loudness_verb(v) { return r; } if let Some(r) = self.help_search_verb(v) { return r; } if let Some(r) = self.autosave_verb(v) { return r; } if let Some(r) = self.pan_face_verb(v) { return r; } if let Some(r) = self.track_gain_face_verb(v) { return r; } if let Some(r) = self.export_queue_verb(v) { return r; } if let Some(r) = self.jump_verb(v) { return r; } if let Some(r) = self.roll_tool_verb(v) { return r; } if let Some(r) = self.marker_style_verb(v) { return r; } if let Some(r) = self.ripple_all_verb(v) { return r; } if let Some(r) = self.marker_marks_verb(v) { return r; } if let Some(r) = self.goto_verb(v) { return r; } // STRIANORMALIZE (SR878): the normalize word (file tail); STRIACLIPGAINFACE (SR838): the gain / fade words and their message (file tail); STRIATRACKGAINSTEP (SR901): the track gain words and their message (file tail); STRIAOPACITYKEYS (SR9048): `opacity-key` / `opacity-unkey` and their note (file tail); STRIAOPACITYFACE (SR898): the opacity step words name the percent (file tail); STRIAPANFACE (SR897): the pan words and their readout (file tail); STRIATRACKORDERKEYS (SR922): the track words name the move (file tail); STRIAMARKERRANGES (SR9052): `marker marks` (file tail); STRIAMARKERJUMPKEYSNEXT (SR984): `marker colour` / `marker range` (file tail); NLEHOSTSAVE (SR677): the save verb (file tail); STRIATRACKADDREMOVE (SR856): `track-` names what went (file tail); STRIAGAPSBLACK (SR909): the close-gaps note of removed black fades (file tail); STRIAINSERTMARKSKEYSNEXT (SR985): `target` (file tail); STRIATRACKGAINTHREE (SR9024): mute / solo and their note (file tail); STRIATRACKSTHREE (SR9038): `headers` (file tail); STRIAGAINENVELOPE (SR9047): the env words and their note (file tail); STRIAGAINENVCURVE (SR9083): `env-curve` and its note (file tail)
+        if let Some(r) = self.env_curve_face_verb(v) { return r; } if let Some(r) = self.transition_step_note(v) { return r; } if let Some(r) = self.env_face_verb(v) { return r; } if let Some(r) = self.normalize_lufs_verb(v) { return r; } if let Some(r) = self.opacity_key_word(v) { return r; } if let Some(r) = self.target_verb(v) { return r; } if let Some(r) = self.proxy_words(v) { return r; } if let Some(r) = self.opacity_word(v) { return r; } if let Some(r) = self.meter_reset_verb(v) { return r; } if let Some(r) = self.normalize_verb(v) { return r; } if let Some(r) = self.proxy_verb(v) { return r; } if let Some(r) = self.gaps_note_verb(v) { return r; } if let Some(r) = self.track_order_word(v) { return r; } if let Some(r) = self.laid_verb(v) { return r; } if let Some(r) = self.xform_note_verb(v) { return r; } if let Some(r) = self.preset_verb(v) { return r; } if let Some(r) = self.transition_len_verb(v) { return r; } if let Some(r) = self.track_flag_face_verb(v) { return r; } if let Some(r) = self.headers_verb(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.info_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.snap_verb(v) { return r; } if let Some(r) = self.export_marker_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.frame_verb(v) { return r; } if let Some(r) = self.clip_audio_verb(v) { return r; } if let Some(r) = self.marker_verb(v) { return r; } if let Some(r) = self.fit_verb(v) { return r; } if let Some(r) = self.tc_verb(v) { return r; } if let Some(r) = self.nudge_verb(v) { return r; } if let Some(r) = self.track_remove_verb(v) { return r; } if let Some(r) = self.loudness_verb(v) { return r; } if let Some(r) = self.help_search_verb(v) { return r; } if let Some(r) = self.autosave_verb(v) { return r; } if let Some(r) = self.pan_face_verb(v) { return r; } if let Some(r) = self.track_gain_face_verb(v) { return r; } if let Some(r) = self.export_queue_verb(v) { return r; } if let Some(r) = self.jump_verb(v) { return r; } if let Some(r) = self.roll_tool_verb(v) { return r; } if let Some(r) = self.marker_style_verb(v) { return r; } if let Some(r) = self.ripple_all_verb(v) { return r; } if let Some(r) = self.marker_marks_verb(v) { return r; } if let Some(r) = self.goto_verb(v) { return r; } // STRIANORMALIZE (SR878): the normalize word (file tail); STRIACLIPGAINFACE (SR838): the gain / fade words and their message (file tail); STRIATRACKGAINSTEP (SR901): the track gain words and their message (file tail); STRIAOPACITYKEYS (SR9048): `opacity-key` / `opacity-unkey` and their note (file tail); STRIAOPACITYFACE (SR898): the opacity step words name the percent (file tail); STRIAPANFACE (SR897): the pan words and their readout (file tail); STRIATRACKORDERKEYS (SR922): the track words name the move (file tail); STRIAEXPORTRANGE (SR9075): `export marker(s)` before `export` takes the words (file tail); STRIAMARKERRANGES (SR9052): `marker marks` (file tail); STRIAMARKERJUMPKEYSNEXT (SR984): `marker colour` / `marker range` (file tail); NLEHOSTSAVE (SR677): the save verb (file tail); STRIATRACKADDREMOVE (SR856): `track-` names what went (file tail); STRIAGAPSBLACK (SR909): the close-gaps note of removed black fades (file tail); STRIAINSERTMARKSKEYSNEXT (SR985): `target` (file tail); STRIATRACKGAINTHREE (SR9024): mute / solo and their note (file tail); STRIATRACKSTHREE (SR9038): `headers` (file tail); STRIAGAINENVELOPE (SR9047): the env words and their note (file tail); STRIAGAINENVCURVE (SR9083): `env-curve` and its note (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -2166,25 +2166,8 @@ impl Face {
             self.last_error = Some(format!("export: busy ({d}/{t})"));
             return Some(true);
         }
-        let (dir, fmt) = match args.as_slice() {
-            [] => (None, "h264"),
-            [f] if VIDEO_NAMES.contains(f) => (None, *f),
-            [d] => (Some(*d), "h264"),
-            [d, f] => (Some(*d), *f),
-            _ => {
-                self.last_error = Some(format!("export: usage: {}", export_usage())); // NLE5DEXPORTMESSAGEAUDIO (SR756): the one usage
-                return Some(true);
-            }
-        };
-        let dir = match (dir, &self.doc_path) {
-            (Some(d), _) => std::path::PathBuf::from(d),
-            (None, Some(p)) => p.with_file_name(format!("{}-export", p.file_stem().and_then(|s| s.to_str()).unwrap_or("untitled"))),
-            (None, None) => {
-                self.last_error = Some("export: no directory (no document path)".into());
-                return Some(true);
-            }
-        };
-        if let Err(e) = audio.and_then(|a| opts.and_then(|o| self.export_or_queue(&dir, fmt, if all { None } else { self.export_range() }, a, o))) { // STRIAEXPORTPRESETS (SR871): a preset's H.264 options (file tail) // STRIAEXPORTQUEUE (SR881): a running job queues the request (file tail)
+        let (dir, fmt) = match self.export_args(&args) { Ok(x) => x, Err(e) => { self.last_error = Some(format!("export: {e}")); return Some(true); } }; // STRIAEXPORTRANGE (SR9075): the dir / format grammar lifted once (file tail)
+        if let Err(e) = audio.and_then(|a| opts.and_then(|o| self.export_or_queue(&dir, &fmt, if all { None } else { self.export_range() }, a, o))) { // STRIAEXPORTPRESETS (SR871): a preset's H.264 options (file tail) // STRIAEXPORTQUEUE (SR881): a running job queues the request (file tail)
             self.last_error = Some(format!("export: {e}"));
         }
         Some(true)
@@ -11079,5 +11062,154 @@ impl Face {
         let n = c.pan_keys.n;
         let line = pan_line(c.pan_at(self.state.playhead));
         if n > 0 { format!("{line} keys {n}") } else { line }
+    }
+}
+
+// ---- STRIAEXPORTRANGE (LEDGER SR9075): export marker / export markers as export-queue entries (named tail block) ----
+// `export marker [<dir>] [fmt] [audio]` exports the range of the marker at or before the playhead (SR9052's
+// `Timeline::marker_before`; its range `at..min(at + len, end)`) and `export markers [..]` every ranged marker in tick
+// order, each as ONE `export_or_queue` call (SR881's road: idle starts at once, running queues with the snapshot), so
+// export-skip / export-clear / export-list / Esc / the waiting note / the witness `queued` all apply unchanged. An entry
+// is named by its marker through its directory `<dir>/<safe name>` (`export_safe_name`): export-list reads `M1 png ticks
+// 12..20`, the result line ends `-> <dir>/M1`. The dir / format grammar is `export`'s own, lifted once into
+// `Face::export_args` (the `export` verb calls it). Face words: no commit, no undo step, no dirty document. Refusals are
+// `last_error` and queue nothing (`export markers` is all-or-nothing against `EXPORT_QUEUE_MAX`); the success is the note.
+// Owed: NLE-EXPORT-RANGE-QUEUE-NAME (the result line is named by the dir, no `M1:` prefix), NLE-EXPORT-RANGE-QUEUE-KERNEL.
+
+/// STRIAEXPORTRANGE (SR9075): a marker's name as one directory component: every char outside `[A-Za-z0-9_-]` becomes
+/// `_` (an empty name is `_`), so no name climbs out of the export directory.
+fn export_safe_name(name: &str) -> String {
+    let s: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
+    if s.is_empty() { "_".to_string() } else { s }
+}
+
+impl Face {
+    /// The `export` grammar's directory and format words (`--all` and the audio word already taken): none = the default
+    /// directory `<document's dir>/<stem>-export` and h264; a lone format word the format; a lone other word the directory;
+    /// `<dir> <fmt>`. Refused: more words (`usage: ..`), no directory and no document path.
+    fn export_args(&self, args: &[&str]) -> Result<(std::path::PathBuf, String), String> {
+        let (dir, fmt) = match args {
+            [] => (None, "h264"),
+            [f] if VIDEO_NAMES.contains(f) => (None, *f),
+            [d] => (Some(*d), "h264"),
+            [d, f] => (Some(*d), *f),
+            _ => return Err(format!("usage: {}", export_usage())), // NLE5DEXPORTMESSAGEAUDIO (SR756): the one usage
+        };
+        let dir = match (dir, &self.doc_path) {
+            (Some(d), _) => std::path::PathBuf::from(d),
+            (None, Some(p)) => p.with_file_name(format!("{}-export", p.file_stem().and_then(|s| s.to_str()).unwrap_or("untitled"))),
+            (None, None) => return Err("no directory (no document path)".into()),
+        };
+        Ok((dir, fmt.to_string()))
+    }
+    /// The ranged markers' entries in tick order, `(name, safe name, at..min(at + len, end))`, and how many ranged markers
+    /// lie past the timeline's end (an empty range: skipped).
+    fn export_marker_ranges(&self) -> (Vec<(String, String, std::ops::Range<i64>)>, usize) {
+        let end = self.state.timeline.end();
+        let (mut v, mut past) = (Vec::new(), 0);
+        for m in self.state.timeline.markers.iter().filter(|m| m.len > 0) {
+            let r = m.at..(m.at + m.len).min(end);
+            if r.is_empty() {
+                past += 1;
+            } else {
+                v.push((m.name.clone(), export_safe_name(&m.name), r));
+            }
+        }
+        (v, past)
+    }
+    /// The `export marker` / `export markers` words (before `export` takes them); `None` for any other word.
+    fn export_marker_verb(&mut self, v: &str) -> Option<bool> {
+        let mut words = v.split_whitespace();
+        if words.next() != Some("export") {
+            return None;
+        }
+        let all = match words.next() {
+            Some("marker") => false,
+            Some("markers") => true,
+            _ => return None,
+        };
+        let word = if all { "export markers" } else { "export marker" };
+        let (args, audio) = export_audio_word(words.collect());
+        let ph = self.state.playhead;
+        let (list, past) = if all {
+            let (list, past) = self.export_marker_ranges();
+            if list.is_empty() {
+                self.last_error = Some(format!("{word}: no ranged marker"));
+                return Some(true);
+            }
+            if let Some((_, safe, _)) = list.iter().enumerate().find(|(i, e)| list[..*i].iter().any(|p| p.1 == e.1)).map(|(_, e)| e) {
+                self.last_error = Some(format!("{word}: two markers named {safe}"));
+                return Some(true);
+            }
+            (list, past)
+        } else {
+            let end = self.state.timeline.end();
+            let Some(m) = self.state.timeline.marker_before(ph).cloned() else {
+                self.last_error = Some(format!("{word}: no marker at or before {}", self.marker_tc(ph)));
+                return Some(true);
+            };
+            let r = m.at..(m.at + m.len).min(end);
+            if m.len == 0 {
+                self.last_error = Some(format!("{word}: {} is a point marker (no range)", m.name));
+                return Some(true);
+            }
+            if r.is_empty() {
+                self.last_error = Some(format!("{word}: {}'s range {}..{} is past the timeline's end {end}", m.name, m.at, m.at + m.len));
+                return Some(true);
+            }
+            (vec![(m.name.clone(), export_safe_name(&m.name), r)], 0)
+        };
+        let room = EXPORT_QUEUE_MAX.saturating_sub(self.export_queue.len()) + usize::from(self.export.is_none());
+        if list.len() > room {
+            let (d, t) = self.export_progress().unwrap_or((0, 0));
+            self.last_error = Some(if all { format!("{word}: {} ranges, room for {room}", list.len()) } else { format!("{word}: busy ({d}/{t})") });
+            return Some(true);
+        }
+        let (base, fmt) = match self.export_args(&args) {
+            Ok(x) => x,
+            Err(e) => {
+                self.last_error = Some(format!("{word}: {e}"));
+                return Some(true);
+            }
+        };
+        let audio = match audio {
+            Ok(a) => a,
+            Err(e) => {
+                self.last_error = Some(format!("{word}: {e}"));
+                return Some(true);
+            }
+        };
+        if !VIDEO_NAMES.contains(&fmt.as_str()) {
+            self.last_error = Some(format!("{word}: unknown format {fmt} ({})", VIDEO_NAMES.join("|")));
+            return Some(true);
+        }
+        let mut started = None;
+        for (i, (_, safe, r)) in list.iter().enumerate() {
+            let dir = base.join(safe);
+            let idle = self.export.is_none();
+            if let Err(e) = self.export_or_queue(&dir, &fmt, Some(r.clone()), audio) {
+                self.last_error = Some(if all { format!("{word}: {safe}: {e} ({i} queued before it)") } else { format!("{word}: {e}") });
+                return Some(true);
+            }
+            if idle {
+                started = Some(dir);
+            }
+        }
+        if self.last_error.as_deref().is_some_and(|l| l.starts_with("export: queued")) {
+            self.last_error = None; // SR881's `export: queued (<n> waiting)`: the note below says it
+        }
+        let n = self.export_queue.len();
+        self.note = Some(if all {
+            let names: Vec<&str> = list.iter().map(|e| e.0.as_str()).collect();
+            let skipped = if past > 0 { format!(", {past} past the end skipped") } else { String::new() };
+            format!("{word}: {} entries ({}){skipped}", list.len(), names.join(", "))
+        } else {
+            let (name, _, r) = &list[0];
+            match &started {
+                Some(d) => format!("{word}: {name} ticks {}..{} started -> {}", r.start, r.end, d.display()),
+                None => format!("{word}: {name} ticks {}..{} queued ({n} waiting)", r.start, r.end),
+            }
+        });
+        Some(true)
     }
 }
