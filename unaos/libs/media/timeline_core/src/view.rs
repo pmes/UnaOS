@@ -350,7 +350,7 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
         c.rect(x0, y0 + 2, x0 + HANDLE_W, y1 - 2, HANDLE);
         c.rect(x1 - HANDLE_W, y0 + 2, x1, y1 - 2, HANDLE);
     }
-    paint_transitions(&mut c, l, st);
+    paint_transitions(&mut c, l, st); paint_reverse_badges(&mut c, l, st); // STRIAREVERSEEDIT (SR9094): a reversed body's badge, nothing when none is reversed (file tail)
     // The playhead, through the ruler and the tracks.
     let px = l.x_of(st.playhead);
     c.rect(px, ry, px + 1, h as i64, PLAYHEAD);
@@ -1187,5 +1187,86 @@ mod slipdrag_tests {
         assert!(d.shown(&st).is_none());
         assert_eq!(d.finish(&mut st), Err(EditError::OutOfSource));
         assert_eq!((&st.timeline, st.undo_depth()), (&tl, 0));
+    }
+}
+
+// ---- STRIAREVERSEEDIT (LEDGER SR9094): a reversed clip body carries a small badge in the band (named tail block) ----
+// A "<<" (8x7, LABEL ink) at the body's BOTTOM-RIGHT corner, inside the out handle (HANDLE_W + 2 px in, 4 px up), so the
+// label (baseline y0 + 15), the selection handles and the marks / curves siblings paint on the body stay clear. Painted
+// after the transitions; a body narrower than the badge plus both handles gets none. No reversed clip: nothing painted, so
+// every golden stays byte-identical. The kernel Player paints its band through THE `paint_in`, so it shows the same badge.
+
+/// STRIAREVERSEEDIT: the badge's rows, bit 7 the leftmost pixel.
+const REVERSE_BADGE: [u8; 7] = [0x11, 0x33, 0x77, 0xff, 0x77, 0x33, 0x11];
+
+/// STRIAREVERSEEDIT: the badge box `(x0, y0, x1, y1)` of a clip body spanning `x0..x1` on a row starting at `y0`, or
+/// `None` when the body is too narrow.
+fn reverse_badge_box(x0: i64, x1: i64, y0: i64) -> Option<(i64, i64, i64, i64)> {
+    if x1 - x0 < 8 + 2 * HANDLE_W + 6 {
+        return None;
+    }
+    let (bx1, by1) = (x1 - 1 - HANDLE_W - 2, y0 + ROW_H as i64 - 4);
+    Some((bx1 - 8, by1 - 7, bx1, by1))
+}
+
+/// STRIAREVERSEEDIT: paint the badge on every visible reversed clip body (none reversed: no pixel touched).
+fn paint_reverse_badges(c: &mut Canvas, l: Layout, st: &EditorState) {
+    for (row, tr) in st.timeline.tracks.iter().enumerate().take(l.rows) {
+        for clip in tr.clips.iter().filter(|k| k.reverse) {
+            let (x0, x1) = (l.x_of(clip.at), l.x_of(clip.end()));
+            if x1 <= 0 || x0 >= l.w as i64 {
+                continue;
+            }
+            let Some((bx0, by0, _, _)) = reverse_badge_box(x0, x1, l.row_y(row)) else { continue };
+            for (dy, bits) in REVERSE_BADGE.iter().enumerate() {
+                for dx in 0..8i64 {
+                    if bits & (0x80 >> dx) != 0 {
+                        let (px, py) = (bx0 + dx, by0 + dy as i64);
+                        c.rect(px, py, px + 1, py + 1, LABEL);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod striareverseedit_tests {
+    use super::*;
+    use crate::Clip;
+
+    fn state(reverse: bool) -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 10, 20, 0).reversed(reverse)];
+        EditorState::new(tl)
+    }
+
+    #[test]
+    fn striareverseedit_badge_only_on_a_reversed_body_inside_its_box() {
+        let (w, h) = (320, 120);
+        let fwd = paint(&state(false), w, h, Order::Rgba, None, None);
+        assert_eq!(fwd, paint(&state(false), w, h, Order::Rgba, None, None));
+        let st = state(true);
+        let rev = paint(&st, w, h, Order::Rgba, None, None);
+        let l = Layout::of(w, h, &st);
+        let c = st.timeline.tracks[0].clips[0];
+        let (bx0, by0, bx1, by1) = reverse_badge_box(l.x_of(c.at), l.x_of(c.end()), l.row_y(0)).unwrap();
+        let mut changed = 0;
+        for y in 0..h as i64 {
+            for x in 0..w as i64 {
+                let i = ((y * w as i64 + x) * 4) as usize;
+                if fwd[i..i + 4] != rev[i..i + 4] {
+                    assert!(bx0 <= x && x < bx1 && by0 <= y && y < by1, "pixel ({x}, {y}) outside the badge box");
+                    assert_eq!(&rev[i..i + 4], &LABEL[..]);
+                    changed += 1;
+                }
+            }
+        }
+        assert_eq!(changed, REVERSE_BADGE.iter().map(|b| b.count_ones()).sum::<u32>() as i32, "the whole badge, nothing else");
+        assert_eq!(reverse_badge_box(0, 8, 0), None, "a narrow body gets none");
+        extern crate std;
+        std::println!("striareverseedit: badge box {:?}, {changed} px", (bx0, by0, bx1, by1));
     }
 }

@@ -4014,9 +4014,9 @@ fn striaspeedreverse_face_word_toggles_in_one_step_and_saves_the_sign() {
     let text = edl::write(&face.state.timeline, "REV").unwrap();
     assert!(text.contains("M2   A        -025.0 00:00:00:13\n"), "{text}");
     assert_eq!(edl::parse(&text, 25).unwrap(), face.state.timeline, "the document reopens reversed");
-    assert!(face.verb("["));
-    assert_eq!(face.last_error.take(), Some(format!("[: {}", timeline_core::EditError::Rate)), "a reversed clip's trim is refused by name");
-    assert!(face.state.undo());
+    assert!(face.verb("]")); // STRIAREVERSEEDIT (SR9094): was `[` refused `Rate`; a reversed clip's trim now works
+    assert_eq!(face.last_error.take(), None, "a reversed clip's trim works (STRIAREVERSEEDIT SR9094)");
+    assert!(face.state.undo() && face.state.undo()); // STRIAREVERSEEDIT (SR9094): one more undo, the `]`
     assert_eq!(face.state.timeline, tl, "undo restores");
-    println!("striaspeedreverse: face `reverse` -> M2 -025.0; `[` -> {}", timeline_core::EditError::Rate);
+    println!("striaspeedreverse: face `reverse` -> M2 -025.0; `]` on the reversed clip works");
 }

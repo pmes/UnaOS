@@ -105,7 +105,7 @@ impl EditorState {
     }
     /// Move the selected clip's in (`Timeline::trim_in`) or out (`Timeline::trim_out`) point by `delta` source ticks.
     pub fn trim(&mut self, edge: Edge, delta: i64) -> Result<(), EditError> {
-        let (track, idx) = self.selection.ok_or(EditError::NoClip)?; if self.selected().is_some_and(|c| c.reverse) { return Err(EditError::Rate); } // STRIASPEEDREVERSE (SR9067): a reversed clip's trim is owed (NLE-REVERSE-EDIT)
+        let (track, idx) = self.selection.ok_or(EditError::NoClip)?; let (edge, delta) = timeline_edge(self.selected(), edge, delta); // STRIAREVERSEEDIT (SR9094): on a reversed clip the edge names the TIMELINE edge (file tail; SR9067's refusal lifted)
         let c = self.selected().ok_or(EditError::NoClip)?;
         let tl = match edge {
             Edge::In => self.timeline.trim_in(track, idx, c.src_in + delta)?,
@@ -343,11 +343,11 @@ impl EditorState {
             "}" => self.trim(Edge::Out, 1),
             "lift" => self.lift_selected(),
             "mark-in" => match self.selected() {
-                Some(c) => self.trim(Edge::In, c.src_at(ph) - c.src_in), // STRIACLIPSPEED (SR829): the playhead's source tick (1x: ph - at)
+                Some(c) => self.trim(Edge::In, edge_delta(&c, Edge::In, ph)), // STRIACLIPSPEED (SR829): the playhead's source tick (1x: ph - at); STRIAREVERSEEDIT (SR9094): either direction (file tail)
                 None => Err(EditError::NoClip),
             },
             "mark-out" => match self.selected() {
-                Some(c) => self.trim(Edge::Out, c.src_at(ph) - c.src_out), // STRIACLIPSPEED (SR829): the playhead's source tick (1x: ph - end)
+                Some(c) => self.trim(Edge::Out, edge_delta(&c, Edge::Out, ph)), // STRIACLIPSPEED (SR829): the playhead's source tick (1x: ph - end); STRIAREVERSEEDIT (SR9094): either direction (file tail)
                 None => Err(EditError::NoClip),
             },
             "home" => {
@@ -462,7 +462,7 @@ impl EditorState {
     /// The ripple twin of [`EditorState::trim`]: the selected clip's in or out point by `delta` source ticks, keeping its
     /// start; the rest of its track follows.
     pub fn ripple_trim(&mut self, edge: Edge, delta: i64) -> Result<(), EditError> {
-        let (track, idx) = self.selection.ok_or(EditError::NoClip)?; if self.selected().is_some_and(|c| c.reverse) { return Err(EditError::Rate); } // STRIASPEEDREVERSE (SR9067): a reversed clip's trim is owed (NLE-REVERSE-EDIT)
+        let (track, idx) = self.selection.ok_or(EditError::NoClip)?; let (edge, delta) = timeline_edge(self.selected(), edge, delta); // STRIAREVERSEEDIT (SR9094): on a reversed clip the edge names the TIMELINE edge (file tail; SR9067's refusal lifted)
         let c = self.selected().ok_or(EditError::NoClip)?;
         let tl = match edge {
             Edge::In => self.timeline.ripple_trim_in(track, idx, c.src_in + delta)?,
@@ -706,8 +706,8 @@ impl EditorState {
     pub fn trim_by_ticks(&mut self, edge: Edge, dt: i64) -> Result<(), EditError> {
         let c = self.selected().ok_or(EditError::NoClip)?;
         let delta = match edge {
-            Edge::In => c.src_at(c.at + dt) - c.src_in,
-            Edge::Out => c.src_at(c.end() + dt) - c.src_out,
+            Edge::In => edge_delta(&c, Edge::In, c.at + dt), // STRIAREVERSEEDIT (SR9094): either direction (file tail)
+            Edge::Out => edge_delta(&c, Edge::Out, c.end() + dt), // STRIAREVERSEEDIT (SR9094): either direction (file tail)
         };
         if delta == 0 && dt != 0 {
             return Ok(());
@@ -732,7 +732,7 @@ impl EditorState {
 // ---- STRIASPEEDREVERSE (LEDGER SR9067): the `reverse` word — the selected clip plays backwards, ONE commit (named tail block) ----
 // `reverse` toggles the selected clip's `reverse` through `Timeline::set_reverse` (its `at`, window, rate and length stay):
 // ONE commit, so undo restores the whole pre-op timeline; a refusal (`NoClip`, `Rate` for a reversed outgoing of a handle)
-// leaves the state. `trim` / `ripple_trim` refuse a reversed selection `Rate` (NLE-REVERSE-EDIT owed).
+// leaves the state. `trim` / `ripple_trim` on a reversed selection: STRIAREVERSEEDIT (SR9094) tail block (NLE-REVERSE-EDIT).
 impl EditorState {
     /// Toggle the selected clip between forward and backward play (ONE commit).
     pub fn reverse_selected(&mut self) -> Result<(), EditError> {
@@ -745,5 +745,31 @@ impl EditorState {
     /// The `reverse` word of [`EditorState::verb`]; `None`: not this word.
     fn reverse_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
         (v == "reverse").then(|| self.reverse_selected())
+    }
+}
+
+// ---- STRIAREVERSEEDIT (LEDGER SR9094): on a reversed selection the trim's edge names the TIMELINE edge (named tail block) ----
+// A reversed clip shows `src_out` at its start and `src_in` at its end, so `trim` / `ripple_trim` map `Edge::In` (the
+// start: keys `[` `]`, `mark-in`, the in handle's drag, `rtrim in`) to its `src_out` and `Edge::Out` to its `src_in`, the
+// source delta negated (`[` still grows the start by one tick). `edge_delta` is the source delta that puts an edge at a
+// tick in that frame (forward: exactly the old `src_at(t) - edge`). One commit per word or drag, as before.
+
+/// STRIAREVERSEEDIT: `(edge, delta)` as the source-edge trim of `c`: unchanged for a forward clip (or none), swapped and
+/// negated for a reversed one.
+fn timeline_edge(c: Option<Clip>, edge: Edge, delta: i64) -> (Edge, i64) {
+    match (c.is_some_and(|c| c.reverse), edge) {
+        (false, _) => (edge, delta),
+        (true, Edge::In) => (Edge::Out, -delta),
+        (true, Edge::Out) => (Edge::In, -delta),
+    }
+}
+
+/// STRIAREVERSEEDIT: the [`EditorState::trim`] delta that puts `c`'s `edge` at timeline tick `t`:
+/// `src_in + floor((t - at) * rate)` minus that edge's source tick (forward: `src_at(t) - edge`; `timeline_edge` maps it).
+fn edge_delta(c: &Clip, edge: Edge, t: i64) -> i64 {
+    let k = c.src_in + crate::scale_q16(t - c.at, crate::eff_rate(c.rate_q16));
+    k - match edge {
+        Edge::In => c.src_in,
+        Edge::Out => c.src_out,
     }
 }
