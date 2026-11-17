@@ -519,6 +519,7 @@ fn transport() -> TetraNode {
         button("kind", "Kind"), button("ease", "Ease"), // NLETRANSITIONFACE (SR691): the selected transition's kind / ease cycle
         button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
         button("insert", "Insert"), button("overwrite", "Overwrite"), // STRIAINSERTOVERWRITE (SR852): the selected clip's source range at the playhead, rippling / over its track
+        button("insert-marked", "Insert Marks"), button("overwrite-marked", "Overwrite Marks"), // STRIAINSERTMARKS (SR905): the selected clip's source into the in / out marks, rippling / over its track
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
 }
@@ -879,7 +880,7 @@ mod striainsertoverwrite_tests {
     fn striainsertoverwrite_buttons_and_token() {
         let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
         let ids: Vec<String> = row.iter().map(|b| match b { TetraNode::Button { id, .. } => id.clone(), _ => panic!("not a button") }).collect();
-        assert_eq!(ids[ids.len() - 3..], ["insert", "overwrite", "help"]);
+        assert_eq!(ids[ids.len() - 5..], ["insert", "overwrite", "insert-marked", "overwrite-marked", "help"]); // STRIAINSERTMARKS (SR905)
         let mut f = face();
         let a1 = f.state.timeline.tracks[1].clone();
         let errors = drive(&mut f, "at:12:0,ruler:15,insert");
@@ -894,5 +895,33 @@ mod striainsertoverwrite_tests {
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(g.state.timeline.tracks[0].clips[1], Clip::new(SourceId(0), 40, 45, 5));
         println!("striainsertoverwrite witness: at:12:0,ruler:15,insert -> clip 15:0:10, V1 end 45; overwrite:A:40:45 at 5");
+    }
+}
+
+// ---- STRIAINSERTMARKS (LEDGER SR905): the insert-marked / overwrite-marked buttons through `--do` (named tail block) ----
+
+#[cfg(test)]
+mod striainsertmarks_tests {
+    use super::*;
+    use timeline_core::SourceId;
+
+    /// STRIAINSERTMARKS M3: the two buttons sit just before `help`; `--do at:12:0,ruler:5,in,ruler:9,out,insert-marked`
+    /// lays the selected B 0..4 at 5 on V1 (the witness's `"clip"` reads `5:0:4`), the playhead at the out mark.
+    #[test]
+    fn striainsertmarks_buttons_and_drive() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let ids: Vec<String> = row.iter().map(|b| match b { TetraNode::Button { id, .. } => id.clone(), _ => panic!("not a button") }).collect();
+        assert_eq!(ids[ids.len() - 3..], ["insert-marked", "overwrite-marked", "help"]);
+        let (tl, src) = nle_face::synth_fixture();
+        let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let a1 = f.state.timeline.tracks[1].clone();
+        let errors = drive(&mut f, "at:12:0,ruler:5,in,ruler:9,out,insert-marked");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(f.last_error.is_none(), "{:?}", f.last_error);
+        let c = f.state.selected().expect("the laid clip selected");
+        assert_eq!(format!("{}:{}:{}", c.at, c.src_in, c.src_out), "5:0:4");
+        assert_eq!((c.src, f.state.playhead, f.state.timeline.marks), (SourceId(1), 9, (Some(5), Some(9))));
+        assert_eq!(f.state.timeline.tracks[1], a1, "insert ripples only the target track");
+        println!("striainsertmarks witness: at:12:0,ruler:5,in,ruler:9,out,insert-marked -> clip 5:0:4, playhead 9");
     }
 }

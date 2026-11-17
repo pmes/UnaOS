@@ -376,6 +376,8 @@ pub enum EditError {
     Policy,
     /// NLE5DRANGESAVE (SR723): both export marks set with the in mark not before the out mark.
     Marks,
+    NoMarks, // STRIAINSERTMARKS (SR905): `insert-marked` / `overwrite-marked` with an export mark unset
+    InsertForm, // STRIAINSERTMARKS (SR905): an `insert` / `overwrite` word in a shape other than bare or `<reel> <in> <out>`
 }
 
 impl core::fmt::Display for EditError {
@@ -396,6 +398,8 @@ impl core::fmt::Display for EditError {
             EditError::Rate => "edit list rate is not 1 (no speed op)",
             EditError::Policy => "no such size policy (letterbox, fill, stretch, adopt)",
             EditError::Marks => "the in mark is not before the out mark",
+            EditError::NoMarks => "no in / out marks set", // STRIAINSERTMARKS (SR905)
+            EditError::InsertForm => "insert / overwrite take nothing or <reel> <in> <out>", // STRIAINSERTMARKS (SR905)
         })
     }
 }

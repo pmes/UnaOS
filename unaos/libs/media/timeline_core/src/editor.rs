@@ -695,7 +695,7 @@ impl EditorState {
     }
     /// The `insert` / `overwrite` words of [`EditorState::verb`]; `None` when `v` is neither (or malformed).
     fn insert_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let (mode, range) = insert_words(v, self.timeline.fps())?;
+        let Some((mode, range)) = insert_words(v, self.timeline.fps()) else { return self.marked_verb(v); }; // STRIAINSERTMARKS (SR905): else the marked words, a malformed insert shape refused by name (file tail)
         Some(match range {
             None => self.insert_selected(mode),
             Some((reel, a, b)) => self.insert_reel(reel, a, b, mode),
@@ -809,7 +809,7 @@ mod striainsertoverwrite_tests {
         assert_eq!(st.verb("insert C 0 5"), Some(Err(EditError::NoTrack)), "a reel on no track");
         assert_eq!((st.timeline.clone(), st.undo_depth(), st.playhead), (tl0, 0, 10));
         for v in ["insert A", "insert A 1", "insert A 1 x", "insert A 1 2 3", "inserts", "overwrite A 00:00:00:25 30"] {
-            assert_eq!(st.verb(v), None, "{v}: not this verb");
+            assert_eq!(st.verb(v), if v == "inserts" { None } else { Some(Err(EditError::InsertForm)) }, "{v}: not this verb, or refused by name"); // STRIAINSERTMARKS (SR905)
         }
     }
 
@@ -825,5 +825,111 @@ mod striainsertoverwrite_tests {
         assert_eq!(st.playhead, 55);
         let text = edl::write(&st.timeline, "INSERT").unwrap();
         assert_eq!(edl::parse(&text, 25).unwrap(), st.timeline);
+    }
+}
+
+// ---- STRIAINSERTMARKS (LEDGER SR905): three-point editing into the marked record range; the malformed insert shapes refused by name (named tail block) ----
+// `insert-marked` / `overwrite-marked` lay the SELECTED clip's source into the timeline's in / out marks (the export
+// range, `Timeline::marks`): the record range's length wins, the source range is taken from the selected clip's in point
+// for that length, laid on its track at the in mark through SR852's `place_at_playhead` (`Timeline::place`, the ONE
+// `commit`). Refused by name: a mark unset `EditError::NoMarks`, nothing selected `EditError::NoClip`, a source shorter
+// than the range `EditError::OutOfSource` (`Timeline::validate`); a refusal leaves the state (playhead included)
+// unchanged. The marks are kept. Any other shape after `insert` / `overwrite` (or words after a marked word) is
+// `EditError::InsertForm`, so the face names it instead of reading an unknown word.
+impl EditorState {
+    /// The selected clip's source from its in point, for the marked length, laid at the in mark on its track (`mode`).
+    pub fn place_marked(&mut self, mode: crate::Mode) -> Result<(), EditError> {
+        let (Some(a), Some(b)) = self.timeline.marks else { return Err(EditError::NoMarks) };
+        let (track, _) = self.selection.ok_or(EditError::NoClip)?;
+        let c = self.selected().ok_or(EditError::NoClip)?;
+        let ph = core::mem::replace(&mut self.playhead, a);
+        let r = self.place_at_playhead(track, c.src, c.src_in, c.src_in.saturating_add(b - a), mode);
+        if r.is_err() {
+            self.playhead = ph;
+        }
+        r
+    }
+    /// The marked words, and the refusal of a malformed `insert` / `overwrite` shape; `None` for any other word.
+    fn marked_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let mut w = v.split_ascii_whitespace();
+        let mode = match w.next()? {
+            "insert-marked" => crate::Mode::Insert,
+            "overwrite-marked" => crate::Mode::Overwrite,
+            "insert" | "overwrite" => return Some(Err(EditError::InsertForm)),
+            _ => return None,
+        };
+        Some(if w.next().is_none() { self.place_marked(mode) } else { Err(EditError::InsertForm) })
+    }
+}
+
+#[cfg(test)]
+mod striainsertmarks_tests {
+    use super::*;
+    use crate::{Kind, Mode, SourceId};
+
+    /// SR852's cut list (A 13..23 at 0, B 0..10 at 10, A 23..33 at 25) on V1 and A1, with the export marks `m`.
+    fn state(m: (Option<i64>, Option<i64>)) -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        let b = tl.add_source("B", 50);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        for t in 0..2 {
+            tl.tracks[t].clips = alloc::vec![Clip::new(a, 13, 23, 0), Clip::new(b, 0, 10, 10), Clip::new(a, 23, 33, 25)];
+        }
+        EditorState::new(tl.set_marks(m).unwrap())
+    }
+
+    #[test]
+    fn striainsertmarks_insert_fills_the_marked_range_from_the_clip_in() {
+        let mut st = state((Some(5), Some(9)));
+        let tl0 = st.timeline.clone();
+        st.select(0, 1).unwrap();
+        st.seek(30);
+        assert_eq!(st.verb("insert-marked"), Some(Ok(())));
+        assert_eq!(st.timeline, tl0.place(0, Clip::new(SourceId(1), 0, 4, 5), Mode::Insert).unwrap(), "B 0..4 at the in mark");
+        assert_eq!(st.timeline.tracks[1], tl0.tracks[1], "insert ripples only the target track");
+        assert_eq!(st.selected(), Some(Clip::new(SourceId(1), 0, 4, 5)));
+        assert_eq!((st.playhead, st.undo_depth(), st.timeline.marks), (9, 1, (Some(5), Some(9))), "playhead at the out mark, marks kept");
+        assert_eq!(st.verb("undo"), Some(Ok(())));
+        assert_eq!(st.timeline, tl0, "ONE undo restores");
+    }
+
+    #[test]
+    fn striainsertmarks_overwrite_fills_the_marked_range_and_keeps_the_end() {
+        let mut st = state((Some(12), Some(20)));
+        let tl0 = st.timeline.clone();
+        st.select(0, 0).unwrap();
+        assert_eq!(st.verb("overwrite-marked"), Some(Ok(())));
+        assert_eq!(st.timeline, tl0.place(0, Clip::new(SourceId(0), 13, 21, 12), Mode::Overwrite).unwrap());
+        assert_eq!(st.timeline.end(), tl0.end());
+        assert_eq!((st.selected(), st.playhead), (Some(Clip::new(SourceId(0), 13, 21, 12)), 20));
+    }
+
+    #[test]
+    fn striainsertmarks_refusals_by_name_leave_the_state() {
+        let mut st = state((Some(0), Some(30)));
+        let tl0 = st.timeline.clone();
+        st.select(0, 2).unwrap();
+        st.seek(7);
+        assert_eq!(st.verb("insert-marked"), Some(Err(EditError::OutOfSource)), "A from 23 for 30 runs past 50");
+        assert_eq!((st.timeline.clone(), st.playhead, st.undo_depth()), (tl0, 7, 0));
+        for m in [(None, None), (Some(5), None), (None, Some(9))] {
+            let mut s = state(m);
+            s.select(0, 1).unwrap();
+            assert_eq!(s.verb("insert-marked"), Some(Err(EditError::NoMarks)), "{m:?}");
+            assert_eq!(s.verb("overwrite-marked"), Some(Err(EditError::NoMarks)), "{m:?}");
+        }
+        let mut s = state((Some(5), Some(9)));
+        assert_eq!(s.verb("insert-marked"), Some(Err(EditError::NoClip)));
+        s.select(0, 1).unwrap();
+        for v in ["insert A", "insert A 1", "insert A 1 x", "insert A 1 2 3", "overwrite A 00:00:00:25 30", "insert-marked now", "overwrite-marked 1"] {
+            assert_eq!(s.verb(v), Some(Err(EditError::InsertForm)), "{v}");
+        }
+        for v in ["inserts", "insert-mark", "marked"] {
+            assert_eq!(s.verb(v), None, "{v}: not this verb");
+        }
+        assert_eq!(s.undo_depth(), 0);
+        assert_eq!(EditError::NoMarks.to_string(), "no in / out marks set");
     }
 }
