@@ -6318,8 +6318,8 @@ impl Face {
         match args.as_slice() {
             [] => return None,
             ["off"] => self.proxy_off(),
-            ["all"] => self.proxy_all(), ["purge"] => self.proxy_purge(), // STRIAPROXYBUTTONS (SR930): purge detaches then removes the files (file tail)
-            _ => self.last_error = Some("proxy: usage: proxy [off|all|purge]".into()),
+            ["all"] => self.proxy_all(), ["purge"] => self.proxy_purge(), ["purge", "all"] | ["purge-all"] => self.proxy_purge_all(), // STRIAPROXYMORE (SR979): purge every source (file tail); STRIAPROXYBUTTONS (SR930): purge detaches then removes the files (file tail)
+            _ => self.last_error = Some("proxy: usage: proxy [off|all|purge [all]]".into()), // STRIAPROXYMORE (SR979): purge all joins the usage
         }
         Some(true)
     }
@@ -6555,9 +6555,30 @@ impl Face {
             return;
         }
         self.proxy_queue.retain(|(s, _)| *s != src);
+        let tail = self.purge_files(src); // STRIAPROXYMORE (SR979): the one file removal (file tail)
+        let line = self.last_error.take().unwrap_or_else(|| "proxy:".to_string());
+        self.last_error = Some(format!("{line}; {tail}"));
+    }
+    /// The reels whose source has an attached proxy, in source order (the witness's `"proxy"` field).
+    pub fn proxy_reels(&self) -> Vec<String> {
+        self.state.timeline.sources.iter().filter(|s| self.sources.has_proxy(s.id)).map(|s| s.reel.clone()).collect()
+    }
+}
+
+// ---- STRIAPROXYMORE (LEDGER SR979): purge all, the shared file removal (named tail block) ----
+// `proxy purge all` (also `proxy purge-all`, the witness's `--do proxy:purge-all`) walks every timeline source in source
+// order: the running job's source is skipped by name (proxy_off's busy line), every other is detached
+// (`Sources::clear_proxy`) and its proxy file, stamp and leftover work dir are removed through the ONE removal fn
+// [`Face::purge_files`] that SR930's `proxy purge` also calls. The `proxy all` queue is dropped; a running job of another
+// reel finishes. View-only: no undo step, the document clean.
+
+impl Face {
+    /// Remove source `src`'s proxy file, stamp and leftover work dir (SR882's `proxy_paths` beside its reel's path):
+    /// `removed <p>, ..` / `no proxy files` / `no source path`. Detaches nothing.
+    fn purge_files(&self, src: timeline_core::SourceId) -> String {
         let reel = self.state.timeline.source(src).map(|s| s.reel.clone());
         let file = reel.and_then(|r| self.reel_paths.iter().find(|(p, _)| *p == r).map(|(_, f)| f.clone()));
-        let tail = match file {
+        match file {
             None => "no source path".to_string(),
             Some(f) => {
                 let (proxy, stamp, work) = proxy_paths(&f);
@@ -6572,13 +6593,30 @@ impl Face {
                 }
                 if removed.is_empty() { "no proxy files".to_string() } else { format!("removed {}", removed.join(", ")) }
             }
-        };
-        let line = self.last_error.take().unwrap_or_else(|| "proxy:".to_string());
-        self.last_error = Some(format!("{line}; {tail}"));
+        }
     }
-    /// The reels whose source has an attached proxy, in source order (the witness's `"proxy"` field).
-    pub fn proxy_reels(&self) -> Vec<String> {
-        self.state.timeline.sources.iter().filter(|s| self.sources.has_proxy(s.id)).map(|s| s.reel.clone()).collect()
+    /// `proxy purge all`: `proxy: purge all: <reel>: [off, ]<purge_files line>; ..` per source in source order, the running
+    /// job's source `<reel>: busy (d/t): Esc cancels the build`; `proxy: purge all: no reels` on a timeline without sources.
+    fn proxy_purge_all(&mut self) {
+        self.proxy_queue.clear();
+        let running = self.proxy.as_ref().map(|j| j.src);
+        let progress = self.proxy_progress();
+        let sources: Vec<(timeline_core::SourceId, String)> = self.state.timeline.sources.iter().map(|s| (s.id, s.reel.clone())).collect();
+        if sources.is_empty() {
+            self.last_error = Some("proxy: purge all: no reels".into());
+            return;
+        }
+        let mut parts = Vec::new();
+        for (src, reel) in sources {
+            if running == Some(src) {
+                let (d, t) = progress.unwrap_or((0, 0));
+                parts.push(format!("{reel}: busy ({d}/{t}): Esc cancels the build"));
+                continue;
+            }
+            let off = if self.sources.clear_proxy(src) { "off, " } else { "" };
+            parts.push(format!("{reel}: {off}{}", self.purge_files(src)));
+        }
+        self.last_error = Some(format!("proxy: purge all: {}", parts.join("; ")));
     }
 }
 

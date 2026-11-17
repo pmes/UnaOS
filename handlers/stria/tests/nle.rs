@@ -8681,7 +8681,7 @@ fn striaproxyoff_usage_and_refusals() {
     let (tl, src) = synth_fixture();
     let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
     assert!(face.verb("proxy foo"));
-    assert_eq!(face.last_error.take().as_deref(), Some("proxy: usage: proxy [off|all|purge]")); // STRIAPROXYBUTTONS (SR930): purge joins the usage
+    assert_eq!(face.last_error.take().as_deref(), Some("proxy: usage: proxy [off|all|purge [all]]")); // STRIAPROXYMORE (SR979): purge all joins the usage; STRIAPROXYBUTTONS (SR930): purge joins the usage
     assert!(face.verb("proxy off"));
     assert_eq!(face.last_error.take().as_deref(), Some("proxy: no clip selected"));
     assert!(face.verb("proxy all"));
@@ -11288,4 +11288,118 @@ fn striaxformmore_face_nudge_note() {
     assert!(face.verb("pip left"));
     assert_eq!(face.last_error.take(), Some(format!("pip left: {}", timeline_core::EditError::Xform)));
     assert_eq!(face.state.undo_depth(), 2);
+}
+
+// ---- STRIAPROXYMORE (LEDGER SR979): purge all, an Adopt reel's proxy, the proxy's audio (named tail block) ----
+
+/// `proxy purge all` detaches every reel and removes each proxy file and stamp; again: nothing to remove. View-only.
+#[test]
+fn striaproxymore_purge_all_removes_every_reel() {
+    let (dir, pa, pb, mut face, tl) = striaproxyoff_face("purgeall");
+    let (a, b) = (tl.sources[0].id, tl.sources[1].id);
+    let ((xa, sa, wa), (xb, sb, wb)) = (stria::nle_face::proxy_paths(&pa), stria::nle_face::proxy_paths(&pb));
+    assert!(face.verb("proxy all") && face.wait_proxy() && face.wait_proxy());
+    assert!(face.has_proxy(a) && face.has_proxy(b) && xa.is_file() && xb.is_file());
+    let _ = face.last_error.take();
+    assert!(face.verb("proxy purge all"));
+    assert_eq!(face.last_error.take(), Some(format!("proxy: purge all: A: off, removed {}, {}; B: off, removed {}, {}", xa.display(), sa.display(), xb.display(), sb.display())));
+    assert!(!face.has_proxy(a) && !face.has_proxy(b));
+    assert!(!xa.exists() && !sa.exists() && !wa.exists() && !xb.exists() && !sb.exists() && !wb.exists());
+    assert!(pa.is_file() && pb.is_file(), "the sources stay");
+    assert!(face.verb("proxy purge all"));
+    assert_eq!(face.last_error.take().as_deref(), Some("proxy: purge all: A: no proxy files; B: no proxy files"));
+    assert!(face.proxy_reels().is_empty());
+    assert_eq!(face.state.timeline, tl, "view-only");
+    assert!(!face.dirty());
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("striaproxymore purge all: A and B detached, their proxies and stamps removed");
+}
+
+/// `proxy purge all` skips the source whose job runs (its work dir untouched) and purges the rest; `proxy purge-all` is the
+/// same word; without paths every reel says so.
+#[test]
+fn striaproxymore_purge_all_skips_the_running_job() {
+    let (dir, pa, pb, mut face, tl) = striaproxyoff_face("purgeallbusy");
+    let b = tl.sources[1].id;
+    let ((_, _, wa), (xb, sb, _)) = (stria::nle_face::proxy_paths(&pa), stria::nle_face::proxy_paths(&pb));
+    face.state.select(0, 1).unwrap();
+    assert!(face.verb("proxy") && face.wait_proxy());
+    assert!(face.has_proxy(b));
+    face.hold_proxy_at(Some(3));
+    face.state.select(0, 0).unwrap();
+    assert!(face.verb("proxy") && face.proxying());
+    let _ = face.last_error.take();
+    assert!(face.verb("proxy purge-all"));
+    let line = face.last_error.take().unwrap_or_default();
+    assert!(line.starts_with("proxy: purge all: A: busy ("), "{line}");
+    assert!(line.ends_with(&format!("): Esc cancels the build; B: off, removed {}, {}", xb.display(), sb.display())), "{line}");
+    assert!(wa.is_dir() && face.proxying(), "A's job and its work dir untouched");
+    assert!(!face.has_proxy(b) && !xb.exists() && !sb.exists());
+    assert!(face.cancel_proxy() && face.wait_proxy());
+    let _ = face.last_error.take();
+    let (t2, s2) = synth_fixture();
+    let mut bare = Face::new(EditorState::new(t2), s2, (320, 160), PixelOrder::Rgba, false);
+    for word in ["proxy purge all", "proxy purge-all"] {
+        assert!(bare.verb(word));
+        assert_eq!(bare.last_error.take().as_deref(), Some("proxy: purge all: A: no source path; B: no source path"), "{word}");
+    }
+    assert!(!bare.dirty());
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("striaproxymore purge all busy: {line}");
+}
+
+/// An Adopt reel's half-size proxy previews at the reel's size (the Letterbox up-fit), not the proxy's; an Adopt reel
+/// without a proxy previews as before.
+#[test]
+fn striaproxymore_adopt_reel_proxy_fits_the_reel() {
+    use stria::nle_face::preview;
+    let (dir, pa, _, mut face, tl) = striaproxyoff_face("adopt");
+    let a = tl.sources[0].id;
+    face.state.select(0, 0).unwrap();
+    assert!(face.verb("proxy") && face.wait_proxy());
+    let bytes = std::fs::read(stria::nle_face::proxy_paths(&pa).0).unwrap();
+    let (t2, s2) = synth_fixture();
+    let adopt = t2.set_size_policy(a, SizePolicy::Adopt).unwrap();
+    let plain = preview(&adopt, &s2, 3).unwrap().expect("A's frame at 3");
+    assert_eq!((plain.width, plain.height), (64, 48));
+    assert!(plain.rgba == preview(&t2, &s2, 3).unwrap().expect("A's frame at 3").rgba, "no proxy: Adopt unchanged");
+    s2.set_proxy(a, bytes).unwrap();
+    let shown = preview(&adopt, &s2, 3).unwrap().expect("the proxy's frame at 3");
+    let boxed = preview(&t2, &s2, 3).unwrap().expect("the proxy's frame at 3");
+    assert_eq!((shown.width, shown.height), (64, 48), "the reel's size, not the proxy's 32x24");
+    assert!(shown.rgba == boxed.rgba, "Adopt fits the proxy as Letterbox does");
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("striaproxymore adopt: proxied preview {}x{}", shown.width, shown.height);
+}
+
+/// A preview-sink render (`proxy() == true`) reads an attached proxy's video but never its audio: the PCM is the original's.
+#[test]
+fn striaproxymore_proxy_leaves_the_audio_original() {
+    #[derive(Default)]
+    struct ProxySink {
+        frames: Vec<Vec<u8>>,
+        pcm: Vec<f32>,
+    }
+    impl RenderSink for ProxySink {
+        fn frame(&mut self, _out_t: i64, _w: u32, _h: u32, rgba: &[u8]) {
+            self.frames.push(rgba.to_vec());
+        }
+        fn pcm(&mut self, _out_t: i64, _rate: u32, _ch: u16, s: &[f32]) {
+            self.pcm.extend_from_slice(s);
+        }
+        fn proxy(&self) -> bool {
+            true
+        }
+    }
+    let (tl, src) = synth_fixture();
+    let a = tl.sources[0].id;
+    let mut before = ProxySink::default();
+    render(&tl, 0..tl.end(), &src, &mut before).unwrap();
+    src.set_proxy(a, synth_source(5000, 50, 25)).unwrap();
+    let mut after = ProxySink::default();
+    render(&tl, 0..tl.end(), &src, &mut after).unwrap();
+    assert!(after.frames != before.frames, "the video reads the proxy");
+    assert!(!before.pcm.is_empty());
+    assert!(after.pcm == before.pcm, "the audio stays the original's");
+    println!("striaproxymore audio: {} samples unchanged under a proxy", after.pcm.len());
 }
