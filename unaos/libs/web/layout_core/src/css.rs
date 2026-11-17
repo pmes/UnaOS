@@ -1546,14 +1546,9 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         }
         "text-decoration" | "text-decoration-line" => {
             let v = value.trim(); deco_shorthand_rest::<H>(prop, v, &mut style.paint, cx);
-            if v.contains("underline") {
-                style.paint.underline = Some(true);
-            } else if v.starts_with("none") {
-                style.paint.underline = Some(false);
-                style.paint.line_through = Some(false);
-            }
-            if v.contains("line-through") {
-                style.paint.line_through = Some(true);
+            if let Some((u, lt)) = deco_line_flags(prop, v) {
+                style.paint.underline = Some(u);
+                style.paint.line_through = Some(lt);
             }
         }
         "text-decoration-color" => {
@@ -5215,4 +5210,31 @@ pub fn border_style_word(code: u8) -> &'static str {
         3 => "double",
         _ => "solid",
     }
+}
+
+// ---- AETHERCSSTEXTDECORATIONLINERESET (LEDGER SR1122): the declared text-decoration-line set replaces, never adds (named tail block) ----
+
+/// AETHERCSSTEXTDECORATIONLINERESET (SR1122): css-text-decor-3 §2.1 / §2.4: text-decoration-line is ONE value, so a
+/// declaration writes the WHOLE set (underline, line-through) over the tag default and any earlier rule (Chromium:
+/// `<a style="text-decoration: line-through">` paints no underline; a later `line-through` rule over `underline` paints
+/// only the strike). The shorthand's omitted line is `none` (`text-decoration: red` is (false, false)); its other words
+/// are [`deco_shorthand_rest`]'s. The longhand takes `none` alone or a set of underline / overline / line-through / blink,
+/// each once, else None (invalid: dropped). The CSS-wide keywords are None, untouched as before (no inherit bit:
+/// AETHER-CSS-TEXT-DECORATION-LINE-CSSWIDE owed).
+fn deco_line_flags(prop: &str, v: &str) -> Option<(bool, bool)> {
+    if v.is_empty() || ["inherit", "initial", "unset", "revert", "revert-layer"].iter().any(|k| v.eq_ignore_ascii_case(k)) {
+        return None;
+    }
+    let words = split_top_level(v);
+    let has = |w: &str| words.iter().any(|p| p.eq_ignore_ascii_case(w));
+    if prop == "text-decoration-line" {
+        let line = ["underline", "overline", "line-through", "blink"];
+        let set = !words.is_empty()
+            && words.iter().all(|p| line.iter().any(|l| p.eq_ignore_ascii_case(l)))
+            && (0..words.len()).all(|i| !words[..i].iter().any(|q| q.eq_ignore_ascii_case(words[i])));
+        if !(set || (words.len() == 1 && has("none"))) {
+            return None;
+        }
+    }
+    Some((has("underline"), has("line-through")))
 }

@@ -12553,4 +12553,59 @@ b</div>
         assert_eq!(font_shorthand_cs(&mut e, "w", "width"), "200px");
         assert_eq!(font_shorthand_cs(&mut e, "td", "textDecoration"), "underline solid rgb(255, 0, 0)");
     }
+
+    // ---- AETHERCSSTEXTDECORATIONLINERESET (LEDGER SR1122): a declared text-decoration-line replaces the UA link underline; propagation kept (named tail block) ----
+
+    /// AETHERCSSTEXTDECORATIONLINERESET (SR1122): 20px serif black rows 20px apart, red decorations: `#xa` a div holding the
+    /// link `#xal` declaring `text-decoration: line-through red`; `#xs` the strike-only div twin; `#xu` a div holding a link
+    /// with only `text-decoration-color: red` (the UA underline); `#tu` the underline-only div twin; `#pp` an underlined div
+    /// holding the span `#ppl` declaring `text-decoration: line-through red`.
+    fn text_decoration_line_reset_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 20px }
+            </style></head><body style="margin:0;font:20px serif;color:black">
+            <div id="xa"><a id="xal" href="#x" style="text-decoration: line-through red">Hgjx Hgjx</a></div>
+            <div id="xs" style="text-decoration: line-through red">Hgjx Hgjx</div>
+            <div id="xu"><a href="#x" style="text-decoration-color: red">Hgjx Hgjx</a></div>
+            <div id="tu" style="text-decoration: underline red">Hgjx Hgjx</div>
+            <div id="pp" style="text-decoration: underline"><span id="ppl" style="text-decoration: line-through red">Hgjx Hgjx</span></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSTEXTDECORATIONLINERESET (SR1122): element `id`'s red rows, each measured from its own box top.
+    fn text_decoration_line_reset_rows(e: &mut crate::AetherEngine, id: &str) -> Vec<i64> {
+        let top = imgalt_rect(e, id).1.floor() as i64;
+        text_decoration_style_red(e, id).0.into_iter().map(|y| y as i64 - top).collect()
+    }
+
+    /// AETHERCSSTEXTDECORATIONLINERESET (SR1122): `<a style="text-decoration: line-through red">` paints the strike band of
+    /// its div twin and no row of the UA underline band, and reads textDecorationLine `line-through` (Chromium: the
+    /// declared set replaces the link's UA underline). Before SR1122 the link painted both bands and read `underline line-through`.
+    #[test]
+    fn text_decoration_line_reset_link_strike_only() {
+        let mut e = text_decoration_line_reset_engine();
+        let (link, strike, under) = (text_decoration_line_reset_rows(&mut e, "xa"), text_decoration_line_reset_rows(&mut e, "xs"), text_decoration_line_reset_rows(&mut e, "xu"));
+        assert!(!strike.is_empty() && !under.is_empty(), "both twins paint red: strike {strike:?} underline {under:?}");
+        assert!(strike.iter().all(|r| !under.contains(r)), "the twins' bands are distinct: {strike:?} vs {under:?}");
+        assert_eq!(link, strike, "the link paints the strike band only (armed: the UA underline band too)");
+        assert_eq!(font_shorthand_cs(&mut e, "xal", "textDecorationLine"), "line-through", "the link's own line set");
+    }
+
+    /// AETHERCSSTEXTDECORATIONLINERESET (SR1122): css-text-decor-3 §2.1: a span declaring `line-through` inside an underlined
+    /// div still paints the div's underline through its text beside its own strike (the reset clears only the element's own
+    /// tag default, never the propagated line), and reads `line-through` (text-decoration-line is not inherited).
+    #[test]
+    fn text_decoration_line_reset_propagation_kept() {
+        let mut e = text_decoration_line_reset_engine();
+        let (both, under, strike) = (text_decoration_line_reset_rows(&mut e, "pp"), text_decoration_line_reset_rows(&mut e, "tu"), text_decoration_line_reset_rows(&mut e, "xs"));
+        assert!(!under.is_empty() && !strike.is_empty(), "the twins paint red: {under:?} {strike:?}");
+        assert!(under.iter().all(|r| both.contains(r)), "the parent's underline paints through the span: {both:?} vs {under:?}");
+        assert!(strike.iter().all(|r| both.contains(r)), "the span's own strike paints: {both:?} vs {strike:?}");
+        assert_eq!(font_shorthand_cs(&mut e, "ppl", "textDecorationLine"), "line-through");
+    }
 }
