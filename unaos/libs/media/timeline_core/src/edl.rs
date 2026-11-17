@@ -207,7 +207,7 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
                     tl.add_source(w[0], d);
                 }
             }
-            mark_comment(l, line, &mut tl)?; if let Some(r) = l.strip_prefix("* UNA SIZE ") {
+            title_comment(l, line, &mut tl)?; mark_comment(l, line, &mut tl)?; if let Some(r) = l.strip_prefix("* UNA SIZE ") {
                 sizes.push(size_comment(r, line)?);
             }
             want_comment(l, line, last_trans.and_then(|i| trans.get_mut(i)).filter(|x| x.0 == Kind::Video).map(|x| &mut x.2))?; if let Some(r) = l.strip_prefix("* UNA EASE ") {
@@ -396,6 +396,7 @@ pub fn write(tl: &Timeline, title: &str) -> Result<String, EdlError> {
         if src.size_policy != SizePolicy::Letterbox {
             s.push_str(&format!("* UNA SIZE {} {}\n", src.reel, src.size_policy.name())); // NLESIZEPOLICY (SR394)
         }
+        s.push_str(&title_line(src)); // STRIATITLECLIP (SR828): a title source's `* UNA TITLE` line, right after its SOURCE (file tail)
     }
     s.push_str(&mark_line(tl)); s.push('\n'); // NLE5DRANGESAVE (SR723): the document's `* UNA MARK` line, last in the header (file tail)
     // NLE3cBLACK: `Err` = a transition TO black, an event at its `at` (no clip).
@@ -623,5 +624,124 @@ fn mark_line(tl: &Timeline) -> String {
     match tl.marks {
         (None, None) => String::new(),
         (a, b) => format!("* UNA MARK {} {}\n", word(a), word(b)),
+    }
+}
+
+// ---- STRIATITLECLIP (LEDGER SR828): the `* UNA TITLE` line (named tail block) ----
+// `* UNA TITLE <reel> "<text>"` is a generated title source's text ([`crate::Source::title`]), written right after that
+// reel's `* UNA SOURCE` (and SIZE) line and only for a titled source, so an EDL with no title writes as before. The text is
+// quoted: `\` -> `\\`, `"` -> `\"`, LF -> `\n`, CR -> `\r`. A TITLE line naming a reel no SOURCE line above it declared, a
+// second TITLE for one reel, or a malformed quote (an unknown escape, no closing quote, words after it) is a syntax error.
+
+/// STRIATITLECLIP: a `* UNA TITLE` line applied to its (already declared) source; any other line is left alone.
+fn title_comment(l: &str, line: usize, tl: &mut Timeline) -> Result<(), EdlError> {
+    let Some(r) = l.strip_prefix("* UNA TITLE ") else { return Ok(()) };
+    let (reel, q) = r.split_once(' ').ok_or(EdlError::Syntax { line })?;
+    let text = unquote(q).ok_or(EdlError::Syntax { line })?;
+    let src = tl.sources.iter_mut().find(|s| s.reel == reel).filter(|s| s.title.is_none()).ok_or(EdlError::Syntax { line })?;
+    src.title = Some(text);
+    Ok(())
+}
+
+/// STRIATITLECLIP: a source's `* UNA TITLE` line (empty for a media reel).
+fn title_line(src: &crate::Source) -> String {
+    match &src.title {
+        Some(t) => format!("* UNA TITLE {} {}\n", src.reel, quote(t)),
+        None => String::new(),
+    }
+}
+
+/// STRIATITLECLIP: `text` in double quotes, `\`, `"`, LF and CR escaped (the one inverse of [`unquote`]).
+fn quote(text: &str) -> String {
+    let mut q = String::from("\"");
+    for c in text.chars() {
+        match c {
+            '\\' => q.push_str("\\\\"),
+            '"' => q.push_str("\\\""),
+            '\n' => q.push_str("\\n"),
+            '\r' => q.push_str("\\r"),
+            c => q.push(c),
+        }
+    }
+    q.push('"');
+    q
+}
+
+/// STRIATITLECLIP: the text of a [`quote`]d string that is the whole of `q`; `None` for anything else.
+fn unquote(q: &str) -> Option<String> {
+    let mut it = q.strip_prefix('"')?.chars();
+    let mut out = String::new();
+    loop {
+        match it.next()? {
+            '"' => return it.next().is_none().then_some(out),
+            '\\' => out.push(match it.next()? {
+                '\\' => '\\',
+                '"' => '"',
+                'n' => '\n',
+                'r' => '\r',
+                _ => return None,
+            }),
+            c => out.push(c),
+        }
+    }
+}
+
+#[cfg(test)]
+mod striatitleclip_tests {
+    use super::*;
+    use crate::{Clip, Kind, Timeline};
+
+    fn titled(text: &str) -> Timeline {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        let t = tl.add_source("T1", 125);
+        tl.sources[1].title = Some(String::from(text));
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 10, 0), Clip::new(t, 0, 20, 10)];
+        tl
+    }
+
+    #[test]
+    fn striatitleclip_title_round_trips_with_quote_and_backslash() {
+        let text = "He said \"hi\" \\ back\\slash";
+        let tl = titled(text);
+        let s = write(&tl, "TITLES").unwrap();
+        assert!(s.contains("* UNA SOURCE T1 00:00:05:00\n* UNA TITLE T1 \"He said \\\"hi\\\" \\\\ back\\\\slash\"\n"), "{s}");
+        let back = parse(&s, 25).unwrap();
+        assert_eq!(back, tl);
+        assert_eq!(back.sources[1].title.as_deref(), Some(text));
+        assert_eq!(write(&back, "TITLES").unwrap(), s, "write(parse(write)) byte-identical");
+    }
+
+    #[test]
+    fn striatitleclip_quote_pair_and_malformed() {
+        for t in ["", "plain", "a\"b", "c\\d", "line\nbreak\rcr", "  spaced  ", "\u{00e9}t\u{00e9}"] {
+            assert_eq!(unquote(&quote(t)).as_deref(), Some(t), "{t:?}");
+        }
+        for bad in ["", "plain", "\"open", "\"x\" tail", "\"bad\\q\"", "\"end\\\"", "x\"y\""] {
+            assert_eq!(unquote(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn striatitleclip_bad_title_lines_are_syntax() {
+        let good = write(&titled("Hello"), "T").unwrap();
+        let unknown = good.replace("* UNA TITLE T1", "* UNA TITLE T9");
+        assert!(matches!(parse(&unknown, 25), Err(EdlError::Syntax { .. })), "unknown reel");
+        let twice = good.replace("* UNA TITLE T1 \"Hello\"\n", "* UNA TITLE T1 \"Hello\"\n* UNA TITLE T1 \"Again\"\n");
+        assert!(matches!(parse(&twice, 25), Err(EdlError::Syntax { .. })), "second title");
+        let bad = good.replace("\"Hello\"", "\"Hello");
+        assert!(matches!(parse(&bad, 25), Err(EdlError::Syntax { .. })), "bad quote");
+        let first = good.replace("* UNA SOURCE T1 00:00:05:00\n* UNA TITLE T1 \"Hello\"\n", "* UNA TITLE T1 \"Hello\"\n* UNA SOURCE T1 00:00:05:00\n");
+        assert!(matches!(parse(&first, 25), Err(EdlError::Syntax { .. })), "title before its source");
+    }
+
+    #[test]
+    fn striatitleclip_no_title_writes_no_title_line() {
+        let mut tl = titled("x");
+        tl.sources[1].title = None;
+        let s = write(&tl, "T").unwrap();
+        assert!(!s.contains("UNA TITLE"), "{s}");
+        assert_eq!(parse(&s, 25).unwrap().sources[1].title, None);
     }
 }

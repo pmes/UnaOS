@@ -660,3 +660,24 @@ impl EditorState {
         })
     }
 }
+
+// ---- STRIATITLECLIP (LEDGER SR828): a title card laid at the playhead as ONE commit (named tail block) ----
+impl EditorState {
+    /// A new generated title source (reel the first free `T<n>`, its text `text`, `dur` ticks) inserted at the playhead on
+    /// the first video track through `Timeline::place` (`Mode::Insert`): ONE commit, so undo removes the source and the clip;
+    /// the new clip is selected. Refused by name: no video track `EditError::NoTrack`; `dur < 1` `EditError::Empty`.
+    pub fn add_title(&mut self, text: &str, dur: i64) -> Result<(), EditError> {
+        let track = self.timeline.tracks.iter().position(|t| t.kind == crate::Kind::Video).ok_or(EditError::NoTrack)?;
+        let reel = (1u32..).map(|n| alloc::format!("T{n}")).find(|r| self.timeline.source_by_reel(r).is_none()).expect("a free T<n> reel");
+        let mut tl = self.timeline.clone();
+        let id = tl.add_source(&reel, dur.max(0));
+        if let Some(s) = tl.sources.last_mut() {
+            s.title = Some(alloc::string::String::from(text));
+        }
+        let at = self.playhead;
+        let tl = tl.place(track, crate::Clip::new(id, 0, dur, at), crate::Mode::Insert)?;
+        self.commit(tl);
+        let _ = self.select_at(track, at);
+        Ok(())
+    }
+}
