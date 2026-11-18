@@ -483,7 +483,7 @@ pub(crate) fn layout_root<H: Host, F: Fonts + ?Sized>(tree: &LayoutTree<H>, ctx:
                 _ => break,
             }
         }
-        let free = (right - left - content_w).max(0.0); let (free, content_w) = justify_line(ctx, default_run, &mut pcs, align, forced, free, content_w);
+        let free = (right - left - content_w).max(0.0); let (free, content_w) = justify_line(ctx, default_run, &mut pcs, align, forced, free, content_w, run_of(ctx, root, default_run).text_justify);
         let dx = left + match align {
             1 => free / 2.0,
             2 | 4 | 6 => free,
@@ -1148,16 +1148,16 @@ mod caps_all_tests {
 /// advancer); every piece after the k-th gap moves by k * free / N. A line with no gap is left as start. Returns the
 /// free space left for `dx` and the stretched content width. The paragraph's last line comes in as start through
 /// [`justify_last`].
-fn justify_line<F: Fonts + ?Sized>(
+#[allow(clippy::too_many_arguments)] fn justify_line<F: Fonts + ?Sized>(
     ctx: &Ctx<F>,
     default_run: &TextRun,
     pcs: &mut Vec<Piece>,
     align: u8,
     forced: bool,
     free: f32,
-    content_w: f32,
+    content_w: f32, justify: u8, // AETHERTEXTJUSTIFY (SR1156): css-text-3 §7.4 text-justify (0 auto, 1 none, 2 inter-word, 3 inter-character)
 ) -> (f32, f32) {
-    if !matches!(align, 3..=6) || (forced && align < 5) || free <= 0.0 {
+    if !matches!(align, 3..=6) || (forced && align < 5) || free <= 0.0 || justify == 1 { // AETHERTEXTJUSTIFY (SR1156): none leaves the line start-aligned
         return (free, content_w);
     }
     let mut split: Vec<Piece> = Vec::with_capacity(pcs.len());
@@ -1191,12 +1191,12 @@ fn justify_line<F: Fonts + ?Sized>(
             split.push(Piece::Text { node, parent, text: text[start..].to_string(), x: x + px, w: (w - px).max(0.0) });
         }
     }
-    let last = split.iter().rposition(|p| match p {
+    let mut split = justify_clusters(ctx, default_run, split, justify); let last = split.iter().rposition(|p| match p { // AETHERTEXTJUSTIFY (SR1156): inter-character splits the word pieces at grapheme clusters
         Piece::Text { text, .. } => !text.trim_end_matches(' ').is_empty(),
         Piece::Atomic { .. } => true,
         _ => false,
     });
-    let is_gap = |i: usize, p: &Piece| matches!(p, Piece::Text { text, .. } if text.ends_with(' ')) && last.is_some_and(|l| i < l);
+    let is_gap = |i: usize, p: &Piece| (if justify == 3 { matches!(p, Piece::Atomic { .. }) || matches!(p, Piece::Text { text, .. } if !text.is_empty()) } else { matches!(p, Piece::Text { text, .. } if text.ends_with(' ')) }) && last.is_some_and(|l| i < l); // AETHERTEXTJUSTIFY (SR1156): inter-character: every unit before the last
     let n = split.iter().enumerate().filter(|(i, p)| is_gap(*i, p)).count();
     if n == 0 {
         *pcs = split;
@@ -1250,4 +1250,40 @@ fn last_line_align(align: u8, last: Option<u8>, rtl: bool) -> u8 {
         Some(8) => 5 + rtl as u8,
         Some(c) => align_code(c, rtl),
     }
+}
+
+// ---- AETHERTEXTJUSTIFY (LEDGER SR1156): css-text-3 §7.4 text-justify inter-character splits the word pieces at grapheme clusters (named tail block) ----
+
+/// AETHERTEXTJUSTIFY (SR1156): under `text-justify: inter-character` (3) every `Piece::Text` [`justify_line`] made (one
+/// word, its trailing space kept) is split into one piece per grapheme cluster (`font_core::grapheme::clusters`, UAX #29:
+/// a combining cluster is never split), x from the run's own measurer over the piece's prefix (one incremental measure
+/// per cluster), the last cluster taking the rest of the piece's width; [`justify_line`] then spreads its free space over
+/// every unit gap. A piece holding a cursive-joining character (Arabic, Syriac, N'Ko, Mongolian) stays one unit
+/// (css-text-3 §7.4: cursive scripts take no inter-character gaps). The `Fonts` seam exposes no shaped clusters, so a
+/// ligature spanning two clusters is drawn as two pieces (AETHER-TEXT-JUSTIFY-LIGATURE owed). Any other code: unchanged.
+fn justify_clusters<F: Fonts + ?Sized>(ctx: &Ctx<F>, default_run: &TextRun, split: Vec<Piece>, justify: u8) -> Vec<Piece> {
+    if justify != 3 {
+        return split;
+    }
+    let cursive = |c: char| matches!(c as u32, 0x0600..=0x06FF | 0x0700..=0x074F | 0x0750..=0x077F | 0x07C0..=0x07FF | 0x08A0..=0x08FF | 0x1800..=0x18AF);
+    let mut out: Vec<Piece> = Vec::with_capacity(split.len());
+    for p in split {
+        let Piece::Text { node, parent, text, x, w } = p else {
+            out.push(p);
+            continue;
+        };
+        let cl = font_core::grapheme::clusters(&text);
+        if cl.len() < 2 || text.chars().any(cursive) {
+            out.push(Piece::Text { node, parent, text, x, w });
+            continue;
+        }
+        let adv = run_of(ctx, node, default_run).advancer();
+        let mut px = 0.0f32;
+        for (k, &(a, b)) in cl.iter().enumerate() {
+            let next = if k + 1 == cl.len() { w } else { ctx.fonts.measure(&text[..b], &adv) };
+            out.push(Piece::Text { node, parent, text: text[a..b].to_string(), x: x + px, w: (next - px).max(0.0) });
+            px = next;
+        }
+    }
+    out
 }
